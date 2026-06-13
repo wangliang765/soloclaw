@@ -7664,6 +7664,16 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   t.after(async () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
+  type DiffReviewProfileShape = {
+    reviewSize?: string;
+    reviewHint?: string;
+    files?: number;
+    additions?: number;
+    deletions?: number;
+    sizeCounts?: Record<string, number>;
+    changeTypeCounts?: Record<string, number>;
+    largestFile?: { path?: string; additions?: number; deletions?: number; changedLines?: number; reviewSize?: string; changeType?: string };
+  };
   const activeWorkspace = path.join(dir, "active-workspace");
   await fs.mkdir(path.join(dir, ".agent"), { recursive: true });
   await fs.mkdir(activeWorkspace, { recursive: true });
@@ -7700,6 +7710,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionDiffChangedPaths?: string[];
       sessionDiffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
       sessionDiffFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
+      sessionDiffReviewProfile?: DiffReviewProfileShape;
       sessionReportFileChanges?: number;
       sessionReportToolResults?: number;
       sessionReportCommandsFinished?: number;
@@ -7707,6 +7718,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReportExecutionProfiles?: Record<string, number>;
       sessionReportDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionReportFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      sessionReportReviewProfile?: DiffReviewProfileShape;
       sessionReportPendingApprovals?: number;
       sessionResultOutcome?: string;
       sessionResultRecovered?: boolean;
@@ -7715,6 +7727,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionResultExecutionProfiles?: Record<string, number>;
       sessionResultDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionResultFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      sessionResultReviewProfile?: DiffReviewProfileShape;
       sessionResultPendingApprovals?: number;
       sessionResultChangedPaths?: string[];
       sessionResultNextActions?: number;
@@ -7751,6 +7764,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReviewPatches?: number;
       sessionReviewDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionReviewFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      sessionReviewReviewProfile?: DiffReviewProfileShape;
       sessionReviewTimelineItems?: number;
       sessionReviewNextActions?: number;
       sessionReviewNextActionStatuses?: Record<string, number>;
@@ -7762,6 +7776,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionBundleTimelineItems?: number;
       sessionBundleNextActions?: number;
       sessionBundleNextActionStatuses?: Record<string, number>;
+      sessionBundleReviewProfile?: DiffReviewProfileShape;
       sessionBundleLocalAgentState?: string;
       sessionBundleLocalAgentDaemonState?: string;
       sessionBundleLocalAgentLogItems?: number;
@@ -7875,6 +7890,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
     entry.reviewSize === "small" &&
     /modified small change/.test(entry.reviewHint ?? "")
   ), true);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.reviewSize, "small");
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.files, 1);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.additions, 1);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.deletions, 1);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.sizeCounts?.small, 1);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.changeTypeCounts?.modified, 1);
+  assert.equal(parsed.evidence?.sessionDiffReviewProfile?.largestFile?.path, "src/math.js");
+  assert.match(parsed.evidence?.sessionDiffReviewProfile?.reviewHint ?? "", /small review/);
   assert.equal((parsed.evidence?.sessionReportFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionReportToolResults ?? 0) >= 3, true);
   assert.equal((parsed.evidence?.sessionReportCommandsFinished ?? 0) >= 2, true);
@@ -7883,6 +7906,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionReportDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionReportDiffStats?.deletions, 1);
   assert.equal(parsed.evidence?.sessionReportFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(parsed.evidence?.sessionReportReviewProfile?.reviewSize, "small");
   assert.equal((parsed.evidence?.sessionReportPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultOutcome, "succeeded");
   assert.equal(parsed.evidence?.sessionResultRecovered, true);
@@ -7892,6 +7916,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionResultDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionResultDiffStats?.deletions, 1);
   assert.equal(parsed.evidence?.sessionResultFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.reviewSize === "small"), true);
+  assert.equal(parsed.evidence?.sessionResultReviewProfile?.largestFile?.path, "src/math.js");
   assert.equal((parsed.evidence?.sessionResultPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultChangedPaths?.includes("src/math.js"), true);
   assert.equal((parsed.evidence?.sessionResultNextActions ?? 0) >= 4, true);
@@ -7937,6 +7962,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionReviewDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionReviewDiffStats?.deletions, 1);
   assert.equal(parsed.evidence?.sessionReviewFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.patches === 1), true);
+  assert.equal(parsed.evidence?.sessionReviewReviewProfile?.reviewSize, "small");
   assert.equal((parsed.evidence?.sessionReviewTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionReviewNextActions, parsed.evidence?.sessionResultNextActions);
   assert.equal((parsed.evidence?.sessionReviewNextActionStatuses?.required ?? 0) >= 1, true);
@@ -7954,6 +7980,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionBundleTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionBundleNextActions, parsed.evidence?.sessionResultNextActions);
   assert.equal((parsed.evidence?.sessionBundleNextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionBundleReviewProfile?.reviewSize, "small");
   assert.equal(parsed.evidence?.sessionBundleLocalAgentState, parsed.evidence?.localAgentState);
   assert.equal(parsed.evidence?.sessionBundleLocalAgentDaemonState, parsed.evidence?.localAgentDaemonState);
   assert.equal((parsed.evidence?.sessionBundleLocalAgentLogItems ?? 0) >= 10, true);
@@ -8030,6 +8057,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-stat-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-file-summary-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-diff-review-profile-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-report-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-result-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-profile-evidence"), true);
@@ -8315,6 +8343,16 @@ test("agent session report summarizes engineering execution evidence", async (t)
   platform.store.close();
 
   const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  type DiffReviewProfileShape = {
+    reviewSize?: string;
+    reviewHint?: string;
+    files?: number;
+    additions?: number;
+    deletions?: number;
+    sizeCounts?: Record<string, number>;
+    changeTypeCounts?: Record<string, number>;
+    largestFile?: { path?: string; additions?: number; deletions?: number; changedLines?: number; reviewSize?: string; changeType?: string };
+  };
   const json = await run(process.execPath, [cli, "session", "report", session.id, "--json"], dir);
   assert.equal(json.exitCode, 0, json.stderr);
   const parsed = JSON.parse(json.stdout) as {
@@ -8328,6 +8366,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
       approvals?: number;
       pendingApprovals?: number;
       modelCalls?: number;
@@ -8371,6 +8410,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
     entry.reviewSize === "small" &&
     /modified small change/.test(entry.reviewHint ?? "")
   ), true);
+  assert.equal(parsed.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(parsed.summary?.reviewProfile?.largestFile?.path, "src/math.js");
+  assert.equal(parsed.summary?.reviewProfile?.changeTypeCounts?.modified, 1);
+  assert.match(parsed.summary?.reviewProfile?.reviewHint ?? "", /small review/);
   assert.equal(parsed.summary?.approvals, 1);
   assert.equal(parsed.summary?.pendingApprovals, 1);
   assert.equal(parsed.summary?.modelCalls, 1);
@@ -8401,6 +8444,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(text.stdout, /profile=local-safe/);
   assert.match(text.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(text.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
+  assert.match(text.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(text.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(text.stdout, /Model usage:/);
   assert.match(text.stdout, /mock\tmock-model\tcalls=1/);
@@ -8457,6 +8501,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
     };
     patches?: Array<{
       ordinal?: number;
@@ -8474,6 +8519,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(diff.summary?.diffStats?.additions, 1);
   assert.equal(diff.summary?.diffStats?.deletions, 1);
   assert.equal(diff.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified" && entry.reviewSize === "small"), true);
+  assert.equal(diff.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(diff.summary?.reviewProfile?.largestFile?.path, "src/math.js");
   assert.equal(diff.patches?.[0]?.ordinal, 1);
   assert.deepEqual(diff.patches?.[0]?.paths, ["src/math.js"]);
   assert.equal(diff.patches?.[0]?.stats?.additions, 1);
@@ -8485,6 +8532,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(diffText.exitCode, 0, diffText.stderr);
   assert.match(diffText.stdout, /Session diff:/);
   assert.match(diffText.stdout, /diffStats=files:1,\+1,-1/);
+  assert.match(diffText.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(diffText.stdout, /File summary:/);
   assert.match(diffText.stdout, /src\/math\.js\tmodified\t\+1\/-1\tpatches=1\tsmall/);
   assert.match(diffText.stdout, /diff --git a\/src\/math\.js b\/src\/math\.js/);
@@ -8496,6 +8544,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     summary?: {
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; reviewSize?: string; reviewHint?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
     };
   };
   assert.equal(addedDeletedDiff.summary?.diffStats?.files, 2);
@@ -8517,6 +8566,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
     entry.reviewSize === "small" &&
     /deleted small change/.test(entry.reviewHint ?? "")
   ), true);
+  assert.equal(addedDeletedDiff.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(addedDeletedDiff.summary?.reviewProfile?.files, 2);
+  assert.equal(addedDeletedDiff.summary?.reviewProfile?.sizeCounts?.small, 2);
+  assert.equal(addedDeletedDiff.summary?.reviewProfile?.changeTypeCounts?.added, 1);
+  assert.equal(addedDeletedDiff.summary?.reviewProfile?.changeTypeCounts?.deleted, 1);
 
   const resultJson = await run(process.execPath, [cli, "session", "result", session.id, "--json"], dir);
   assert.equal(resultJson.exitCode, 0, resultJson.stderr);
@@ -8530,6 +8584,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
       changedPaths?: string[];
       patches?: number;
       fileChanges?: number;
@@ -8570,6 +8625,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionResult.summary?.diffStats?.additions, 1);
   assert.equal(sessionResult.summary?.diffStats?.deletions, 1);
   assert.equal(sessionResult.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(sessionResult.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(sessionResult.summary?.reviewProfile?.largestFile?.path, "src/math.js");
   assert.deepEqual(sessionResult.summary?.changedPaths, ["src/math.js"]);
   assert.equal(sessionResult.summary?.patches, 1);
   assert.equal(sessionResult.summary?.fileChanges, 1);
@@ -8615,6 +8672,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(resultText.stdout, /Recovery:/);
   assert.match(resultText.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(resultText.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
+  assert.match(resultText.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(resultText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(resultText.stdout, /mock\tmock-model\tcalls=1/);
   assert.match(resultText.stdout, /Changed files:/);
@@ -8633,6 +8691,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
+      reviewProfile?: DiffReviewProfileShape;
       modelCalls?: number;
       modelSuccessfulCalls?: number;
       modelFailedCalls?: number;
@@ -8652,6 +8711,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.summary?.diffStats?.additions, 1);
   assert.equal(status.summary?.diffStats?.deletions, 1);
   assert.equal(status.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(status.summary?.reviewProfile?.reviewSize, "small");
   assert.equal(status.summary?.modelCalls, 1);
   assert.equal(status.summary?.modelSuccessfulCalls, 1);
   assert.equal(status.summary?.modelFailedCalls, 0);
@@ -8666,6 +8726,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(statusText.exitCode, 0, statusText.stderr);
   assert.match(statusText.stdout, /Session status:/);
   assert.match(statusText.stdout, /nextActions=/);
+  assert.match(statusText.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(statusText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(statusText.stdout, /Latest timeline:/);
 
@@ -8792,6 +8853,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       timelineItems?: number;
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
       modelCalls?: number;
       modelSuccessfulCalls?: number;
       modelFailedCalls?: number;
@@ -8804,6 +8866,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      reviewProfile?: DiffReviewProfileShape;
       patches?: Array<{ paths?: string[]; stats?: { files?: number; additions?: number; deletions?: number }; hasPatchText?: boolean; patchExcerpt?: string }>;
     };
     commands?: Array<{ status?: string; exitCode?: number; executionProfile?: string }>;
@@ -8824,6 +8887,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(review.summary?.diffStats?.additions, 1);
   assert.equal(review.summary?.diffStats?.deletions, 1);
   assert.equal(review.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(review.summary?.reviewProfile?.reviewSize, "small");
   assert.equal(review.summary?.modelCalls, 1);
   assert.equal(review.summary?.modelSuccessfulCalls, 1);
   assert.equal(review.summary?.modelFailedCalls, 0);
@@ -8840,6 +8904,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(review.changes?.diffStats?.additions, 1);
   assert.equal(review.changes?.diffStats?.deletions, 1);
   assert.equal(review.changes?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.patches === 1 && entry.reviewSize === "small"), true);
+  assert.equal(review.changes?.reviewProfile?.largestFile?.path, "src/math.js");
   assert.deepEqual(review.changes?.patches?.[0]?.paths, ["src/math.js"]);
   assert.equal(review.changes?.patches?.[0]?.stats?.additions, 1);
   assert.equal(review.changes?.patches?.[0]?.stats?.deletions, 1);
@@ -8870,6 +8935,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(reviewText.stdout, /Checklist:/);
   assert.match(reviewText.stdout, /Changed paths:/);
   assert.match(reviewText.stdout, /File summary:/);
+  assert.match(reviewText.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(reviewText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(reviewText.stdout, /Approvals:/);
   assert.match(reviewText.stdout, /Next actions:/);
@@ -8947,6 +9013,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
+      reviewProfile?: DiffReviewProfileShape;
       modelCalls?: number;
       modelSuccessfulCalls?: number;
       modelFailedCalls?: number;
@@ -8963,12 +9030,12 @@ test("agent session report summarizes engineering execution evidence", async (t)
       localAgentLogKinds?: Record<string, number>;
     };
     sections?: {
-      diff?: { summary?: { patches?: number } };
-      report?: { summary?: { fileChanges?: number; modelCalls?: number }; modelUsage?: { totals?: { totalTokens?: number } } };
-      status?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number } };
+      diff?: { summary?: { patches?: number; reviewProfile?: DiffReviewProfileShape } };
+      report?: { summary?: { fileChanges?: number; modelCalls?: number; reviewProfile?: DiffReviewProfileShape }; modelUsage?: { totals?: { totalTokens?: number } } };
+      status?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number; reviewProfile?: DiffReviewProfileShape } };
       timeline?: { summary?: { returnedItems?: number } };
-      review?: { summary?: { reviewState?: string; nextActions?: number }; nextActions?: Array<{ id?: string; status?: string }> };
-      result?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number }; modelUsage?: { totals?: { totalTokens?: number } }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
+      review?: { summary?: { reviewState?: string; nextActions?: number; reviewProfile?: DiffReviewProfileShape }; nextActions?: Array<{ id?: string; status?: string }> };
+      result?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number; reviewProfile?: DiffReviewProfileShape }; modelUsage?: { totals?: { totalTokens?: number } }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
       localStatus?: {
         summary?: { state?: string; pendingApprovals?: number };
         daemon?: { state?: string };
@@ -8988,6 +9055,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundle.summary?.diffStats?.additions, 1);
   assert.equal(bundle.summary?.diffStats?.deletions, 1);
   assert.equal(bundle.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(bundle.summary?.reviewProfile?.reviewSize, "small");
   assert.equal(bundle.summary?.modelCalls, 1);
   assert.equal(bundle.summary?.modelSuccessfulCalls, 1);
   assert.equal(bundle.summary?.modelFailedCalls, 0);
@@ -9002,17 +9070,22 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal((bundle.summary?.localAgentLogItems ?? 0) >= 5, true);
   assert.equal((bundle.summary?.localAgentLogKinds?.audit ?? 0) >= 5, true);
   assert.equal(bundle.sections?.diff?.summary?.patches, 1);
+  assert.equal(bundle.sections?.diff?.summary?.reviewProfile?.largestFile?.path, "src/math.js");
   assert.equal(bundle.sections?.report?.summary?.fileChanges, 1);
   assert.equal(bundle.sections?.report?.summary?.modelCalls, 1);
+  assert.equal(bundle.sections?.report?.summary?.reviewProfile?.reviewSize, "small");
   assert.equal(bundle.sections?.report?.modelUsage?.totals?.totalTokens, 15);
   assert.equal(bundle.sections?.status?.summary?.outcome, "succeeded");
   assert.equal(bundle.sections?.status?.summary?.modelCalls, 1);
+  assert.equal(bundle.sections?.status?.summary?.reviewProfile?.reviewSize, "small");
   assert.equal((bundle.sections?.status?.summary?.nextActions ?? 0) >= 4, true);
   assert.equal(bundle.sections?.timeline?.summary?.returnedItems, 5);
   assert.equal(bundle.sections?.review?.summary?.reviewState, "waiting_for_approval");
+  assert.equal(bundle.sections?.review?.summary?.reviewProfile?.reviewSize, "small");
   assert.equal((bundle.sections?.review?.summary?.nextActions ?? 0) >= 4, true);
   assert.equal(bundle.sections?.result?.summary?.outcome, "succeeded");
   assert.equal(bundle.sections?.result?.summary?.modelCalls, 1);
+  assert.equal(bundle.sections?.result?.summary?.reviewProfile?.reviewSize, "small");
   assert.equal(bundle.sections?.result?.modelUsage?.totals?.totalTokens, 15);
   assert.equal(bundle.sections?.result?.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required"), true);
   assert.equal(bundle.sections?.localStatus?.summary?.state, "needs_attention");
@@ -9041,6 +9114,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(bundleText.stdout, /Session bundle:/);
   assert.match(bundleText.stdout, /verification=pass/);
   assert.match(bundleText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
+  assert.match(bundleText.stdout, /reviewProfile=small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(bundleText.stdout, /localAgent=needs_attention\/needs_attention pendingApprovals=1/);
   assert.match(bundleText.stdout, /Sections:/);
   assert.match(bundleText.stdout, /localStatus/);

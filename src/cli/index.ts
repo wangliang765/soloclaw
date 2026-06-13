@@ -4955,6 +4955,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionDiffChangedPaths: string[];
     sessionDiffStats: UnifiedDiffStats;
     sessionDiffFileSummaries: UnifiedDiffFileSummary[];
+    sessionDiffReviewProfile: UnifiedDiffReviewProfile;
     sessionReportFileChanges: number;
     sessionReportToolResults: number;
     sessionReportCommandsFinished: number;
@@ -4962,6 +4963,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReportExecutionProfiles: Record<string, number>;
     sessionReportDiffStats: UnifiedDiffStats;
     sessionReportFileSummaries: UnifiedDiffFileSummary[];
+    sessionReportReviewProfile: UnifiedDiffReviewProfile;
     sessionReportPendingApprovals: number;
     sessionResultOutcome?: string;
     sessionResultRecovered: boolean;
@@ -4970,6 +4972,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultExecutionProfiles: Record<string, number>;
     sessionResultDiffStats: UnifiedDiffStats;
     sessionResultFileSummaries: UnifiedDiffFileSummary[];
+    sessionResultReviewProfile: UnifiedDiffReviewProfile;
     sessionResultPendingApprovals: number;
     sessionResultChangedPaths: string[];
     sessionResultNextActions: number;
@@ -5006,6 +5009,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewPatches: number;
     sessionReviewDiffStats: UnifiedDiffStats;
     sessionReviewFileSummaries: UnifiedDiffFileSummary[];
+    sessionReviewReviewProfile: UnifiedDiffReviewProfile;
     sessionReviewTimelineItems: number;
     sessionReviewNextActions: number;
     sessionReviewNextActionStatuses: Record<string, number>;
@@ -5017,6 +5021,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionBundleTimelineItems: number;
     sessionBundleNextActions: number;
     sessionBundleNextActionStatuses: Record<string, number>;
+    sessionBundleReviewProfile: UnifiedDiffReviewProfile;
     sessionBundleLocalAgentState?: string;
     sessionBundleLocalAgentDaemonState?: string;
     sessionBundleLocalAgentLogItems: number;
@@ -5306,6 +5311,20 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       label: "session file summary evidence",
       status: sessionFileSummaryPass ? "pass" : "fail",
       summary: sessionFileSummary ? formatDiffFileSummary(sessionFileSummary) : "src/math.js summary missing",
+    });
+    const sessionReviewProfilePass =
+      sessionDiff.summary.reviewProfile.reviewSize === "small" &&
+      sessionDiff.summary.reviewProfile.files === 1 &&
+      sessionDiff.summary.reviewProfile.additions === 1 &&
+      sessionDiff.summary.reviewProfile.deletions === 1 &&
+      sessionDiff.summary.reviewProfile.sizeCounts.small === 1 &&
+      sessionDiff.summary.reviewProfile.changeTypeCounts.modified === 1 &&
+      sessionDiff.summary.reviewProfile.largestFile?.path === "src/math.js";
+    checks.push({
+      id: "session-diff-review-profile-evidence",
+      label: "session diff review profile evidence",
+      status: sessionReviewProfilePass ? "pass" : "fail",
+      summary: sessionDiff.summary.reviewProfile.reviewHint,
     });
 
     const sessionReport = await buildSessionReport(platform.store, session.id);
@@ -5717,6 +5736,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionDiffChangedPaths: sessionDiff.summary.changedPaths,
         sessionDiffStats: sessionDiff.summary.diffStats,
         sessionDiffFileSummaries: sessionDiff.summary.fileSummaries,
+        sessionDiffReviewProfile: sessionDiff.summary.reviewProfile,
         sessionReportFileChanges: sessionReport.summary.fileChanges,
         sessionReportToolResults: sessionReport.summary.toolResults,
         sessionReportCommandsFinished: sessionReport.summary.commandsFinished,
@@ -5724,6 +5744,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReportExecutionProfiles: sessionReport.summary.executionProfiles,
         sessionReportDiffStats: sessionReport.summary.diffStats,
         sessionReportFileSummaries: sessionReport.summary.fileSummaries,
+        sessionReportReviewProfile: sessionReport.summary.reviewProfile,
         sessionReportPendingApprovals: sessionReport.summary.pendingApprovals,
         sessionResultOutcome: sessionResult.summary.outcome,
         sessionResultRecovered: sessionResult.summary.recovered,
@@ -5732,6 +5753,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultExecutionProfiles: sessionResult.summary.executionProfiles,
         sessionResultDiffStats: sessionResult.summary.diffStats,
         sessionResultFileSummaries: sessionResult.summary.fileSummaries,
+        sessionResultReviewProfile: sessionResult.summary.reviewProfile,
         sessionResultPendingApprovals: sessionResult.summary.pendingApprovals,
         sessionResultChangedPaths: sessionResult.summary.changedPaths,
         sessionResultNextActions: sessionResult.summary.nextActions,
@@ -5768,6 +5790,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewPatches: sessionReview.changes.patches.length,
         sessionReviewDiffStats: sessionReview.changes.diffStats,
         sessionReviewFileSummaries: sessionReview.changes.fileSummaries,
+        sessionReviewReviewProfile: sessionReview.changes.reviewProfile,
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
         sessionReviewNextActions: sessionReview.summary.nextActions,
         sessionReviewNextActionStatuses: sessionReview.summary.nextActionStatuses,
@@ -5779,6 +5802,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleTimelineItems: sessionBundle.summary.timelineItems,
         sessionBundleNextActions: sessionBundle.summary.nextActions,
         sessionBundleNextActionStatuses: sessionBundle.summary.nextActionStatuses,
+        sessionBundleReviewProfile: sessionBundle.summary.reviewProfile,
         sessionBundleLocalAgentState: sessionBundle.summary.localAgentState,
         sessionBundleLocalAgentDaemonState: sessionBundle.summary.localAgentDaemonState,
         sessionBundleLocalAgentLogItems: sessionBundle.summary.localAgentLogItems,
@@ -5910,6 +5934,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionDiffChangedPaths=${result.evidence.sessionDiffChangedPaths.join(",") || "-"}`);
   console.log(`- sessionDiffStats=${formatDiffStats(result.evidence.sessionDiffStats)}`);
   console.log(`- sessionDiffFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionDiffFileSummaries)}`);
+  console.log(`- sessionDiffReviewProfile=${formatDiffReviewProfile(result.evidence.sessionDiffReviewProfile)}`);
   console.log(`- sessionReportFileChanges=${result.evidence.sessionReportFileChanges}`);
   console.log(`- sessionReportToolResults=${result.evidence.sessionReportToolResults}`);
   console.log(`- sessionReportCommandsFinished=${result.evidence.sessionReportCommandsFinished}`);
@@ -5917,6 +5942,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReportExecutionProfiles=${formatRecordCounts(result.evidence.sessionReportExecutionProfiles)}`);
   console.log(`- sessionReportDiffStats=${formatDiffStats(result.evidence.sessionReportDiffStats)}`);
   console.log(`- sessionReportFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReportFileSummaries)}`);
+  console.log(`- sessionReportReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReportReviewProfile)}`);
   console.log(`- sessionResultOutcome=${result.evidence.sessionResultOutcome ?? "-"}`);
   console.log(`- sessionResultRecovered=${result.evidence.sessionResultRecovered}`);
   console.log(`- sessionResultCommandsFinished=${result.evidence.sessionResultCommandsFinished}`);
@@ -5924,6 +5950,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionResultExecutionProfiles=${formatRecordCounts(result.evidence.sessionResultExecutionProfiles)}`);
   console.log(`- sessionResultDiffStats=${formatDiffStats(result.evidence.sessionResultDiffStats)}`);
   console.log(`- sessionResultFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionResultFileSummaries)}`);
+  console.log(`- sessionResultReviewProfile=${formatDiffReviewProfile(result.evidence.sessionResultReviewProfile)}`);
   console.log(`- sessionResultChangedPaths=${result.evidence.sessionResultChangedPaths.join(",") || "-"}`);
   console.log(`- sessionResultNextActions=${result.evidence.sessionResultNextActions} statuses=${formatRecordCounts(result.evidence.sessionResultNextActionStatuses)}`);
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
@@ -5954,6 +5981,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewPatches=${result.evidence.sessionReviewPatches}`);
   console.log(`- sessionReviewDiffStats=${formatDiffStats(result.evidence.sessionReviewDiffStats)}`);
   console.log(`- sessionReviewFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReviewFileSummaries)}`);
+  console.log(`- sessionReviewReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReviewReviewProfile)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
   console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
@@ -5962,6 +5990,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
   console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
+  console.log(`- sessionBundleReviewProfile=${formatDiffReviewProfile(result.evidence.sessionBundleReviewProfile)}`);
   console.log(`- sessionBundleLocalAgent=${result.evidence.sessionBundleLocalAgentState ?? "-"}/${result.evidence.sessionBundleLocalAgentDaemonState ?? "-"} logs=${result.evidence.sessionBundleLocalAgentLogItems}`);
   console.log(`- timeoutCommandTimedOut=${result.evidence.timeoutCommandTimedOut}`);
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
@@ -6587,6 +6616,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
   });
   const diffStats = mergeDiffStats(patchDiffs.map((patch) => patch.stats));
   const fileSummaries = summarizeDiffFileSummaries(patchDiffs);
+  const reviewProfile = buildDiffReviewProfile({ patches: patchDiffs.length, diffStats, fileSummaries });
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const approvedApprovals = approvals.filter((approval) => approval.status === "approved");
   const deniedApprovals = approvals.filter((approval) => approval.status === "denied");
@@ -6607,6 +6637,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
       executionProfiles,
       diffStats,
       fileSummaries,
+      reviewProfile,
       approvals: approvals.length,
       pendingApprovals: pendingApprovals.length,
       approvedApprovals: approvedApprovals.length,
@@ -6674,6 +6705,7 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
   console.log(`- executionProfiles=${formatRecordCounts(report.summary.executionProfiles)}`);
   console.log(`- diffStats=${formatDiffStats(report.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(report.summary.fileSummaries)}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(report.summary.reviewProfile)}`);
   console.log(`- approvals=${report.summary.approvals} pending=${report.summary.pendingApprovals}`);
   console.log(
     `- modelCalls=${report.summary.modelCalls} ok=${report.summary.modelSuccessfulCalls} ` +
@@ -6820,6 +6852,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       executionProfiles: result.summary.executionProfiles,
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
+      reviewProfile: result.summary.reviewProfile,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -7492,6 +7525,7 @@ async function buildSessionEvidenceBundle(
       patches: result.summary.patches,
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
+      reviewProfile: result.summary.reviewProfile,
       commandsFinished: result.summary.commandsFinished,
       failedCommands: result.summary.failedCommands,
       timedOutCommands: result.summary.timedOutCommands,
@@ -7570,6 +7604,7 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- changedPaths=${bundle.summary.changedPaths.join(",") || "-"}`);
   console.log(`- fileChanges=${bundle.summary.fileChanges} patches=${bundle.summary.patches} diffStats=${formatDiffStats(bundle.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(bundle.summary.fileSummaries)}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(bundle.summary.reviewProfile)}`);
   console.log(`- commandsFinished=${bundle.summary.commandsFinished} failed=${bundle.summary.failedCommands} timedOut=${bundle.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(bundle.summary.executionProfiles)}`);
   console.log(`- approvals=${bundle.summary.approvals} pending=${bundle.summary.pendingApprovals}`);
@@ -7654,6 +7689,7 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- executionProfiles=${formatRecordCounts(status.summary.executionProfiles)}`);
   console.log(`- diffStats=${formatDiffStats(status.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(status.summary.fileSummaries)}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(status.summary.reviewProfile)}`);
   console.log(`- pendingApprovals=${status.summary.pendingApprovals}`);
   console.log(`- toolResults=${status.summary.toolResults} failed=${status.summary.failedToolResults}`);
   console.log(
@@ -7702,6 +7738,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       executionProfiles: result.summary.executionProfiles,
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
+      reviewProfile: result.summary.reviewProfile,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -7723,6 +7760,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       diffStats: diff.summary.diffStats,
       fileChanges: result.fileChanges,
       fileSummaries: diff.summary.fileSummaries,
+      reviewProfile: diff.summary.reviewProfile,
       patches: diff.patches.map((patch) => ({
         ordinal: patch.ordinal,
         createdAt: patch.createdAt,
@@ -7838,6 +7876,7 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(`- patches=${review.summary.patches} fileChanges=${review.summary.fileChanges}`);
   console.log(`- diffStats=${formatDiffStats(review.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(review.summary.fileSummaries)}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(review.summary.reviewProfile)}`);
   console.log(`- commandsFinished=${review.summary.commandsFinished} failed=${review.summary.failedCommands} timedOut=${review.summary.timedOutCommands}`);
   console.log(`- pendingApprovals=${review.summary.pendingApprovals}`);
   console.log(
@@ -8175,6 +8214,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       executionProfiles: report.summary.executionProfiles,
       diffStats: diff.summary.diffStats,
       fileSummaries: diff.summary.fileSummaries,
+      reviewProfile: diff.summary.reviewProfile,
       approvals: report.summary.approvals,
       pendingApprovals: report.summary.pendingApprovals,
       approvedApprovals: report.summary.approvedApprovals,
@@ -8295,6 +8335,7 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- patches=${result.summary.patches}`);
   console.log(`- diffStats=${formatDiffStats(result.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(result.summary.fileSummaries)}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(result.summary.reviewProfile)}`);
   console.log(`- commandsFinished=${result.summary.commandsFinished} failed=${result.summary.failedCommands} timedOut=${result.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(result.summary.executionProfiles)}`);
   console.log(`- approvals=${result.summary.approvals} pending=${result.summary.pendingApprovals}`);
@@ -8579,6 +8620,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
   });
   const diffStats = mergeDiffStats(patches.map((patch) => patch.stats));
   const fileSummaries = summarizeDiffFileSummaries(patches);
+  const reviewProfile = buildDiffReviewProfile({ patches: patches.length, diffStats, fileSummaries });
   return {
     generatedAt: new Date().toISOString(),
     session,
@@ -8588,6 +8630,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
       changedPaths: [...new Set(fileChanges.map((change) => change.path))].sort(),
       diffStats,
       fileSummaries,
+      reviewProfile,
     },
     patches,
     fileChanges,
@@ -8598,6 +8641,7 @@ function printSessionDiff(diff: Awaited<ReturnType<typeof buildSessionDiff>>): v
   console.log(`Session diff: ${diff.session.id}`);
   console.log(`status=${diff.session.status}\tpatches=${diff.summary.patches}\tfileChanges=${diff.summary.fileChanges}`);
   console.log(`diffStats=${formatDiffStats(diff.summary.diffStats)}`);
+  console.log(`reviewProfile=${formatDiffReviewProfile(diff.summary.reviewProfile)}`);
   if (diff.summary.changedPaths.length > 0) {
     console.log(`changedPaths=${diff.summary.changedPaths.join(",")}`);
   }
@@ -8658,6 +8702,22 @@ type UnifiedDiffFileSummary = UnifiedDiffPathStats & {
   lastPatchOrdinal: number;
   reviewSize: UnifiedDiffReviewSize;
   reviewHint: string;
+};
+
+type UnifiedDiffReviewProfile = {
+  reviewSize: UnifiedDiffReviewSize | "none";
+  reviewHint: string;
+  patches: number;
+  files: number;
+  additions: number;
+  deletions: number;
+  sizeCounts: Record<UnifiedDiffReviewSize, number>;
+  changeTypeCounts: Record<UnifiedDiffChangeType, number>;
+  largestFile?: UnifiedDiffPathStats & {
+    changedLines: number;
+    changeType: UnifiedDiffChangeType;
+    reviewSize: UnifiedDiffReviewSize;
+  };
 };
 
 type UnifiedDiffStats = {
@@ -8756,6 +8816,62 @@ function emptyDiffStats(): UnifiedDiffStats {
 
 function formatDiffStats(stats: UnifiedDiffStats): string {
   return `files:${stats.files},+${stats.additions},-${stats.deletions}`;
+}
+
+function buildDiffReviewProfile(input: {
+  patches: number;
+  diffStats: UnifiedDiffStats;
+  fileSummaries: UnifiedDiffFileSummary[];
+}): UnifiedDiffReviewProfile {
+  const sizeCounts: Record<UnifiedDiffReviewSize, number> = { small: 0, medium: 0, large: 0 };
+  const changeTypeCounts: Record<UnifiedDiffChangeType, number> = { added: 0, deleted: 0, modified: 0, renamed: 0 };
+  let largestFile: UnifiedDiffReviewProfile["largestFile"];
+  for (const summary of input.fileSummaries) {
+    sizeCounts[summary.reviewSize] += 1;
+    changeTypeCounts[summary.changeType] += 1;
+    const changedLines = summary.additions + summary.deletions;
+    if (!largestFile || changedLines > largestFile.changedLines || (changedLines === largestFile.changedLines && summary.path.localeCompare(largestFile.path) < 0)) {
+      largestFile = {
+        path: summary.path,
+        additions: summary.additions,
+        deletions: summary.deletions,
+        changedLines,
+        changeType: summary.changeType,
+        reviewSize: summary.reviewSize,
+      };
+    }
+  }
+  const reviewSize: UnifiedDiffReviewProfile["reviewSize"] =
+    input.fileSummaries.length === 0
+      ? "none"
+      : sizeCounts.large > 0
+        ? "large"
+        : sizeCounts.medium > 0
+          ? "medium"
+          : "small";
+  const reviewHint = input.fileSummaries.length === 0
+    ? "no persisted patch changes"
+    : `${reviewSize} review across ${input.diffStats.files} file(s), +${input.diffStats.additions}/-${input.diffStats.deletions}` +
+      (largestFile ? `; largest=${largestFile.path} +${largestFile.additions}/-${largestFile.deletions}` : "");
+
+  return {
+    reviewSize,
+    reviewHint,
+    patches: input.patches,
+    files: input.diffStats.files,
+    additions: input.diffStats.additions,
+    deletions: input.diffStats.deletions,
+    sizeCounts,
+    changeTypeCounts,
+    largestFile,
+  };
+}
+
+function formatDiffReviewProfile(profile: UnifiedDiffReviewProfile): string {
+  const largest = profile.largestFile
+    ? `${profile.largestFile.path}:+${profile.largestFile.additions}/-${profile.largestFile.deletions}`
+    : "-";
+  return `${profile.reviewSize}:files=${profile.files},+${profile.additions},-${profile.deletions},largest=${largest}`;
 }
 
 function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: string; stats: UnifiedDiffStats }>): UnifiedDiffFileSummary[] {
