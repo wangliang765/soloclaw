@@ -57,11 +57,15 @@ MCP approvals use the same decision command. When `agent mcp capabilities`, `age
 Current local CLI flow:
 
 ```text
+agent sessions --json --limit 5
+agent sessions --status paused --target-mode build
 agent session bundle <session-id> --json --output .agent/tmp/session-bundle.json
 agent session bundle <session-id> --json --require-change --require-patch --require-recovery --require-diff-stat --require-execution-profile local-safe
 ```
 
-The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
+`agent sessions` is the local recent-session dashboard. It reuses the session status view for each returned session, so JSON callers get outcome, pending approval count, command/change counts, latest safe timeline items, and follow-up review/result commands without opening each session manually.
+
+The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, and a short review hint when the session contains completed `apply_patch` evidence. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
 
 ## Audit Export
 

@@ -1234,6 +1234,34 @@ test("agent run can emit session evidence and verify the completed run", async (
   assert.match(text.stdout, /Session verification:/);
   assert.match(text.stdout, /status=pass/);
 
+  const sessionsJson = await run(process.execPath, [cli, "sessions", "--json", "--limit", "5"], dir);
+  assert.equal(sessionsJson.exitCode, 0, sessionsJson.stderr);
+  const sessions = JSON.parse(sessionsJson.stdout) as {
+    summary?: { returned?: number; byOutcome?: Record<string, number>; changedSessions?: number };
+    sessions?: Array<{
+      session?: { id?: string; targetMode?: string; status?: string };
+      summary?: { outcome?: string; pendingApprovals?: number; commandsFinished?: number };
+      reviewCommands?: { review?: string; result?: string };
+    }>;
+  };
+  const listedRunSession = sessions.sessions?.find((entry) => entry.session?.id === parsed.session?.id);
+  assert.equal((sessions.summary?.returned ?? 0) >= 2, true);
+  assert.equal((sessions.summary?.byOutcome?.succeeded ?? 0) >= 2, true);
+  assert.equal(sessions.summary?.changedSessions, 0);
+  assert.equal(listedRunSession?.session?.targetMode, "build");
+  assert.equal(listedRunSession?.session?.status, "completed");
+  assert.equal(listedRunSession?.summary?.outcome, "succeeded");
+  assert.equal(listedRunSession?.summary?.pendingApprovals, 0);
+  assert.equal(listedRunSession?.summary?.commandsFinished, 0);
+  assert.match(listedRunSession?.reviewCommands?.result ?? "", new RegExp(`agent session result ${parsed.session?.id}`));
+
+  const sessionsText = await run(process.execPath, [cli, "sessions", "--limit", "1"], dir);
+  assert.equal(sessionsText.exitCode, 0, sessionsText.stderr);
+  assert.match(sessionsText.stdout, /Session dashboard:/);
+  assert.match(sessionsText.stdout, /byOutcome=succeeded:1/);
+  assert.match(sessionsText.stdout, /outcome=succeeded/);
+  assert.match(sessionsText.stdout, /review: agent session review sess_/);
+
   const failedGate = await run(process.execPath, [cli, "run", "--verify-session", "--require-change", "inspect", "this", "workspace"], dir);
   assert.equal(failedGate.exitCode, 1);
   assert.match(failedGate.stdout, /Session verification:/);
@@ -7421,12 +7449,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionDiffFileChanges?: number;
       sessionDiffChangedPaths?: string[];
       sessionDiffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      sessionDiffFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
       sessionReportFileChanges?: number;
       sessionReportToolResults?: number;
       sessionReportCommandsFinished?: number;
       sessionReportTimedOutCommands?: number;
       sessionReportExecutionProfiles?: Record<string, number>;
       sessionReportDiffStats?: { files?: number; additions?: number; deletions?: number };
+      sessionReportFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
       sessionReportPendingApprovals?: number;
       sessionResultOutcome?: string;
       sessionResultRecovered?: boolean;
@@ -7434,6 +7464,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionResultTimedOutCommands?: number;
       sessionResultExecutionProfiles?: Record<string, number>;
       sessionResultDiffStats?: { files?: number; additions?: number; deletions?: number };
+      sessionResultFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
       sessionResultPendingApprovals?: number;
       sessionResultChangedPaths?: string[];
       sessionTimelineItems?: number;
@@ -7441,11 +7472,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionTimelineKinds?: Record<string, number>;
       sessionStatusOutcome?: string;
       sessionStatusTimelineItems?: number;
+      sessionListReturned?: number;
+      sessionListOutcome?: string;
+      sessionListPendingApprovals?: number;
       sessionReviewState?: string;
       sessionReviewChecklist?: Record<string, string>;
       sessionReviewChangedPaths?: string[];
       sessionReviewPatches?: number;
       sessionReviewDiffStats?: { files?: number; additions?: number; deletions?: number };
+      sessionReviewFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
       sessionReviewTimelineItems?: number;
       sessionVerificationStatus?: string;
       sessionVerificationChecks?: number;
@@ -7523,6 +7558,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionDiffStats?.deletions, 1);
   assert.equal(parsed.evidence?.sessionDiffStats?.byPath?.some((entry) => entry.path === "src/math.js" && entry.additions === 1 && entry.deletions === 1), true);
+  assert.equal(parsed.evidence?.sessionDiffFileSummaries?.some((entry) =>
+    entry.path === "src/math.js" &&
+    entry.changeType === "modified" &&
+    entry.additions === 1 &&
+    entry.deletions === 1 &&
+    entry.patches === 1 &&
+    entry.reviewSize === "small" &&
+    /modified small change/.test(entry.reviewHint ?? "")
+  ), true);
   assert.equal((parsed.evidence?.sessionReportFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionReportToolResults ?? 0) >= 3, true);
   assert.equal((parsed.evidence?.sessionReportCommandsFinished ?? 0) >= 2, true);
@@ -7530,6 +7574,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionReportExecutionProfiles?.["local-safe"] ?? 0) >= 3, true);
   assert.equal(parsed.evidence?.sessionReportDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionReportDiffStats?.deletions, 1);
+  assert.equal(parsed.evidence?.sessionReportFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.equal((parsed.evidence?.sessionReportPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultOutcome, "succeeded");
   assert.equal(parsed.evidence?.sessionResultRecovered, true);
@@ -7538,6 +7583,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionResultExecutionProfiles?.["local-safe"] ?? 0) >= 3, true);
   assert.equal(parsed.evidence?.sessionResultDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionResultDiffStats?.deletions, 1);
+  assert.equal(parsed.evidence?.sessionResultFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.reviewSize === "small"), true);
   assert.equal((parsed.evidence?.sessionResultPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultChangedPaths?.includes("src/math.js"), true);
   assert.equal((parsed.evidence?.sessionTimelineItems ?? 0) >= 10, true);
@@ -7547,6 +7593,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionTimelineKinds?.approval ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionStatusOutcome, "succeeded");
   assert.equal(parsed.evidence?.sessionStatusTimelineItems, parsed.evidence?.sessionTimelineItems);
+  assert.equal((parsed.evidence?.sessionListReturned ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionListOutcome, "succeeded");
+  assert.equal((parsed.evidence?.sessionListPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionReviewState, "waiting_for_approval");
   assert.equal(parsed.evidence?.sessionReviewChecklist?.["change-summary"], "pass");
   assert.equal(parsed.evidence?.sessionReviewChecklist?.["patch-review"], "pass");
@@ -7558,6 +7607,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionReviewPatches ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionReviewDiffStats?.additions, 1);
   assert.equal(parsed.evidence?.sessionReviewDiffStats?.deletions, 1);
+  assert.equal(parsed.evidence?.sessionReviewFileSummaries?.some((entry) => entry.path === "src/math.js" && entry.patches === 1), true);
   assert.equal((parsed.evidence?.sessionReviewTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionVerificationStatus, "pass");
   assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 7, true);
@@ -7624,11 +7674,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "recovered-test"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-stat-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-file-summary-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-report-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-result-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-profile-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-timeline-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-status-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-list-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
@@ -7796,6 +7848,57 @@ test("agent session report summarizes engineering execution evidence", async (t)
     metadata: { command: "npm test", exitCode: 0, stdoutBytes: 4, stderrBytes: 0, executionProfile: "local-safe" },
     createdAt: "2026-06-13T00:00:05.000Z",
   });
+  const addedDeletedSession = await platform.store.createSession({
+    objective: "Summarize added and deleted patch files.",
+    targetMode: "build",
+    status: "completed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  const addedDeletedPatch = [
+    "diff --git a/docs/new.md b/docs/new.md",
+    "--- /dev/null",
+    "+++ b/docs/new.md",
+    "@@ -0,0 +1,2 @@",
+    "+hello",
+    "+world",
+    "diff --git a/src/old.js b/src/old.js",
+    "--- a/src/old.js",
+    "+++ /dev/null",
+    "@@ -1,2 +0,0 @@",
+    "-console.log(\"old\");",
+    "-export {};",
+    "",
+  ].join("\n");
+  await platform.store.recordFileChange({
+    id: "change_added_file",
+    sessionId: addedDeletedSession.id,
+    actor,
+    kind: "create",
+    path: "docs/new.md",
+    afterHash: "new_hash",
+    summary: "create via patch",
+    createdAt: "2026-06-13T00:00:06.000Z",
+  });
+  await platform.store.recordFileChange({
+    id: "change_deleted_file",
+    sessionId: addedDeletedSession.id,
+    actor,
+    kind: "delete",
+    path: "src/old.js",
+    beforeHash: "old_hash",
+    summary: "delete via patch",
+    createdAt: "2026-06-13T00:00:06.000Z",
+  });
+  await platform.store.recordAuditEvent({
+    id: "audit_added_deleted_patch_completed",
+    type: "tool.completed",
+    actor,
+    sessionId: addedDeletedSession.id,
+    summary: "apply_patch completed",
+    metadata: { tool: "apply_patch", action: "workspace.write", input: { patch: addedDeletedPatch }, ok: true },
+    createdAt: "2026-06-13T00:00:06.500Z",
+  });
   platform.locks.close?.();
   platform.store.close();
 
@@ -7812,6 +7915,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       failedCommands?: number;
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
       approvals?: number;
       pendingApprovals?: number;
       changedPaths?: string[];
@@ -7834,6 +7938,15 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(parsed.summary?.diffStats?.additions, 1);
   assert.equal(parsed.summary?.diffStats?.deletions, 1);
   assert.equal(parsed.summary?.diffStats?.byPath?.some((entry) => entry.path === "src/math.js" && entry.additions === 1 && entry.deletions === 1), true);
+  assert.equal(parsed.summary?.fileSummaries?.some((entry) =>
+    entry.path === "src/math.js" &&
+    entry.changeType === "modified" &&
+    entry.additions === 1 &&
+    entry.deletions === 1 &&
+    entry.patches === 1 &&
+    entry.reviewSize === "small" &&
+    /modified small change/.test(entry.reviewHint ?? "")
+  ), true);
   assert.equal(parsed.summary?.approvals, 1);
   assert.equal(parsed.summary?.pendingApprovals, 1);
   assert.equal(parsed.approvals?.[0]?.action, "workspace.write");
@@ -7851,6 +7964,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(text.stdout, /Commands:/);
   assert.match(text.stdout, /profile=local-safe/);
   assert.match(text.stdout, /diffStats=files:1,\+1,-1/);
+  assert.match(text.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
   assert.match(text.stdout, /Approvals:/);
   assert.match(text.stdout, /workspace\.write/);
   assert.match(text.stdout, /src\/math\.js/);
@@ -7898,8 +8012,20 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(diffJson.exitCode, 0, diffJson.stderr);
   const diff = JSON.parse(diffJson.stdout) as {
     session?: { id?: string };
-    summary?: { patches?: number; fileChanges?: number; changedPaths?: string[]; diffStats?: { files?: number; additions?: number; deletions?: number } };
-    patches?: Array<{ ordinal?: number; paths?: string[]; stats?: { files?: number; additions?: number; deletions?: number }; patch?: string }>;
+    summary?: {
+      patches?: number;
+      fileChanges?: number;
+      changedPaths?: string[];
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+    };
+    patches?: Array<{
+      ordinal?: number;
+      paths?: string[];
+      stats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; reviewSize?: string }>;
+      patch?: string;
+    }>;
   };
   assert.equal(diff.session?.id, session.id);
   assert.equal(diff.summary?.patches, 1);
@@ -7908,18 +8034,50 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(diff.summary?.diffStats?.files, 1);
   assert.equal(diff.summary?.diffStats?.additions, 1);
   assert.equal(diff.summary?.diffStats?.deletions, 1);
+  assert.equal(diff.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified" && entry.reviewSize === "small"), true);
   assert.equal(diff.patches?.[0]?.ordinal, 1);
   assert.deepEqual(diff.patches?.[0]?.paths, ["src/math.js"]);
   assert.equal(diff.patches?.[0]?.stats?.additions, 1);
   assert.equal(diff.patches?.[0]?.stats?.deletions, 1);
+  assert.equal(diff.patches?.[0]?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.match(diff.patches?.[0]?.patch ?? "", /return a \+ b/);
 
   const diffText = await run(process.execPath, [cli, "session", "diff", session.id], dir);
   assert.equal(diffText.exitCode, 0, diffText.stderr);
   assert.match(diffText.stdout, /Session diff:/);
   assert.match(diffText.stdout, /diffStats=files:1,\+1,-1/);
+  assert.match(diffText.stdout, /File summary:/);
+  assert.match(diffText.stdout, /src\/math\.js\tmodified\t\+1\/-1\tpatches=1\tsmall/);
   assert.match(diffText.stdout, /diff --git a\/src\/math\.js b\/src\/math\.js/);
   assert.match(diffText.stdout, /-  return a - b;/);
+
+  const addedDeletedDiffJson = await run(process.execPath, [cli, "session", "diff", addedDeletedSession.id, "--json"], dir);
+  assert.equal(addedDeletedDiffJson.exitCode, 0, addedDeletedDiffJson.stderr);
+  const addedDeletedDiff = JSON.parse(addedDeletedDiffJson.stdout) as {
+    summary?: {
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; reviewSize?: string; reviewHint?: string }>;
+    };
+  };
+  assert.equal(addedDeletedDiff.summary?.diffStats?.files, 2);
+  assert.equal(addedDeletedDiff.summary?.diffStats?.additions, 2);
+  assert.equal(addedDeletedDiff.summary?.diffStats?.deletions, 2);
+  assert.equal(addedDeletedDiff.summary?.fileSummaries?.some((entry) =>
+    entry.path === "docs/new.md" &&
+    entry.changeType === "added" &&
+    entry.additions === 2 &&
+    entry.deletions === 0 &&
+    entry.reviewSize === "small" &&
+    /added small change/.test(entry.reviewHint ?? "")
+  ), true);
+  assert.equal(addedDeletedDiff.summary?.fileSummaries?.some((entry) =>
+    entry.path === "src/old.js" &&
+    entry.changeType === "deleted" &&
+    entry.additions === 0 &&
+    entry.deletions === 2 &&
+    entry.reviewSize === "small" &&
+    /deleted small change/.test(entry.reviewHint ?? "")
+  ), true);
 
   const resultJson = await run(process.execPath, [cli, "session", "result", session.id, "--json"], dir);
   assert.equal(resultJson.exitCode, 0, resultJson.stderr);
@@ -7932,6 +8090,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       failedCommands?: number;
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
       changedPaths?: string[];
       patches?: number;
       fileChanges?: number;
@@ -7956,6 +8115,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionResult.summary?.executionProfiles?.["local-safe"], 2);
   assert.equal(sessionResult.summary?.diffStats?.additions, 1);
   assert.equal(sessionResult.summary?.diffStats?.deletions, 1);
+  assert.equal(sessionResult.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.deepEqual(sessionResult.summary?.changedPaths, ["src/math.js"]);
   assert.equal(sessionResult.summary?.patches, 1);
   assert.equal(sessionResult.summary?.fileChanges, 1);
@@ -7978,6 +8138,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(resultText.stdout, /recovered=yes/);
   assert.match(resultText.stdout, /Recovery:/);
   assert.match(resultText.stdout, /diffStats=files:1,\+1,-1/);
+  assert.match(resultText.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
   assert.match(resultText.stdout, /Changed files:/);
   assert.match(resultText.stdout, /Approvals:/);
 
@@ -7991,6 +8152,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       pendingApprovals?: number;
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
     };
     latestTimeline?: Array<{ kind?: string; title?: string }>;
     reviewCommands?: { timeline?: string; result?: string; report?: string };
@@ -8002,6 +8164,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.summary?.executionProfiles?.["local-safe"], 2);
   assert.equal(status.summary?.diffStats?.additions, 1);
   assert.equal(status.summary?.diffStats?.deletions, 1);
+  assert.equal(status.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.equal(status.latestTimeline?.length, 5);
   assert.match(status.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${session.id}`));
 
@@ -8023,11 +8186,13 @@ test("agent session report summarizes engineering execution evidence", async (t)
       pendingApprovals?: number;
       timelineItems?: number;
       diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
     };
     checklist?: Array<{ id?: string; status?: string }>;
     changes?: {
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
       patches?: Array<{ paths?: string[]; stats?: { files?: number; additions?: number; deletions?: number }; hasPatchText?: boolean; patchExcerpt?: string }>;
     };
     commands?: Array<{ status?: string; exitCode?: number; executionProfile?: string }>;
@@ -8046,6 +8211,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(review.summary?.timelineItems, timeline.summary?.totalItems);
   assert.equal(review.summary?.diffStats?.additions, 1);
   assert.equal(review.summary?.diffStats?.deletions, 1);
+  assert.equal(review.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.equal(reviewChecklist["change-summary"], "pass");
   assert.equal(reviewChecklist["patch-review"], "pass");
   assert.equal(reviewChecklist["command-result"], "pass");
@@ -8055,6 +8221,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.deepEqual(review.changes?.changedPaths, ["src/math.js"]);
   assert.equal(review.changes?.diffStats?.additions, 1);
   assert.equal(review.changes?.diffStats?.deletions, 1);
+  assert.equal(review.changes?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.patches === 1 && entry.reviewSize === "small"), true);
   assert.deepEqual(review.changes?.patches?.[0]?.paths, ["src/math.js"]);
   assert.equal(review.changes?.patches?.[0]?.stats?.additions, 1);
   assert.equal(review.changes?.patches?.[0]?.stats?.deletions, 1);
@@ -8077,6 +8244,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(reviewText.stdout, /state=waiting_for_approval/);
   assert.match(reviewText.stdout, /Checklist:/);
   assert.match(reviewText.stdout, /Changed paths:/);
+  assert.match(reviewText.stdout, /File summary:/);
   assert.match(reviewText.stdout, /Approvals:/);
   assert.match(reviewText.stdout, /agent session verify/);
 
@@ -8144,6 +8312,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       verificationStatus?: string;
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
       timelineItems?: number;
       returnedTimelineItems?: number;
     };
@@ -8166,6 +8335,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.deepEqual(bundle.summary?.changedPaths, ["src/math.js"]);
   assert.equal(bundle.summary?.diffStats?.additions, 1);
   assert.equal(bundle.summary?.diffStats?.deletions, 1);
+  assert.equal(bundle.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
   assert.equal(bundle.summary?.returnedTimelineItems, 5);
   assert.equal(bundle.sections?.diff?.summary?.patches, 1);
   assert.equal(bundle.sections?.report?.summary?.fileChanges, 1);
