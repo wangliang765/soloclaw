@@ -7758,6 +7758,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionBundleTimelineItems?: number;
       sessionBundleNextActions?: number;
       sessionBundleNextActionStatuses?: Record<string, number>;
+      sessionBundleLocalAgentState?: string;
+      sessionBundleLocalAgentDaemonState?: string;
+      sessionBundleLocalAgentLogItems?: number;
       policyBoundaryApprovalActions?: string[];
       policyBoundaryApprovalCount?: number;
       timeoutCommandTimedOut?: boolean;
@@ -7936,11 +7939,16 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("report"), true);
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("review"), true);
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("result"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("localStatus"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("localLogs"), true);
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("verification"), true);
   assert.equal((parsed.evidence?.sessionBundleOutputBytes ?? 0) > 100, true);
   assert.equal((parsed.evidence?.sessionBundleTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionBundleNextActions, parsed.evidence?.sessionResultNextActions);
   assert.equal((parsed.evidence?.sessionBundleNextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionBundleLocalAgentState, parsed.evidence?.localAgentState);
+  assert.equal(parsed.evidence?.sessionBundleLocalAgentDaemonState, parsed.evidence?.localAgentDaemonState);
+  assert.equal((parsed.evidence?.sessionBundleLocalAgentLogItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("workspace.write"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("dependency.install"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("git.mutation"), true);
@@ -8923,6 +8931,12 @@ test("agent session report summarizes engineering execution evidence", async (t)
       returnedTimelineItems?: number;
       nextActions?: number;
       nextActionStatuses?: Record<string, number>;
+      localAgentState?: string;
+      localAgentDaemonState?: string;
+      localAgentPendingApprovals?: number;
+      localAgentSessions?: number;
+      localAgentLogItems?: number;
+      localAgentLogKinds?: Record<string, number>;
     };
     sections?: {
       diff?: { summary?: { patches?: number } };
@@ -8931,10 +8945,12 @@ test("agent session report summarizes engineering execution evidence", async (t)
       timeline?: { summary?: { returnedItems?: number } };
       review?: { summary?: { reviewState?: string; nextActions?: number }; nextActions?: Array<{ id?: string; status?: string }> };
       result?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number }; modelUsage?: { totals?: { totalTokens?: number } }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
+      localStatus?: { summary?: { state?: string; pendingApprovals?: number }; daemon?: { state?: string } };
+      localLogs?: { summary?: { returnedItems?: number; byKind?: Record<string, number> }; items?: Array<{ session?: { id?: string }; kind?: string; title?: string }> };
       verification?: { status?: string; options?: { requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> };
     };
     output?: { path?: string; bytes?: number };
-    reviewCommands?: { bundle?: string; verify?: string };
+    reviewCommands?: { bundle?: string; verify?: string; localStatus?: string; localLogs?: string };
   };
   assert.equal(bundle.session?.id, session.id);
   assert.equal(bundle.summary?.outcome, "succeeded");
@@ -8951,6 +8967,12 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundle.summary?.returnedTimelineItems, 5);
   assert.equal((bundle.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((bundle.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(bundle.summary?.localAgentState, "needs_attention");
+  assert.equal(bundle.summary?.localAgentDaemonState, "needs_attention");
+  assert.equal(bundle.summary?.localAgentPendingApprovals, 1);
+  assert.equal((bundle.summary?.localAgentSessions ?? 0) >= 2, true);
+  assert.equal((bundle.summary?.localAgentLogItems ?? 0) >= 5, true);
+  assert.equal((bundle.summary?.localAgentLogKinds?.audit ?? 0) >= 5, true);
   assert.equal(bundle.sections?.diff?.summary?.patches, 1);
   assert.equal(bundle.sections?.report?.summary?.fileChanges, 1);
   assert.equal(bundle.sections?.report?.summary?.modelCalls, 1);
@@ -8965,6 +8987,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundle.sections?.result?.summary?.modelCalls, 1);
   assert.equal(bundle.sections?.result?.modelUsage?.totals?.totalTokens, 15);
   assert.equal(bundle.sections?.result?.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required"), true);
+  assert.equal(bundle.sections?.localStatus?.summary?.state, "needs_attention");
+  assert.equal(bundle.sections?.localStatus?.daemon?.state, "needs_attention");
+  assert.equal(bundle.sections?.localStatus?.summary?.pendingApprovals, 1);
+  assert.equal((bundle.sections?.localLogs?.summary?.returnedItems ?? 0) >= 5, true);
+  assert.equal(bundle.sections?.localLogs?.items?.some((item) => item.session?.id === session.id && item.kind === "audit"), true);
   assert.equal(bundle.sections?.verification?.status, "pass");
   assert.equal(bundle.sections?.verification?.options?.requireModelCall, true);
   assert.equal(bundle.sections?.verification?.checks?.every((check) => check.status === "pass"), true);
@@ -8972,6 +8999,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal((bundle.output?.bytes ?? 0) > 100, true);
   assert.match(bundle.output?.path ?? "", /session-bundle\.json$/);
   assert.match(bundle.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${session.id}`));
+  assert.match(bundle.reviewCommands?.localStatus ?? "", /agent local status/);
+  assert.match(bundle.reviewCommands?.localLogs ?? "", /agent local logs/);
   assert.equal(await exists(path.join(dir, bundleOutputPath)), true);
   const writtenBundle = JSON.parse(await fs.readFile(path.join(dir, bundleOutputPath), "utf8")) as { session?: { id?: string }; summary?: { verificationStatus?: string } };
   assert.equal(writtenBundle.session?.id, session.id);
@@ -8982,9 +9011,14 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(bundleText.stdout, /Session bundle:/);
   assert.match(bundleText.stdout, /verification=pass/);
   assert.match(bundleText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
+  assert.match(bundleText.stdout, /localAgent=needs_attention\/needs_attention pendingApprovals=1/);
   assert.match(bundleText.stdout, /Sections:/);
+  assert.match(bundleText.stdout, /localStatus/);
+  assert.match(bundleText.stdout, /localLogs/);
   assert.match(bundleText.stdout, /Next actions:/);
   assert.match(bundleText.stdout, /agent session bundle/);
+  assert.match(bundleText.stdout, /agent local status/);
+  assert.match(bundleText.stdout, /agent local logs/);
 
   const verifyFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-change", "--json"], dir);
   assert.equal(verifyFailure.exitCode, 1);

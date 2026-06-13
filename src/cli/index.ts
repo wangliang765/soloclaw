@@ -3902,6 +3902,7 @@ async function main() {
           return;
         }
         const bundle = await buildSessionEvidenceBundle(store, sessionId, {
+          workspace: process.cwd(),
           limit: parsed.options.limit,
           requireChange: parsed.options.requireChange,
           requirePatch: parsed.options.requirePatch,
@@ -5012,6 +5013,9 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionBundleTimelineItems: number;
     sessionBundleNextActions: number;
     sessionBundleNextActionStatuses: Record<string, number>;
+    sessionBundleLocalAgentState?: string;
+    sessionBundleLocalAgentDaemonState?: string;
+    sessionBundleLocalAgentLogItems: number;
     policyBoundaryApprovalActions: string[];
     policyBoundaryApprovalCount: number;
     timeoutCommandTimedOut: boolean;
@@ -5494,6 +5498,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
     });
 
     const sessionBundle = await buildSessionEvidenceBundle(platform.store, session.id, {
+      workspace: sampleWorkspace,
       limit: 20,
       requireChange: true,
       requirePatch: true,
@@ -5515,13 +5520,19 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleSections.includes("report") &&
         sessionBundleSections.includes("review") &&
         sessionBundleSections.includes("result") &&
+        sessionBundleSections.includes("localStatus") &&
+        sessionBundleSections.includes("localLogs") &&
         sessionBundleSections.includes("verification") &&
+        sessionBundle.summary.localAgentState === localAgentStatus.summary.state &&
+        sessionBundle.summary.localAgentDaemonState === localAgentStatus.daemon.state &&
+        sessionBundle.summary.localAgentLogItems >= 10 &&
         sessionBundleOutput.bytes > 100
           ? "pass"
           : "fail",
       summary:
         `bundleVerification=${sessionBundle.summary.verificationStatus}, sections=${sessionBundleSections.join(",")}, ` +
-        `outputBytes=${sessionBundleOutput.bytes}`,
+        `localAgent=${sessionBundle.summary.localAgentState}/${sessionBundle.summary.localAgentDaemonState}, ` +
+        `localLogs=${sessionBundle.summary.localAgentLogItems}, outputBytes=${sessionBundleOutput.bytes}`,
     });
 
     const nextActionEvidencePass =
@@ -5753,6 +5764,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleTimelineItems: sessionBundle.summary.timelineItems,
         sessionBundleNextActions: sessionBundle.summary.nextActions,
         sessionBundleNextActionStatuses: sessionBundle.summary.nextActionStatuses,
+        sessionBundleLocalAgentState: sessionBundle.summary.localAgentState,
+        sessionBundleLocalAgentDaemonState: sessionBundle.summary.localAgentDaemonState,
+        sessionBundleLocalAgentLogItems: sessionBundle.summary.localAgentLogItems,
         policyBoundaryApprovalActions: [...policyBoundaryActionSet],
         policyBoundaryApprovalCount: policyBoundaryApprovals.length,
         timeoutCommandTimedOut: timeoutObserved,
@@ -5929,6 +5943,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
   console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
+  console.log(`- sessionBundleLocalAgent=${result.evidence.sessionBundleLocalAgentState ?? "-"}/${result.evidence.sessionBundleLocalAgentDaemonState ?? "-"} logs=${result.evidence.sessionBundleLocalAgentLogItems}`);
   console.log(`- timeoutCommandTimedOut=${result.evidence.timeoutCommandTimedOut}`);
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
   console.log(`- runSessionOutcome=${result.evidence.runSessionOutcome ?? "-"}`);
@@ -7334,8 +7349,9 @@ function printLocalAgentLogs(logs: Awaited<ReturnType<typeof buildLocalAgentLogs
 async function buildSessionEvidenceBundle(
   store: AgentStore,
   sessionId: string,
-  options: SessionVerificationOptions & { limit?: number } = {},
+  options: SessionVerificationOptions & { limit?: number; workspace?: string } = {},
 ) {
+  const workspace = options.workspace ?? process.cwd();
   const diff = await buildSessionDiff(store, sessionId);
   const report = await buildSessionReport(store, sessionId);
   const result = await buildSessionResult(store, sessionId);
@@ -7343,6 +7359,8 @@ async function buildSessionEvidenceBundle(
   const status = await buildSessionStatus(store, sessionId, { limit: options.limit ?? 8 });
   const review = await buildSessionReview(store, sessionId, { limit: options.limit ?? 12 });
   const verification = await buildSessionVerification(store, sessionId, options);
+  const localStatus = await buildLocalAgentStatus(store, workspace, { limit: Math.max(options.limit ?? 10, 10) });
+  const localLogs = await buildLocalAgentLogs(store, workspace, { limit: Math.max(options.limit ?? 20, 20) });
 
   return {
     generatedAt: new Date().toISOString(),
@@ -7378,6 +7396,12 @@ async function buildSessionEvidenceBundle(
       returnedTimelineItems: timeline.summary.returnedItems,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
+      localAgentState: localStatus.summary.state,
+      localAgentDaemonState: localStatus.daemon.state,
+      localAgentPendingApprovals: localStatus.summary.pendingApprovals,
+      localAgentSessions: localStatus.summary.sessions.returned,
+      localAgentLogItems: localLogs.summary.returnedItems,
+      localAgentLogKinds: localLogs.summary.byKind,
     },
     sections: {
       diff,
@@ -7386,6 +7410,8 @@ async function buildSessionEvidenceBundle(
       timeline,
       review,
       result,
+      localStatus,
+      localLogs,
       verification,
     },
     reviewCommands: {
@@ -7398,6 +7424,8 @@ async function buildSessionEvidenceBundle(
       result: `agent session result ${sessionId}`,
       verify: `agent session verify ${sessionId}`,
       audit: `agent audit list --session ${sessionId}`,
+      localStatus: "agent local status --json",
+      localLogs: "agent local logs --limit 20",
     },
   };
 }
@@ -7435,6 +7463,10 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   );
   console.log(`- nextActions=${bundle.summary.nextActions} statuses=${formatRecordCounts(bundle.summary.nextActionStatuses)}`);
   console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
+  console.log(
+    `- localAgent=${bundle.summary.localAgentState}/${bundle.summary.localAgentDaemonState} ` +
+    `pendingApprovals=${bundle.summary.localAgentPendingApprovals} logs=${bundle.summary.localAgentLogItems}`,
+  );
   console.log(`- verificationChecks=${bundle.sections.verification.checks.length}`);
   if (bundle.output) {
     console.log(`- output=${bundle.output.path} bytes=${bundle.output.bytes}`);
@@ -7447,6 +7479,8 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log("- timeline");
   console.log("- review");
   console.log("- result");
+  console.log("- localStatus");
+  console.log("- localLogs");
   console.log("- verification");
   if (bundle.sections.result.nextActions.length > 0) {
     console.log("");
@@ -7463,6 +7497,8 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- ${bundle.reviewCommands.diff}`);
   console.log(`- ${bundle.reviewCommands.result}`);
   console.log(`- ${bundle.reviewCommands.verify}`);
+  console.log(`- ${bundle.reviewCommands.localStatus}`);
+  console.log(`- ${bundle.reviewCommands.localLogs}`);
 }
 
 function printSessionTimeline(timeline: Awaited<ReturnType<typeof buildSessionTimeline>>): void {
