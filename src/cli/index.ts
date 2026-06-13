@@ -4994,6 +4994,10 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentDaemonActiveLeases: number;
     localAgentDaemonWorkerPollCommand?: string;
     localAgentDaemonNextStep?: string;
+    localAgentRunbookReady: boolean;
+    localAgentRunbookSteps: number;
+    localAgentRunbookRequiredCommand?: string;
+    localAgentRunbookBlockedSteps: number;
     localAgentLogItems: number;
     localAgentLogKinds: Record<string, number>;
     sessionReviewState?: string;
@@ -5423,6 +5427,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
     });
     const localAgentStatus = await buildLocalAgentStatus(platform.store, sampleWorkspace, { limit: 5 });
     const localAgentStatusSession = localAgentStatus.sessions.find((entry) => entry.session.id === session.id);
+    const localAgentRunbookRequiredStep = localAgentStatus.runbook.steps.find((step) => step.status === "required");
+    const localAgentRunbookBlockedSteps = localAgentStatus.runbook.steps.filter((step) => step.status === "blocked").length;
     checks.push({
       id: "local-agent-status-evidence",
       label: "local agent status evidence",
@@ -5434,13 +5440,18 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentStatus.daemon.scheduler.ready &&
         localAgentStatus.daemon.worker.ready &&
         localAgentStatus.daemon.worker.command?.includes(`agent workers poll ${localStatusWorker.id}`) &&
+        localAgentStatus.runbook.ready === false &&
+        localAgentRunbookRequiredStep?.id === "resolve-attention" &&
+        localAgentRunbookRequiredStep.command === "agent approvals pending" &&
+        localAgentRunbookBlockedSteps >= 2 &&
         localAgentStatus.commands.logs.includes("agent local logs")
           ? "pass"
           : "fail",
       summary:
         `state=${localAgentStatus.summary.state}, sessions=${localAgentStatus.summary.sessions.returned}, ` +
         `pendingApprovals=${localAgentStatus.summary.pendingApprovals}, workers=${localAgentStatus.summary.workers.total}, ` +
-        `daemon=${localAgentStatus.daemon.state}, workerReady=${localAgentStatus.daemon.worker.ready}`,
+        `daemon=${localAgentStatus.daemon.state}, workerReady=${localAgentStatus.daemon.worker.ready}, ` +
+        `runbookReady=${localAgentStatus.runbook.ready}, required=${localAgentRunbookRequiredStep?.id ?? "-"}`,
     });
 
     const localAgentLogs = await buildLocalAgentLogs(platform.store, sampleWorkspace, { limit: 20 });
@@ -5745,6 +5756,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentDaemonActiveLeases: localAgentStatus.daemon.queue.activeLeases,
         localAgentDaemonWorkerPollCommand: localAgentStatus.daemon.worker.command,
         localAgentDaemonNextStep: localAgentStatus.daemon.nextStep,
+        localAgentRunbookReady: localAgentStatus.runbook.ready,
+        localAgentRunbookSteps: localAgentStatus.runbook.steps.length,
+        localAgentRunbookRequiredCommand: localAgentRunbookRequiredStep?.command,
+        localAgentRunbookBlockedSteps,
         localAgentLogItems: localAgentLogs.summary.returnedItems,
         localAgentLogKinds: localAgentLogs.summary.byKind,
         sessionReviewState: sessionReview.summary.reviewState,
@@ -5926,6 +5941,10 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     `- localAgentDaemon=state:${result.evidence.localAgentDaemonState ?? "-"},` +
     `schedulerReady:${result.evidence.localAgentDaemonSchedulerReady},workerReady:${result.evidence.localAgentDaemonWorkerReady},` +
     `queueDepth:${result.evidence.localAgentDaemonQueueDepth},activeLeases:${result.evidence.localAgentDaemonActiveLeases}`,
+  );
+  console.log(
+    `- localAgentRunbook=ready:${result.evidence.localAgentRunbookReady},steps:${result.evidence.localAgentRunbookSteps},` +
+    `blocked:${result.evidence.localAgentRunbookBlockedSteps},requiredCommand:${result.evidence.localAgentRunbookRequiredCommand ?? "-"}`,
   );
   console.log(`- localAgentLogItems=${result.evidence.localAgentLogItems}`);
   console.log(`- localAgentLogKinds=${formatRecordCounts(result.evidence.localAgentLogKinds)}`);
@@ -6845,6 +6864,15 @@ type LocalAgentCliOptions = {
 
 type LocalAgentState = "idle" | "active" | "needs_attention";
 type LocalAgentDaemonState = "idle" | "ready_to_run" | "running" | "needs_worker" | "needs_attention";
+type LocalAgentRunbookStepStatus = "required" | "recommended" | "optional" | "blocked";
+
+type LocalAgentRunbookStep = {
+  id: string;
+  label: string;
+  status: LocalAgentRunbookStepStatus;
+  command?: string;
+  reason: string;
+};
 
 type LocalAgentLogItem = SessionTimelineItem & {
   session?: {
@@ -6966,6 +6994,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     status: "agent local status --json",
     logs: "agent local logs --limit 20",
     sessions: `agent sessions --limit ${limit}`,
+    approvals: "agent approvals pending",
     schedulerRun: "agent scheduler run --interval-ms 1000 --max-ticks 10 --stop-when-idle",
     workerPoll: pollableWorker ? `agent workers poll ${pollableWorker.workerId} --limit 5 --idle-limit 1` : undefined,
     latestSession: latestSessionId ? `agent session status ${latestSessionId}` : undefined,
@@ -6978,6 +7007,11 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     schedulerRunCommand: commands.schedulerRun,
     workerPollCommand: commands.workerPoll,
     pollableWorkerId: pollableWorker?.workerId,
+  });
+  const runbook = buildLocalAgentRunbook({
+    daemon,
+    commands,
+    pendingApprovals: pendingApprovals.length,
   });
 
   return {
@@ -7003,6 +7037,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
       },
     },
     daemon,
+    runbook,
     sessions: sessions.sessions,
     workers: workers.slice(0, limit).map((worker) => ({
       id: worker.id,
@@ -7231,6 +7266,80 @@ function localAgentDaemonNextStep(input: {
   return "No queued daemon work is visible.";
 }
 
+function buildLocalAgentRunbook(input: {
+  daemon: ReturnType<typeof buildLocalAgentDaemonSummary>;
+  commands: {
+    logs: string;
+    sessions: string;
+    approvals: string;
+    schedulerRun: string;
+    workerPoll?: string;
+    latestSession?: string;
+  };
+  pendingApprovals: number;
+}) {
+  const attentionReasons = input.daemon.attention.reasons;
+  const attentionRequired = input.daemon.attention.required;
+  const steps: LocalAgentRunbookStep[] = [];
+
+  steps.push({
+    id: "resolve-attention",
+    label: "Resolve attention items",
+    status: attentionRequired ? "required" : "optional",
+    command: input.pendingApprovals > 0 ? input.commands.approvals : input.commands.logs,
+    reason: attentionRequired
+      ? `Attention required before a clean daemon loop: ${attentionReasons.join(",") || "unknown"}.`
+      : "No attention items are currently blocking daemon loops.",
+  });
+
+  steps.push({
+    id: "run-scheduler",
+    label: "Run scheduler loop",
+    status: attentionRequired ? "blocked" : "recommended",
+    command: input.commands.schedulerRun,
+    reason: attentionRequired
+      ? "Resolve attention items before relying on scheduler polling."
+      : "Recover expired leases, dispatch ready work, and poll runnable workers.",
+  });
+
+  steps.push({
+    id: "poll-worker",
+    label: "Poll ready worker",
+    status: !input.daemon.worker.ready ? "blocked" : attentionRequired ? "blocked" : "recommended",
+    command: input.commands.workerPoll,
+    reason: !input.daemon.worker.ready
+      ? "No online worker with available capacity is ready to poll."
+      : attentionRequired
+        ? "Resolve attention items before worker polling."
+        : "A worker is online with available capacity and can claim queued work.",
+  });
+
+  steps.push({
+    id: "inspect-logs",
+    label: "Inspect local logs",
+    status: "optional",
+    command: input.commands.logs,
+    reason: "Review recent safe audit, file-change, approval, and worker events.",
+  });
+
+  if (input.commands.latestSession) {
+    steps.push({
+      id: "inspect-latest-session",
+      label: "Inspect latest session",
+      status: "optional",
+      command: input.commands.latestSession,
+      reason: "Drill into the newest session status before handing work to a daemon loop.",
+    });
+  }
+
+  return {
+    state: input.daemon.state,
+    ready: !attentionRequired && input.daemon.scheduler.ready && (input.daemon.worker.ready || input.daemon.queue.queueDepth === 0),
+    nextStep: input.daemon.nextStep,
+    steps,
+  };
+}
+
 function withLocalLogSession(
   item: Omit<SessionTimelineItem, "ordinal">,
   sessions: Map<string, Session>,
@@ -7275,6 +7384,13 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
     `schedulableWorkers=${status.daemon.worker.schedulableWorkers}`,
   );
   console.log(`- next=${status.daemon.nextStep}`);
+  console.log("");
+  console.log("Daemon runbook:");
+  console.log(`- ready=${status.runbook.ready}\tstate=${status.runbook.state}`);
+  for (const step of status.runbook.steps) {
+    console.log(`- [${step.status}] ${step.label}${step.command ? `: ${step.command}` : ""}`);
+    console.log(`  ${step.reason}`);
+  }
   if (status.sessions.length > 0) {
     console.log("");
     console.log("Sessions:");

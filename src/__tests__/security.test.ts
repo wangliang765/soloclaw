@@ -7739,6 +7739,10 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       localAgentDaemonActiveLeases?: number;
       localAgentDaemonWorkerPollCommand?: string;
       localAgentDaemonNextStep?: string;
+      localAgentRunbookReady?: boolean;
+      localAgentRunbookSteps?: number;
+      localAgentRunbookRequiredCommand?: string;
+      localAgentRunbookBlockedSteps?: number;
       localAgentLogItems?: number;
       localAgentLogKinds?: Record<string, number>;
       sessionReviewState?: string;
@@ -7914,6 +7918,10 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.localAgentDaemonActiveLeases, 0);
   assert.match(parsed.evidence?.localAgentDaemonWorkerPollCommand ?? "", /agent workers poll worker_/);
   assert.match(parsed.evidence?.localAgentDaemonNextStep ?? "", /Resolve pending approvals/);
+  assert.equal(parsed.evidence?.localAgentRunbookReady, false);
+  assert.equal((parsed.evidence?.localAgentRunbookSteps ?? 0) >= 4, true);
+  assert.equal(parsed.evidence?.localAgentRunbookRequiredCommand, "agent approvals pending");
+  assert.equal((parsed.evidence?.localAgentRunbookBlockedSteps ?? 0) >= 2, true);
   assert.equal((parsed.evidence?.localAgentLogItems ?? 0) >= 10, true);
   assert.equal((parsed.evidence?.localAgentLogKinds?.audit ?? 0) >= 6, true);
   assert.equal((parsed.evidence?.localAgentLogKinds?.approval ?? 0) >= 4, true);
@@ -8685,7 +8693,13 @@ test("agent session report summarizes engineering execution evidence", async (t)
       attention?: { required?: boolean; reasons?: string[] };
       nextStep?: string;
     };
-    commands?: { logs?: string; workerPoll?: string; latestSession?: string };
+    runbook?: {
+      state?: string;
+      ready?: boolean;
+      nextStep?: string;
+      steps?: Array<{ id?: string; label?: string; status?: string; command?: string; reason?: string }>;
+    };
+    commands?: { logs?: string; approvals?: string; workerPoll?: string; latestSession?: string };
   };
   assert.equal(localStatus.workspace, dir);
   assert.equal(localStatus.summary?.state, "needs_attention");
@@ -8713,7 +8727,14 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(localStatus.daemon?.attention?.required, true);
   assert.equal(localStatus.daemon?.attention?.reasons?.includes("pending_approvals"), true);
   assert.match(localStatus.daemon?.nextStep ?? "", /Resolve pending approvals/);
+  assert.equal(localStatus.runbook?.state, "needs_attention");
+  assert.equal(localStatus.runbook?.ready, false);
+  assert.match(localStatus.runbook?.nextStep ?? "", /Resolve pending approvals/);
+  assert.equal(localStatus.runbook?.steps?.some((step) => step.id === "resolve-attention" && step.status === "required" && step.command === "agent approvals pending"), true);
+  assert.equal(localStatus.runbook?.steps?.some((step) => step.id === "run-scheduler" && step.status === "blocked" && /agent scheduler run/.test(step.command ?? "")), true);
+  assert.equal(localStatus.runbook?.steps?.some((step) => step.id === "poll-worker" && step.status === "blocked" && new RegExp(`agent workers poll ${worker.id}`).test(step.command ?? "")), true);
   assert.match(localStatus.commands?.logs ?? "", /agent local logs/);
+  assert.match(localStatus.commands?.approvals ?? "", /agent approvals pending/);
   assert.match(localStatus.commands?.workerPoll ?? "", new RegExp(`agent workers poll ${worker.id}`));
 
   const localStatusText = await run(process.execPath, [cli, "local", "status", "--limit", "10"], dir);
@@ -8724,6 +8745,9 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(localStatusText.stdout, /Assignments:/);
   assert.match(localStatusText.stdout, /Pending approvals:/);
   assert.match(localStatusText.stdout, /Daemon loop:/);
+  assert.match(localStatusText.stdout, /Daemon runbook:/);
+  assert.match(localStatusText.stdout, /\[required\] Resolve attention items: agent approvals pending/);
+  assert.match(localStatusText.stdout, /\[blocked\] Run scheduler loop: agent scheduler run/);
   assert.match(localStatusText.stdout, /queueDepth=1/);
 
   const soloclawAgentStatus = await run(process.execPath, [cli, "agent", "status", "--json", "--limit", "10"], dir);
@@ -8945,7 +8969,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
       timeline?: { summary?: { returnedItems?: number } };
       review?: { summary?: { reviewState?: string; nextActions?: number }; nextActions?: Array<{ id?: string; status?: string }> };
       result?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number }; modelUsage?: { totals?: { totalTokens?: number } }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
-      localStatus?: { summary?: { state?: string; pendingApprovals?: number }; daemon?: { state?: string } };
+      localStatus?: {
+        summary?: { state?: string; pendingApprovals?: number };
+        daemon?: { state?: string };
+        runbook?: { ready?: boolean; steps?: Array<{ id?: string; status?: string; command?: string }> };
+      };
       localLogs?: { summary?: { returnedItems?: number; byKind?: Record<string, number> }; items?: Array<{ session?: { id?: string }; kind?: string; title?: string }> };
       verification?: { status?: string; options?: { requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> };
     };
@@ -8990,6 +9018,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundle.sections?.localStatus?.summary?.state, "needs_attention");
   assert.equal(bundle.sections?.localStatus?.daemon?.state, "needs_attention");
   assert.equal(bundle.sections?.localStatus?.summary?.pendingApprovals, 1);
+  assert.equal(bundle.sections?.localStatus?.runbook?.ready, false);
+  assert.equal(bundle.sections?.localStatus?.runbook?.steps?.some((step) => step.id === "resolve-attention" && step.status === "required"), true);
   assert.equal((bundle.sections?.localLogs?.summary?.returnedItems ?? 0) >= 5, true);
   assert.equal(bundle.sections?.localLogs?.items?.some((item) => item.session?.id === session.id && item.kind === "audit"), true);
   assert.equal(bundle.sections?.verification?.status, "pass");
