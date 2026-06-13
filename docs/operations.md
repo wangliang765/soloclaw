@@ -41,6 +41,11 @@ agent approve <approval-id> --auto-replay --auto-resume "reason"
   -> approved pending tool is executed
   -> real tool result is appended to the original session transcript
   -> session resumes from durable messages
+
+agent approve <approval-id> --queue-resume <worker-id> "reason"
+  -> approved pending tool is executed
+  -> real tool result is appended to the original session transcript
+  -> session is assigned to the local worker queue for continuation
 ```
 
 `--auto-resume` implies `--auto-replay`. Denied approvals keep the session paused for now; production workers should move the session into a clear waiting, failed, or replanning state depending on policy.

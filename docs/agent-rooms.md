@@ -489,6 +489,7 @@ agent tool create_file --execution-mode balanced --room <room-id> --input-file <
 agent approvals pending
 agent approve <approval-id> "reason"
 agent approve <approval-id> --auto-replay --auto-resume "reason"
+agent approve <approval-id> --queue-resume <worker-id> "reason"
 agent replay <approval-id>
 agent spec dispatch <spec-id> --plan <plan-id> --require-plan-approval
 agent spec dispatch <spec-id> --plan <plan-id> --required-plan-approvals 2

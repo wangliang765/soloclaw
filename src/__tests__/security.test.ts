@@ -2283,6 +2283,136 @@ test("MCP execution CLI can continue an approved ask decision", async (t) => {
   }
 });
 
+test("approval CLI can queue session resume through a local worker", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-approval-queue-cli-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const approvalId = "appr_queue_resume_cli";
+  const pendingToolCallId = "pending_tool_queue_resume_cli";
+  const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
+  let workerId = "";
+  let sessionId = "";
+
+  {
+    const platform = await createLocalPlatform(dir, { provider: "mock" });
+    try {
+      const worker = await platform.workers.register({
+        actor,
+        agentId: platform.localAgent.id,
+        machineId: platform.localAgent.machineId,
+        displayName: "Queue continuation worker",
+        maxConcurrentTasks: 1,
+        ttlSeconds: 60,
+      });
+      workerId = worker.id;
+      const session = await platform.store.createSession({
+        objective: "approval queue continuation CLI test",
+        status: "paused",
+        risk: "medium",
+        createdBy: actor,
+      });
+      sessionId = session.id;
+      await platform.store.appendMessage({
+        sessionId,
+        message: { role: "system", content: "Mock approval queue continuation CLI test." },
+      });
+      await platform.store.appendMessage({
+        sessionId,
+        message: { role: "user", content: "inspect this workspace after queued approval" },
+      });
+      await platform.organizations.grantCapability({
+        subjectType: "user",
+        subjectId: actor.id,
+        scopeType: "session",
+        scopeId: sessionId,
+        capability: "tool.approve",
+        grantedBy: actor,
+      });
+      const now = new Date().toISOString();
+      await platform.store.createApprovalRequest({
+        id: approvalId,
+        status: "pending",
+        requestedBy: actor,
+        action: "workspace.write",
+        reason: "Need write approval for queued continuation",
+        sessionId,
+        toolName: "create_file",
+        inputSummary: "{\"path\":\"queued-cli.txt\"}",
+        createdAt: now,
+      });
+      await platform.store.createPendingToolCall({
+        id: pendingToolCallId,
+        approvalId,
+        toolCallId: "cli-queued-create",
+        sessionId,
+        toolName: "create_file",
+        input: {
+          path: "queued-cli.txt",
+          content: "queued cli continuation\n",
+          overwrite: true,
+        },
+        requestedBy: actor,
+        status: "pending_approval",
+        createdAt: now,
+        updatedAt: now,
+      });
+    } finally {
+      platform.locks.close?.();
+      platform.store.close?.();
+    }
+  }
+
+  const approved = await run(process.execPath, [cli, "approve", approvalId, "--actor", "user:operator", "--queue-resume", workerId, "approved for queued continuation"], dir);
+  assert.equal(approved.exitCode, 0, approved.stderr);
+  assert.match(approved.stdout, /"replay":/);
+  const queuedLine = approved.stdout.split(/\r?\n/).find((line) => line.startsWith("queued_resume\t"));
+  assert.equal(Boolean(queuedLine), true, approved.stdout);
+  const [, assignmentId, queuedWorkerId, queuedSessionId] = queuedLine!.split("\t");
+  assert.equal(queuedWorkerId, workerId);
+  assert.equal(queuedSessionId, sessionId);
+
+  {
+    const platform = await createLocalPlatform(dir, { provider: "mock" });
+    try {
+      const pending = await platform.store.getPendingToolCallByApproval(approvalId);
+      const assignment = await platform.assignments.get(assignmentId);
+      assert.equal(pending?.status, "executed");
+      assert.equal(assignment?.status, "leased");
+      assert.equal(assignment?.metadata?.continuation, "approval_resume");
+      assert.equal(assignment?.metadata?.approvalId, approvalId);
+      assert.equal((await platform.store.getSession(sessionId))?.status, "running");
+      assert.equal(await exists(path.join(dir, "queued-cli.txt")), true);
+    } finally {
+      platform.locks.close?.();
+      platform.store.close?.();
+    }
+  }
+
+  const runOnce = await run(process.execPath, [cli, "workers", "run-once", workerId], dir);
+  assert.equal(runOnce.exitCode, 0, runOnce.stderr);
+  const runOutput = JSON.parse(runOnce.stdout) as { ran?: boolean; completed?: boolean; assignment?: { id?: string; status?: string }; finalAnswer?: string };
+  assert.equal(runOutput.ran, true);
+  assert.equal(runOutput.completed, true);
+  assert.equal(runOutput.assignment?.id, assignmentId);
+  assert.equal(runOutput.assignment?.status, "completed");
+  assert.match(runOutput.finalAnswer ?? "", /Blueprint agent loop is working/);
+
+  {
+    const platform = await createLocalPlatform(dir, { provider: "mock" });
+    try {
+      assert.equal((await platform.store.getSession(sessionId))?.status, "completed");
+      assert.equal((await platform.assignments.get(assignmentId))?.status, "completed");
+      const fileChanges = await platform.store.listFileChanges(sessionId);
+      assert.equal(fileChanges.some((change) => change.path === "queued-cli.txt"), true);
+    } finally {
+      platform.locks.close?.();
+      platform.store.close?.();
+    }
+  }
+});
+
 test("release boundary interfaces express artifact, event, migration, search, and MCP contracts", async () => {
   const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
   const artifactStore = new MemoryArtifactBoundary();
@@ -7290,17 +7420,20 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionDiffPatches?: number;
       sessionDiffFileChanges?: number;
       sessionDiffChangedPaths?: string[];
+      sessionDiffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
       sessionReportFileChanges?: number;
       sessionReportToolResults?: number;
       sessionReportCommandsFinished?: number;
       sessionReportTimedOutCommands?: number;
       sessionReportExecutionProfiles?: Record<string, number>;
+      sessionReportDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionReportPendingApprovals?: number;
       sessionResultOutcome?: string;
       sessionResultRecovered?: boolean;
       sessionResultCommandsFinished?: number;
       sessionResultTimedOutCommands?: number;
       sessionResultExecutionProfiles?: Record<string, number>;
+      sessionResultDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionResultPendingApprovals?: number;
       sessionResultChangedPaths?: string[];
       sessionTimelineItems?: number;
@@ -7312,6 +7445,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReviewChecklist?: Record<string, string>;
       sessionReviewChangedPaths?: string[];
       sessionReviewPatches?: number;
+      sessionReviewDiffStats?: { files?: number; additions?: number; deletions?: number };
       sessionReviewTimelineItems?: number;
       sessionVerificationStatus?: string;
       sessionVerificationChecks?: number;
@@ -7339,6 +7473,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       resumeVerificationStatus?: string;
       resumeToolResults?: number;
       resumeAuditEvents?: number;
+      queuedApprovalSessionId?: string;
+      queuedApprovalWorkerId?: string;
+      queuedApprovalAssignmentId?: string;
+      queuedApprovalOutcome?: string;
+      queuedApprovalCompleted?: boolean;
+      queuedApprovalFileChanges?: number;
+      queuedApprovalToolResults?: number;
+      queuedApprovalAuditEvents?: number;
       targetModeWorkspace?: string;
       targetModeSessions?: Array<{
         mode?: string;
@@ -7373,17 +7515,25 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionDiffPatches ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionDiffFileChanges ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionDiffChangedPaths?.includes("src/math.js"), true);
+  assert.equal(parsed.evidence?.sessionDiffStats?.files, 1);
+  assert.equal(parsed.evidence?.sessionDiffStats?.additions, 1);
+  assert.equal(parsed.evidence?.sessionDiffStats?.deletions, 1);
+  assert.equal(parsed.evidence?.sessionDiffStats?.byPath?.some((entry) => entry.path === "src/math.js" && entry.additions === 1 && entry.deletions === 1), true);
   assert.equal((parsed.evidence?.sessionReportFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionReportToolResults ?? 0) >= 3, true);
   assert.equal((parsed.evidence?.sessionReportCommandsFinished ?? 0) >= 2, true);
   assert.equal((parsed.evidence?.sessionReportTimedOutCommands ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionReportExecutionProfiles?.["local-safe"] ?? 0) >= 3, true);
+  assert.equal(parsed.evidence?.sessionReportDiffStats?.additions, 1);
+  assert.equal(parsed.evidence?.sessionReportDiffStats?.deletions, 1);
   assert.equal((parsed.evidence?.sessionReportPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultOutcome, "succeeded");
   assert.equal(parsed.evidence?.sessionResultRecovered, true);
   assert.equal((parsed.evidence?.sessionResultCommandsFinished ?? 0) >= 2, true);
   assert.equal((parsed.evidence?.sessionResultTimedOutCommands ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionResultExecutionProfiles?.["local-safe"] ?? 0) >= 3, true);
+  assert.equal(parsed.evidence?.sessionResultDiffStats?.additions, 1);
+  assert.equal(parsed.evidence?.sessionResultDiffStats?.deletions, 1);
   assert.equal((parsed.evidence?.sessionResultPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionResultChangedPaths?.includes("src/math.js"), true);
   assert.equal((parsed.evidence?.sessionTimelineItems ?? 0) >= 10, true);
@@ -7402,9 +7552,11 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.sessionReviewChecklist?.["tool-errors"], "pass");
   assert.equal(parsed.evidence?.sessionReviewChangedPaths?.includes("src/math.js"), true);
   assert.equal((parsed.evidence?.sessionReviewPatches ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionReviewDiffStats?.additions, 1);
+  assert.equal(parsed.evidence?.sessionReviewDiffStats?.deletions, 1);
   assert.equal((parsed.evidence?.sessionReviewTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionVerificationStatus, "pass");
-  assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 6, true);
+  assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 7, true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("workspace.write"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("dependency.install"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("git.mutation"), true);
@@ -7431,6 +7583,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.resumeVerificationStatus, "pass");
   assert.equal((parsed.evidence?.resumeToolResults ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.resumeAuditEvents ?? 0) >= 1, true);
+  assert.match(parsed.evidence?.queuedApprovalSessionId ?? "", /^sess_/);
+  assert.match(parsed.evidence?.queuedApprovalWorkerId ?? "", /^worker_/);
+  assert.match(parsed.evidence?.queuedApprovalAssignmentId ?? "", /^assign_/);
+  assert.equal(parsed.evidence?.queuedApprovalOutcome, "succeeded");
+  assert.equal(parsed.evidence?.queuedApprovalCompleted, true);
+  assert.equal((parsed.evidence?.queuedApprovalFileChanges ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.queuedApprovalToolResults ?? 0) >= 2, true);
+  assert.equal((parsed.evidence?.queuedApprovalAuditEvents ?? 0) >= 1, true);
   assert.match(parsed.evidence?.targetModeWorkspace ?? "", /phase2-target-modes-/);
   assert.deepEqual(parsed.evidence?.targetModeSessions?.map((entry) => entry.mode), ["plan", "build", "goal"]);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => /^sess_/.test(entry.sessionId ?? "")), true);
@@ -7451,6 +7611,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "patch-applied"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "recovered-test"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-diff-stat-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-report-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-result-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-profile-evidence"), true);
@@ -7461,6 +7622,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "policy-boundary-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-timeout-evidence"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-timeout"), true);
+  assert.equal(parsed.commands?.sessionVerify?.includes("--require-diff-stat"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-execution-profile"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-approval-actions"), true);
   assert.equal(parsed.commands?.sessionStatus?.includes("agent session status"), true);
@@ -7469,6 +7631,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "queued-approval-continuation-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "target-mode-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "lifecycle-evidence"), true);
   assert.equal(await exists(parsed.sampleWorkspace ?? path.join(dir, "missing")), false);
@@ -7633,6 +7796,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       commandsFinished?: number;
       failedCommands?: number;
       executionProfiles?: Record<string, number>;
+      diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
       approvals?: number;
       pendingApprovals?: number;
       changedPaths?: string[];
@@ -7651,6 +7815,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(parsed.summary?.commandsFinished, 2);
   assert.equal(parsed.summary?.failedCommands, 1);
   assert.equal(parsed.summary?.executionProfiles?.["local-safe"], 2);
+  assert.equal(parsed.summary?.diffStats?.files, 1);
+  assert.equal(parsed.summary?.diffStats?.additions, 1);
+  assert.equal(parsed.summary?.diffStats?.deletions, 1);
+  assert.equal(parsed.summary?.diffStats?.byPath?.some((entry) => entry.path === "src/math.js" && entry.additions === 1 && entry.deletions === 1), true);
   assert.equal(parsed.summary?.approvals, 1);
   assert.equal(parsed.summary?.pendingApprovals, 1);
   assert.equal(parsed.approvals?.[0]?.action, "workspace.write");
@@ -7667,6 +7835,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(text.stdout, /File changes:/);
   assert.match(text.stdout, /Commands:/);
   assert.match(text.stdout, /profile=local-safe/);
+  assert.match(text.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(text.stdout, /Approvals:/);
   assert.match(text.stdout, /workspace\.write/);
   assert.match(text.stdout, /src\/math\.js/);
@@ -7714,20 +7883,26 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(diffJson.exitCode, 0, diffJson.stderr);
   const diff = JSON.parse(diffJson.stdout) as {
     session?: { id?: string };
-    summary?: { patches?: number; fileChanges?: number; changedPaths?: string[] };
-    patches?: Array<{ ordinal?: number; paths?: string[]; patch?: string }>;
+    summary?: { patches?: number; fileChanges?: number; changedPaths?: string[]; diffStats?: { files?: number; additions?: number; deletions?: number } };
+    patches?: Array<{ ordinal?: number; paths?: string[]; stats?: { files?: number; additions?: number; deletions?: number }; patch?: string }>;
   };
   assert.equal(diff.session?.id, session.id);
   assert.equal(diff.summary?.patches, 1);
   assert.equal(diff.summary?.fileChanges, 1);
   assert.deepEqual(diff.summary?.changedPaths, ["src/math.js"]);
+  assert.equal(diff.summary?.diffStats?.files, 1);
+  assert.equal(diff.summary?.diffStats?.additions, 1);
+  assert.equal(diff.summary?.diffStats?.deletions, 1);
   assert.equal(diff.patches?.[0]?.ordinal, 1);
   assert.deepEqual(diff.patches?.[0]?.paths, ["src/math.js"]);
+  assert.equal(diff.patches?.[0]?.stats?.additions, 1);
+  assert.equal(diff.patches?.[0]?.stats?.deletions, 1);
   assert.match(diff.patches?.[0]?.patch ?? "", /return a \+ b/);
 
   const diffText = await run(process.execPath, [cli, "session", "diff", session.id], dir);
   assert.equal(diffText.exitCode, 0, diffText.stderr);
   assert.match(diffText.stdout, /Session diff:/);
+  assert.match(diffText.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(diffText.stdout, /diff --git a\/src\/math\.js b\/src\/math\.js/);
   assert.match(diffText.stdout, /-  return a - b;/);
 
@@ -7741,6 +7916,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       commandsFinished?: number;
       failedCommands?: number;
       executionProfiles?: Record<string, number>;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
       changedPaths?: string[];
       patches?: number;
       fileChanges?: number;
@@ -7763,6 +7939,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionResult.summary?.commandsFinished, 2);
   assert.equal(sessionResult.summary?.failedCommands, 1);
   assert.equal(sessionResult.summary?.executionProfiles?.["local-safe"], 2);
+  assert.equal(sessionResult.summary?.diffStats?.additions, 1);
+  assert.equal(sessionResult.summary?.diffStats?.deletions, 1);
   assert.deepEqual(sessionResult.summary?.changedPaths, ["src/math.js"]);
   assert.equal(sessionResult.summary?.patches, 1);
   assert.equal(sessionResult.summary?.fileChanges, 1);
@@ -7784,6 +7962,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(resultText.stdout, /outcome=succeeded/);
   assert.match(resultText.stdout, /recovered=yes/);
   assert.match(resultText.stdout, /Recovery:/);
+  assert.match(resultText.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(resultText.stdout, /Changed files:/);
   assert.match(resultText.stdout, /Approvals:/);
 
@@ -7796,6 +7975,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       timelineItems?: number;
       pendingApprovals?: number;
       executionProfiles?: Record<string, number>;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
     };
     latestTimeline?: Array<{ kind?: string; title?: string }>;
     reviewCommands?: { timeline?: string; result?: string; report?: string };
@@ -7805,6 +7985,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.summary?.timelineItems, timeline.summary?.totalItems);
   assert.equal(status.summary?.pendingApprovals, 1);
   assert.equal(status.summary?.executionProfiles?.["local-safe"], 2);
+  assert.equal(status.summary?.diffStats?.additions, 1);
+  assert.equal(status.summary?.diffStats?.deletions, 1);
   assert.equal(status.latestTimeline?.length, 5);
   assert.match(status.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${session.id}`));
 
@@ -7825,11 +8007,13 @@ test("agent session report summarizes engineering execution evidence", async (t)
       patches?: number;
       pendingApprovals?: number;
       timelineItems?: number;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
     };
     checklist?: Array<{ id?: string; status?: string }>;
     changes?: {
       changedPaths?: string[];
-      patches?: Array<{ paths?: string[]; hasPatchText?: boolean; patchExcerpt?: string }>;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+      patches?: Array<{ paths?: string[]; stats?: { files?: number; additions?: number; deletions?: number }; hasPatchText?: boolean; patchExcerpt?: string }>;
     };
     commands?: Array<{ status?: string; exitCode?: number; executionProfile?: string }>;
     approvals?: Array<{ status?: string; action?: string; toolName?: string }>;
@@ -7845,6 +8029,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(review.summary?.patches, 1);
   assert.equal(review.summary?.pendingApprovals, 1);
   assert.equal(review.summary?.timelineItems, timeline.summary?.totalItems);
+  assert.equal(review.summary?.diffStats?.additions, 1);
+  assert.equal(review.summary?.diffStats?.deletions, 1);
   assert.equal(reviewChecklist["change-summary"], "pass");
   assert.equal(reviewChecklist["patch-review"], "pass");
   assert.equal(reviewChecklist["command-result"], "pass");
@@ -7852,7 +8038,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(reviewChecklist["approval-state"], "warn");
   assert.equal(reviewChecklist["tool-errors"], "pass");
   assert.deepEqual(review.changes?.changedPaths, ["src/math.js"]);
+  assert.equal(review.changes?.diffStats?.additions, 1);
+  assert.equal(review.changes?.diffStats?.deletions, 1);
   assert.deepEqual(review.changes?.patches?.[0]?.paths, ["src/math.js"]);
+  assert.equal(review.changes?.patches?.[0]?.stats?.additions, 1);
+  assert.equal(review.changes?.patches?.[0]?.stats?.deletions, 1);
   assert.equal(review.changes?.patches?.[0]?.hasPatchText, true);
   assert.match(review.changes?.patches?.[0]?.patchExcerpt ?? "", /return a \+ b/);
   assert.equal(review.commands?.length, 2);
@@ -7883,6 +8073,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     "--require-change",
     "--require-patch",
     "--require-recovery",
+    "--require-diff-stat",
     "--require-execution-profile",
     "local-safe",
     "--json",
@@ -7900,13 +8091,15 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(verification.checks?.every((check) => check.status === "pass"), true);
   assert.equal(verification.checks?.some((check) => check.id === "change-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "patch-evidence"), true);
+  assert.equal(verification.checks?.some((check) => check.id === "diff-stat-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "recovery-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "execution-profile-local-safe"), true);
 
-  const verifyText = await run(process.execPath, [cli, "session", "verify", session.id, "--require-change", "--require-patch", "--require-recovery", "--require-execution-profile", "local-safe"], dir);
+  const verifyText = await run(process.execPath, [cli, "session", "verify", session.id, "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-execution-profile", "local-safe"], dir);
   assert.equal(verifyText.exitCode, 0, verifyText.stderr);
   assert.match(verifyText.stdout, /Session verification:/);
   assert.match(verifyText.stdout, /status=pass/);
+  assert.match(verifyText.stdout, /\[pass\] diff stat evidence/);
   assert.match(verifyText.stdout, /\[pass\] recovery evidence/);
 
   const verifyFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-change", "--json"], dir);
@@ -7917,6 +8110,15 @@ test("agent session report summarizes engineering execution evidence", async (t)
   };
   assert.equal(failedVerification.status, "fail");
   assert.equal(failedVerification.checks?.some((check) => check.id === "change-evidence" && check.status === "fail"), true);
+
+  const diffStatFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-diff-stat", "--json"], dir);
+  assert.equal(diffStatFailure.exitCode, 1);
+  const failedDiffStatVerification = JSON.parse(diffStatFailure.stdout) as {
+    status?: string;
+    checks?: Array<{ id?: string; status?: string }>;
+  };
+  assert.equal(failedDiffStatVerification.status, "fail");
+  assert.equal(failedDiffStatVerification.checks?.some((check) => check.id === "diff-stat-evidence" && check.status === "fail"), true);
 });
 
 test("agent session verify can gate timeout and approval action evidence", async (t) => {

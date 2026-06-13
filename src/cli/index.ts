@@ -471,6 +471,7 @@ async function main() {
           requirePatch: cli.requirePatch,
           requireRecovery: cli.requireRecovery,
           requireTimeout: cli.requireTimeout,
+          requireDiffStat: cli.requireDiffStat,
           requiredExecutionProfiles: cli.requiredExecutionProfiles,
           requiredApprovalActions: cli.requiredApprovalActions,
           requireCommand: cli.allowNoCommand !== true,
@@ -2519,13 +2520,19 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const { agent, workspace, store, rooms, locks, localAgent, plugins, organizations, policy, secretBroker, redactor } = await createLocalPlatform(process.cwd());
+    const { agent, workspace, store, rooms, locks, localAgent, plugins, organizations, policy, secretBroker, redactor, taskBroker } = await createLocalPlatform(process.cwd());
     try {
+      if (parsedApproval.options.autoResume && parsedApproval.options.queueResumeWorkerId) {
+        throw new Error("--auto-resume and --queue-resume are mutually exclusive.");
+      }
       const decidedBy = parsedApproval.options.localAgent
         ? agentActor(localAgent)
         : await resolveActor(store, parseActorRef(parsedApproval.options.actor));
       const existingApproval = (await store.listApprovalRequests()).find((candidate) => candidate.id === approvalId);
       if (existingApproval) {
+        if (parsedApproval.options.queueResumeWorkerId && isMcpApprovalAction(existingApproval.action)) {
+          throw new Error("--queue-resume is only supported for session-scoped workspace/plugin tool approvals.");
+        }
         await ensureApprovalDecisionAllowed({
           approval: existingApproval,
           decidedBy,
@@ -2546,8 +2553,11 @@ async function main() {
       }
       await appendApprovalDecisionRoomMessage(store, approval, decidedBy);
       console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`);
-      if (command === "approve" && (parsedApproval.options.autoReplay || parsedApproval.options.autoResume)) {
+      if (command === "approve" && (parsedApproval.options.autoReplay || parsedApproval.options.autoResume || parsedApproval.options.queueResumeWorkerId)) {
         if (isMcpApprovalAction(approval.action)) {
+          if (parsedApproval.options.queueResumeWorkerId) {
+            throw new Error("--queue-resume is only supported for session-scoped workspace/plugin tool approvals.");
+          }
           const mcpResult = await new McpExecutionService(
             new LocalMcpRegistry(path.join(process.cwd(), ".agent")),
             new LocalMcpRuntime({ redactor }),
@@ -2562,9 +2572,11 @@ async function main() {
         } else {
           const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
           const { replayApprovedTool } = await import("../tools/tool-replay.js");
+          const pending = await store.getPendingToolCallByApproval(approvalId);
           const pluginTools = await plugins.createTools({
             store,
             actor: decidedBy,
+            sessionId: pending?.sessionId,
           });
           const replayResult = await replayApprovedTool({
             approvalId,
@@ -2574,10 +2586,30 @@ async function main() {
               store,
               locks,
               actor: decidedBy,
+              sessionId: pending?.sessionId,
             }).concat(pluginTools),
           });
           console.log(JSON.stringify({ replay: replayResult }, null, 2));
-          const pending = await store.getPendingToolCallByApproval(approvalId);
+          if (parsedApproval.options.queueResumeWorkerId) {
+            if (!pending?.sessionId) {
+              throw new Error(`Approval ${approvalId} has no session to queue for resume.`);
+            }
+            if (!replayResult.ok) {
+              throw new Error(`Approved tool replay failed; session was not queued for resume.`);
+            }
+            const assignment = await taskBroker.enqueue({
+              actor: decidedBy,
+              workerId: parsedApproval.options.queueResumeWorkerId,
+              sessionId: pending.sessionId,
+              metadata: {
+                continuation: "approval_resume",
+                approvalId,
+                pendingToolCallId: pending.id,
+                toolName: pending.toolName,
+              },
+            });
+            console.log(`queued_resume\t${assignment.id}\t${assignment.workerId}\t${pending.sessionId}`);
+          }
           if (parsedApproval.options.autoResume && pending?.sessionId && replayResult.ok) {
             const finalAnswer = await agent.resume(pending.sessionId);
             console.log(finalAnswer);
@@ -3812,7 +3844,7 @@ async function main() {
       if (subcommand === "verify") {
         const parsed = parseLifecycleArgs(args);
         if (!sessionId) {
-          console.error("Usage: agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
+          console.error("Usage: agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
           process.exitCode = 1;
           return;
         }
@@ -3821,6 +3853,7 @@ async function main() {
           requirePatch: parsed.options.requirePatch,
           requireRecovery: parsed.options.requireRecovery,
           requireTimeout: parsed.options.requireTimeout,
+          requireDiffStat: parsed.options.requireDiffStat,
           requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
           requiredApprovalActions: parsed.options.requiredApprovalActions,
           requireCommand: parsed.options.allowNoCommand !== true,
@@ -4061,6 +4094,7 @@ async function main() {
       requirePatch: parsed.cli.requirePatch,
       requireRecovery: parsed.cli.requireRecovery,
       requireTimeout: parsed.cli.requireTimeout,
+      requireDiffStat: parsed.cli.requireDiffStat,
       requiredExecutionProfiles: parsed.cli.requiredExecutionProfiles,
       requiredApprovalActions: parsed.cli.requiredApprovalActions,
       requireCommand: parsed.cli.allowNoCommand !== true,
@@ -4114,6 +4148,7 @@ type RunCliOptions = {
   requirePatch?: boolean;
   requireRecovery?: boolean;
   requireTimeout?: boolean;
+  requireDiffStat?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
   allowNoCommand?: boolean;
@@ -4390,6 +4425,11 @@ function applyRunEvidenceFlag(arg: string, cli: RunCliOptions): boolean {
   }
   if (arg === "--require-timeout") {
     cli.requireTimeout = true;
+    cli.verifySession = true;
+    return true;
+  }
+  if (arg === "--require-diff-stat" || arg === "--require-diff-stats") {
+    cli.requireDiffStat = true;
     cli.verifySession = true;
     return true;
   }
@@ -4686,17 +4726,20 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionDiffPatches: number;
     sessionDiffFileChanges: number;
     sessionDiffChangedPaths: string[];
+    sessionDiffStats: UnifiedDiffStats;
     sessionReportFileChanges: number;
     sessionReportToolResults: number;
     sessionReportCommandsFinished: number;
     sessionReportTimedOutCommands: number;
     sessionReportExecutionProfiles: Record<string, number>;
+    sessionReportDiffStats: UnifiedDiffStats;
     sessionReportPendingApprovals: number;
     sessionResultOutcome?: string;
     sessionResultRecovered: boolean;
     sessionResultCommandsFinished: number;
     sessionResultTimedOutCommands: number;
     sessionResultExecutionProfiles: Record<string, number>;
+    sessionResultDiffStats: UnifiedDiffStats;
     sessionResultPendingApprovals: number;
     sessionResultChangedPaths: string[];
     sessionTimelineItems: number;
@@ -4708,6 +4751,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewChecklist: Record<string, string>;
     sessionReviewChangedPaths: string[];
     sessionReviewPatches: number;
+    sessionReviewDiffStats: UnifiedDiffStats;
     sessionReviewTimelineItems: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
@@ -4735,6 +4779,14 @@ type PhaseTwoEngineeringSmokeResult = {
     resumeVerificationStatus?: string;
     resumeToolResults: number;
     resumeAuditEvents: number;
+    queuedApprovalSessionId?: string;
+    queuedApprovalWorkerId?: string;
+    queuedApprovalAssignmentId?: string;
+    queuedApprovalOutcome?: string;
+    queuedApprovalCompleted: boolean;
+    queuedApprovalFileChanges: number;
+    queuedApprovalToolResults: number;
+    queuedApprovalAuditEvents: number;
     targetModeWorkspace?: string;
     targetModeSessions: Array<{
       mode: string;
@@ -4942,6 +4994,17 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       status: sessionDiff.summary.patches >= 1 && sessionDiff.summary.changedPaths.includes("src/math.js") && hasExpectedPatch ? "pass" : "fail",
       summary: `session diff exposes ${sessionDiff.summary.patches} patch(es) across ${sessionDiff.summary.changedPaths.length} changed path(s)`,
     });
+    const sessionDiffStatPass =
+      sessionDiff.summary.diffStats.files === 1 &&
+      sessionDiff.summary.diffStats.additions === 1 &&
+      sessionDiff.summary.diffStats.deletions === 1 &&
+      sessionDiff.summary.diffStats.byPath.some((entry) => entry.path === "src/math.js" && entry.additions === 1 && entry.deletions === 1);
+    checks.push({
+      id: "session-diff-stat-evidence",
+      label: "session diff stat evidence",
+      status: sessionDiffStatPass ? "pass" : "fail",
+      summary: `diffStats=${formatDiffStats(sessionDiff.summary.diffStats)}`,
+    });
 
     const sessionReport = await buildSessionReport(platform.store, session.id);
     const requiredExecutionProfiles: CommandExecutionProfileName[] = ["local-safe"];
@@ -4954,6 +5017,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReport.summary.commandsFinished >= 2 &&
         sessionReport.summary.timedOutCommands >= 1 &&
         sessionReport.summary.pendingApprovals >= requiredPolicyBoundaryActions.length &&
+        sessionReport.summary.diffStats.additions >= 1 &&
+        sessionReport.summary.diffStats.deletions >= 1 &&
         sessionReport.summary.changedPaths.includes("src/math.js")
           ? "pass"
           : "fail",
@@ -4975,6 +5040,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResult.summary.changedPaths.includes("src/math.js") &&
         sessionResult.summary.timedOutCommands >= 1 &&
         sessionResult.summary.pendingApprovals >= requiredPolicyBoundaryActions.length &&
+        sessionResult.summary.diffStats.additions >= 1 &&
+        sessionResult.summary.diffStats.deletions >= 1 &&
         sessionResult.summary.commandsFinished >= 2
           ? "pass"
           : "fail",
@@ -5044,6 +5111,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       sessionReviewChecklist["tool-errors"] === "pass" &&
       sessionReview.changes.changedPaths.includes("src/math.js") &&
       sessionReview.changes.patches.length >= 1 &&
+      sessionReview.changes.diffStats.additions >= 1 &&
+      sessionReview.changes.diffStats.deletions >= 1 &&
       sessionReview.latestTimeline.length > 0;
     checks.push({
       id: "session-review-evidence",
@@ -5059,6 +5128,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       requirePatch: true,
       requireRecovery: true,
       requireTimeout: true,
+      requireDiffStat: true,
       requiredExecutionProfiles,
       requiredApprovalActions: requiredPolicyBoundaryActions,
     });
@@ -5122,6 +5192,23 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `verification=${resumeSmoke.verificationStatus ?? "-"}, auditEvents=${resumeSmoke.auditEvents}`,
     });
 
+    const queuedApproval = await runPhaseTwoQueuedApprovalContinuationSmoke(platform, actor);
+    checks.push({
+      id: "queued-approval-continuation-evidence",
+      label: "queued approval continuation evidence",
+      status:
+        queuedApproval.completed &&
+        queuedApproval.outcome === "succeeded" &&
+        queuedApproval.fileChanges >= 1 &&
+        queuedApproval.toolResults >= 2 &&
+        queuedApproval.auditEvents >= 1
+          ? "pass"
+          : "fail",
+      summary:
+        `session=${queuedApproval.sessionId ?? "-"}, worker=${queuedApproval.workerId ?? "-"}, ` +
+        `assignment=${queuedApproval.assignmentId ?? "-"}, outcome=${queuedApproval.outcome ?? "-"}, completed=${queuedApproval.completed}`,
+    });
+
     const targetModes = await runPhaseTwoTargetModeSmoke(cwd, { cleanup: options.cleanup });
     const targetModePass = targetModes.sessions.every((entry) =>
       entry.sessionId &&
@@ -5178,17 +5265,20 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionDiffPatches: sessionDiff.summary.patches,
         sessionDiffFileChanges: sessionDiff.summary.fileChanges,
         sessionDiffChangedPaths: sessionDiff.summary.changedPaths,
+        sessionDiffStats: sessionDiff.summary.diffStats,
         sessionReportFileChanges: sessionReport.summary.fileChanges,
         sessionReportToolResults: sessionReport.summary.toolResults,
         sessionReportCommandsFinished: sessionReport.summary.commandsFinished,
         sessionReportTimedOutCommands: sessionReport.summary.timedOutCommands,
         sessionReportExecutionProfiles: sessionReport.summary.executionProfiles,
+        sessionReportDiffStats: sessionReport.summary.diffStats,
         sessionReportPendingApprovals: sessionReport.summary.pendingApprovals,
         sessionResultOutcome: sessionResult.summary.outcome,
         sessionResultRecovered: sessionResult.summary.recovered,
         sessionResultCommandsFinished: sessionResult.summary.commandsFinished,
         sessionResultTimedOutCommands: sessionResult.summary.timedOutCommands,
         sessionResultExecutionProfiles: sessionResult.summary.executionProfiles,
+        sessionResultDiffStats: sessionResult.summary.diffStats,
         sessionResultPendingApprovals: sessionResult.summary.pendingApprovals,
         sessionResultChangedPaths: sessionResult.summary.changedPaths,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
@@ -5200,6 +5290,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewChecklist,
         sessionReviewChangedPaths: sessionReview.changes.changedPaths,
         sessionReviewPatches: sessionReview.changes.patches.length,
+        sessionReviewDiffStats: sessionReview.changes.diffStats,
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
@@ -5227,6 +5318,14 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         resumeVerificationStatus: resumeSmoke.verificationStatus,
         resumeToolResults: resumeSmoke.toolResults,
         resumeAuditEvents: resumeSmoke.auditEvents,
+        queuedApprovalSessionId: queuedApproval.sessionId,
+        queuedApprovalWorkerId: queuedApproval.workerId,
+        queuedApprovalAssignmentId: queuedApproval.assignmentId,
+        queuedApprovalOutcome: queuedApproval.outcome,
+        queuedApprovalCompleted: queuedApproval.completed,
+        queuedApprovalFileChanges: queuedApproval.fileChanges,
+        queuedApprovalToolResults: queuedApproval.toolResults,
+        queuedApprovalAuditEvents: queuedApproval.auditEvents,
         targetModeWorkspace: targetModes.workspace,
         targetModeSessions: targetModes.sessions.map((entry) => ({
           mode: entry.mode,
@@ -5257,7 +5356,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResult: `cd ${sampleWorkspace} && agent session result ${session.id}`,
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
-          `--require-timeout --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+          `--require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --verify-session "inspect this workspace"`,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
@@ -5297,16 +5396,19 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- toolResults=${result.evidence.toolResults}`);
   console.log(`- sessionDiffPatches=${result.evidence.sessionDiffPatches}`);
   console.log(`- sessionDiffChangedPaths=${result.evidence.sessionDiffChangedPaths.join(",") || "-"}`);
+  console.log(`- sessionDiffStats=${formatDiffStats(result.evidence.sessionDiffStats)}`);
   console.log(`- sessionReportFileChanges=${result.evidence.sessionReportFileChanges}`);
   console.log(`- sessionReportToolResults=${result.evidence.sessionReportToolResults}`);
   console.log(`- sessionReportCommandsFinished=${result.evidence.sessionReportCommandsFinished}`);
   console.log(`- sessionReportTimedOutCommands=${result.evidence.sessionReportTimedOutCommands}`);
   console.log(`- sessionReportExecutionProfiles=${formatRecordCounts(result.evidence.sessionReportExecutionProfiles)}`);
+  console.log(`- sessionReportDiffStats=${formatDiffStats(result.evidence.sessionReportDiffStats)}`);
   console.log(`- sessionResultOutcome=${result.evidence.sessionResultOutcome ?? "-"}`);
   console.log(`- sessionResultRecovered=${result.evidence.sessionResultRecovered}`);
   console.log(`- sessionResultCommandsFinished=${result.evidence.sessionResultCommandsFinished}`);
   console.log(`- sessionResultTimedOutCommands=${result.evidence.sessionResultTimedOutCommands}`);
   console.log(`- sessionResultExecutionProfiles=${formatRecordCounts(result.evidence.sessionResultExecutionProfiles)}`);
+  console.log(`- sessionResultDiffStats=${formatDiffStats(result.evidence.sessionResultDiffStats)}`);
   console.log(`- sessionResultChangedPaths=${result.evidence.sessionResultChangedPaths.join(",") || "-"}`);
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
   console.log(`- sessionTimelineKinds=${formatRecordCounts(result.evidence.sessionTimelineKinds)}`);
@@ -5316,6 +5418,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewChecklist=${Object.entries(result.evidence.sessionReviewChecklist).map(([key, value]) => `${key}:${value}`).join(",") || "-"}`);
   console.log(`- sessionReviewChangedPaths=${result.evidence.sessionReviewChangedPaths.join(",") || "-"}`);
   console.log(`- sessionReviewPatches=${result.evidence.sessionReviewPatches}`);
+  console.log(`- sessionReviewDiffStats=${formatDiffStats(result.evidence.sessionReviewDiffStats)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
@@ -5339,6 +5442,13 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- resumeVerificationStatus=${result.evidence.resumeVerificationStatus ?? "-"}`);
   console.log(`- resumeToolResults=${result.evidence.resumeToolResults}`);
   console.log(`- resumeAuditEvents=${result.evidence.resumeAuditEvents}`);
+  console.log(
+    `- queuedApprovalContinuation=session:${result.evidence.queuedApprovalSessionId ?? "-"},worker:${result.evidence.queuedApprovalWorkerId ?? "-"},` +
+    `assignment:${result.evidence.queuedApprovalAssignmentId ?? "-"},outcome:${result.evidence.queuedApprovalOutcome ?? "-"},completed:${result.evidence.queuedApprovalCompleted}`,
+  );
+  console.log(`- queuedApprovalFileChanges=${result.evidence.queuedApprovalFileChanges}`);
+  console.log(`- queuedApprovalToolResults=${result.evidence.queuedApprovalToolResults}`);
+  console.log(`- queuedApprovalAuditEvents=${result.evidence.queuedApprovalAuditEvents}`);
   console.log(`- targetModeWorkspace=${result.evidence.targetModeWorkspace ?? "-"}`);
   console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}`).join(",") || "-"}`);
   console.log(`- lifecycleAuditEvents=${result.evidence.lifecycleAuditEvents}`);
@@ -5457,6 +5567,118 @@ async function runPhaseTwoResumeSmoke(platform: Awaited<ReturnType<typeof create
     verificationStatus: verification.status,
     toolResults: result.summary.toolResults,
     auditEvents: auditEvents.filter((event) => event.type === "session.resumed").length,
+  };
+}
+
+async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<ReturnType<typeof createLocalPlatform>>, actor: ReturnType<typeof localUserActor>) {
+  const session = await platform.store.createSession({
+    objective: "Phase 2 queued approval smoke: replay an approved write and resume through a worker.",
+    targetMode: "build",
+    status: "paused",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await platform.store.appendMessage({
+    sessionId: session.id,
+    message: { role: "system", content: "Mock queued approval continuation smoke system prompt." },
+  });
+  await platform.store.appendMessage({
+    sessionId: session.id,
+    message: { role: "user", content: "inspect this workspace after queued approval continuation" },
+  });
+
+  const worker = await platform.workers.register({
+    actor,
+    agentId: platform.localAgent.id,
+    machineId: platform.localAgent.machineId,
+    displayName: "Phase 2 queued approval worker",
+    capabilities: ["workspace.exec"],
+    maxConcurrentTasks: 1,
+    ttlSeconds: 60,
+  });
+  const approvalId = makeId<"ArtifactId">("appr");
+  const pendingToolCallId = makeId<"ToolCallId">("pending_tool");
+  const now = new Date().toISOString();
+  await platform.store.createApprovalRequest({
+    id: approvalId,
+    status: "pending",
+    requestedBy: actor,
+    action: "workspace.write",
+    reason: "Phase 2 queued approval continuation smoke",
+    sessionId: session.id,
+    toolName: "create_file",
+    inputSummary: "{\"path\":\"queued-approval.txt\"}",
+    createdAt: now,
+  });
+  await platform.store.createPendingToolCall({
+    id: pendingToolCallId,
+    approvalId,
+    toolCallId: "phase2-queued-create",
+    sessionId: session.id,
+    toolName: "create_file",
+    input: {
+      path: "queued-approval.txt",
+      content: "queued approval continuation\n",
+      overwrite: true,
+    },
+    requestedBy: actor,
+    status: "pending_approval",
+    createdAt: now,
+    updatedAt: now,
+  });
+  await platform.store.decideApproval({
+    approvalId,
+    status: "approved",
+    decidedBy: actor,
+    decisionReason: "phase2 smoke queued continuation",
+  });
+
+  const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
+  const { replayApprovedTool } = await import("../tools/tool-replay.js");
+  const replay = await replayApprovedTool({
+    approvalId,
+    store: platform.store,
+    actor,
+    tools: createWorkspaceTools(platform.workspace, {
+      store: platform.store,
+      locks: platform.locks,
+      actor,
+      sessionId: session.id,
+    }),
+  });
+  const assignment = replay.ok
+    ? await platform.taskBroker.enqueue({
+        actor,
+        workerId: worker.id,
+        sessionId: session.id,
+        metadata: {
+          continuation: "approval_resume",
+          approvalId,
+          pendingToolCallId,
+          toolName: "create_file",
+        },
+      })
+    : undefined;
+  const run = assignment
+    ? await platform.workerRunner.runOnce({
+        workerId: worker.id,
+        actor,
+        leaseTtlSeconds: 60,
+      })
+    : undefined;
+  const result = await buildSessionResult(platform.store, session.id);
+  const auditEvents = await platform.store.listAuditEvents({ sessionId: session.id, limit: 100 });
+  const fileChanges = await platform.store.listFileChanges(session.id);
+  return {
+    sessionId: session.id,
+    workerId: worker.id,
+    assignmentId: assignment?.id,
+    outcome: result.summary.outcome,
+    completed: run?.ran === true && run.completed && result.summary.outcome === "succeeded",
+    replayOk: replay.ok,
+    fileChanges: fileChanges.length,
+    toolResults: result.summary.toolResults,
+    auditEvents: auditEvents.filter((event) => event.type === "task.assigned" || event.type === "task.completed" || event.type === "tool.completed").length,
   };
 }
 
@@ -5657,6 +5879,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
   const executionProfiles = commandExecutionProfileCounts(finishedCommands);
   const failedToolResults = toolResults.filter((result) => !result.ok);
   const changedPaths = [...new Set(fileChanges.map((change) => change.path))].sort();
+  const diffStats = mergeDiffStats(sessionPatchAuditEvents(auditEvents).map((event) => summarizeUnifiedDiffPatch(auditPatchInput(event.metadata))));
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const approvedApprovals = approvals.filter((approval) => approval.status === "approved");
   const deniedApprovals = approvals.filter((approval) => approval.status === "denied");
@@ -5675,6 +5898,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
       failedCommands: failedCommands.length,
       timedOutCommands: timedOutCommands.length,
       executionProfiles,
+      diffStats,
       approvals: approvals.length,
       pendingApprovals: pendingApprovals.length,
       approvedApprovals: approvedApprovals.length,
@@ -5731,6 +5955,7 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
   console.log(`- fileChanges=${report.summary.fileChanges} paths=${report.summary.changedPaths.length}`);
   console.log(`- commandsFinished=${report.summary.commandsFinished} failed=${report.summary.failedCommands} timedOut=${report.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(report.summary.executionProfiles)}`);
+  console.log(`- diffStats=${formatDiffStats(report.summary.diffStats)}`);
   console.log(`- approvals=${report.summary.approvals} pending=${report.summary.pendingApprovals}`);
   console.log(`- auditEvents=${report.summary.auditEvents}`);
   if (report.fileChanges.length > 0) {
@@ -5864,6 +6089,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       failedCommands: result.summary.failedCommands,
       timedOutCommands: result.summary.timedOutCommands,
       executionProfiles: result.summary.executionProfiles,
+      diffStats: result.summary.diffStats,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -5917,6 +6143,7 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- changedPaths=${status.summary.changedPaths.length ? status.summary.changedPaths.join(",") : "-"}`);
   console.log(`- commandsFinished=${status.summary.commandsFinished} failed=${status.summary.failedCommands} timedOut=${status.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(status.summary.executionProfiles)}`);
+  console.log(`- diffStats=${formatDiffStats(status.summary.diffStats)}`);
   console.log(`- pendingApprovals=${status.summary.pendingApprovals}`);
   console.log(`- toolResults=${status.summary.toolResults} failed=${status.summary.failedToolResults}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
@@ -5958,6 +6185,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       failedCommands: result.summary.failedCommands,
       timedOutCommands: result.summary.timedOutCommands,
       executionProfiles: result.summary.executionProfiles,
+      diffStats: result.summary.diffStats,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -5966,11 +6194,13 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     checklist,
     changes: {
       changedPaths: result.summary.changedPaths,
+      diffStats: diff.summary.diffStats,
       fileChanges: result.fileChanges,
       patches: diff.patches.map((patch) => ({
         ordinal: patch.ordinal,
         createdAt: patch.createdAt,
         paths: patch.paths,
+        stats: patch.stats,
         hasPatchText: Boolean(patch.patch),
         patchExcerpt: toolOutputExcerpt(patch.patch),
       })),
@@ -6015,7 +6245,7 @@ function buildSessionReviewChecklist(
       id: "patch-review",
       label: "patch review",
       status: diff.summary.patches > 0 ? "pass" : "warn",
-      summary: `${diff.summary.patches} persisted patch(es), ${diff.summary.changedPaths.length} diff path(s)`,
+      summary: `${diff.summary.patches} persisted patch(es), ${diff.summary.changedPaths.length} diff path(s), ${formatDiffStats(diff.summary.diffStats)}`,
     },
     {
       id: "command-result",
@@ -6076,6 +6306,7 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log("Summary:");
   console.log(`- changedPaths=${review.summary.changedPaths.length ? review.summary.changedPaths.join(",") : "-"}`);
   console.log(`- patches=${review.summary.patches} fileChanges=${review.summary.fileChanges}`);
+  console.log(`- diffStats=${formatDiffStats(review.summary.diffStats)}`);
   console.log(`- commandsFinished=${review.summary.commandsFinished} failed=${review.summary.failedCommands} timedOut=${review.summary.timedOutCommands}`);
   console.log(`- pendingApprovals=${review.summary.pendingApprovals}`);
   console.log(`- timelineItems=${review.summary.timelineItems}`);
@@ -6257,6 +6488,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       failedCommands: failedCommands.length,
       timedOutCommands: timedOutCommands.length,
       executionProfiles: report.summary.executionProfiles,
+      diffStats: diff.summary.diffStats,
       approvals: report.summary.approvals,
       pendingApprovals: report.summary.pendingApprovals,
       approvedApprovals: report.summary.approvedApprovals,
@@ -6316,6 +6548,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       ordinal: patch.ordinal,
       createdAt: patch.createdAt,
       paths: patch.paths,
+      stats: patch.stats,
       hasPatchText: Boolean(patch.patch),
     })),
     reviewCommands: {
@@ -6361,6 +6594,7 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- changedPaths=${result.summary.changedPaths.length ? result.summary.changedPaths.join(",") : "-"}`);
   console.log(`- fileChanges=${result.summary.fileChanges}`);
   console.log(`- patches=${result.summary.patches}`);
+  console.log(`- diffStats=${formatDiffStats(result.summary.diffStats)}`);
   console.log(`- commandsFinished=${result.summary.commandsFinished} failed=${result.summary.failedCommands} timedOut=${result.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(result.summary.executionProfiles)}`);
   console.log(`- approvals=${result.summary.approvals} pending=${result.summary.pendingApprovals}`);
@@ -6410,6 +6644,7 @@ type SessionVerificationOptions = {
   requirePatch?: boolean;
   requireRecovery?: boolean;
   requireTimeout?: boolean;
+  requireDiffStat?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
   requireCommand?: boolean;
@@ -6464,6 +6699,14 @@ async function buildSessionVerification(store: AgentStore, sessionId: string, op
       summary: `${result.summary.patches} persisted patch(es)`,
     });
   }
+  if (options.requireDiffStat) {
+    checks.push({
+      id: "diff-stat-evidence",
+      label: "diff stat evidence",
+      status: result.summary.diffStats.files > 0 && (result.summary.diffStats.additions > 0 || result.summary.diffStats.deletions > 0) ? "pass" : "fail",
+      summary: formatDiffStats(result.summary.diffStats),
+    });
+  }
   if (options.requireRecovery) {
     checks.push({
       id: "recovery-evidence",
@@ -6510,6 +6753,7 @@ async function buildSessionVerification(store: AgentStore, sessionId: string, op
       requirePatch: Boolean(options.requirePatch),
       requireRecovery: Boolean(options.requireRecovery),
       requireTimeout: Boolean(options.requireTimeout),
+      requireDiffStat: Boolean(options.requireDiffStat),
       requiredExecutionProfiles: [...new Set(options.requiredExecutionProfiles ?? [])],
       requiredApprovalActions: [...new Set(options.requiredApprovalActions ?? [])],
     },
@@ -6584,25 +6828,22 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
   }
   const auditEvents = await store.listAuditEvents({ sessionId, limit: 500 });
   const fileChanges = await store.listFileChanges(sessionId);
-  const patchEvents = auditEvents
-    .filter((event) =>
-      event.type === "tool.completed" &&
-      event.metadata?.tool === "apply_patch" &&
-      event.metadata?.ok === true
-    )
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const patchEvents = sessionPatchAuditEvents(auditEvents);
   const patches = patchEvents.map((event, index) => {
     const patch = auditPatchInput(event.metadata);
     const paths = patch ? extractUnifiedDiffPaths(patch) : [];
+    const stats = summarizeUnifiedDiffPatch(patch);
     return {
       ordinal: index + 1,
       createdAt: event.createdAt,
       actor: event.actor,
       summary: event.summary,
       paths,
+      stats,
       patch,
     };
   });
+  const diffStats = mergeDiffStats(patches.map((patch) => patch.stats));
   return {
     generatedAt: new Date().toISOString(),
     session,
@@ -6610,6 +6851,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
       patches: patches.length,
       fileChanges: fileChanges.length,
       changedPaths: [...new Set(fileChanges.map((change) => change.path))].sort(),
+      diffStats,
     },
     patches,
     fileChanges,
@@ -6619,6 +6861,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
 function printSessionDiff(diff: Awaited<ReturnType<typeof buildSessionDiff>>): void {
   console.log(`Session diff: ${diff.session.id}`);
   console.log(`status=${diff.session.status}\tpatches=${diff.summary.patches}\tfileChanges=${diff.summary.fileChanges}`);
+  console.log(`diffStats=${formatDiffStats(diff.summary.diffStats)}`);
   if (diff.summary.changedPaths.length > 0) {
     console.log(`changedPaths=${diff.summary.changedPaths.join(",")}`);
   }
@@ -6628,13 +6871,23 @@ function printSessionDiff(diff: Awaited<ReturnType<typeof buildSessionDiff>>): v
   }
   for (const patch of diff.patches) {
     console.log("");
-    console.log(`# patch ${patch.ordinal}\t${patch.createdAt}\tpaths=${patch.paths.join(",") || "-"}`);
+    console.log(`# patch ${patch.ordinal}\t${patch.createdAt}\tpaths=${patch.paths.join(",") || "-"}\t${formatDiffStats(patch.stats)}`);
     if (patch.patch) {
       process.stdout.write(patch.patch.endsWith("\n") ? patch.patch : `${patch.patch}\n`);
     } else {
       console.log("[patch input unavailable]");
     }
   }
+}
+
+function sessionPatchAuditEvents(auditEvents: AuditEvent[]): AuditEvent[] {
+  return auditEvents
+    .filter((event) =>
+      event.type === "tool.completed" &&
+      event.metadata?.tool === "apply_patch" &&
+      event.metadata?.ok === true
+    )
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 }
 
 function auditPatchInput(metadata: Record<string, unknown> | undefined): string | undefined {
@@ -6644,6 +6897,110 @@ function auditPatchInput(metadata: Record<string, unknown> | undefined): string 
   }
   const patch = (input as Record<string, unknown>).patch;
   return typeof patch === "string" ? patch : undefined;
+}
+
+type UnifiedDiffPathStats = {
+  path: string;
+  additions: number;
+  deletions: number;
+};
+
+type UnifiedDiffStats = {
+  files: number;
+  additions: number;
+  deletions: number;
+  byPath: UnifiedDiffPathStats[];
+};
+
+function summarizeUnifiedDiffPatch(patch: string | undefined): UnifiedDiffStats {
+  if (!patch) {
+    return emptyDiffStats();
+  }
+  const byPath = new Map<string, UnifiedDiffPathStats>();
+  let oldPath: string | undefined;
+  let currentPath: string | undefined;
+  let inHunk = false;
+
+  for (const line of patch.replace(/\r\n/g, "\n").split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      oldPath = undefined;
+      currentPath = undefined;
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith("--- ")) {
+      oldPath = parseUnifiedDiffPath(line, "--- ");
+      currentPath = oldPath;
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      const newPath = parseUnifiedDiffPath(line, "+++ ");
+      currentPath = newPath ?? oldPath;
+      if (currentPath) {
+        ensureDiffPathStats(byPath, currentPath);
+      }
+      inHunk = false;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      if (currentPath) {
+        ensureDiffPathStats(byPath, currentPath);
+      }
+      continue;
+    }
+    if (!inHunk || !currentPath) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      ensureDiffPathStats(byPath, currentPath).additions += 1;
+    } else if (line.startsWith("-")) {
+      ensureDiffPathStats(byPath, currentPath).deletions += 1;
+    }
+  }
+
+  return diffStatsFromMap(byPath);
+}
+
+function mergeDiffStats(stats: UnifiedDiffStats[]): UnifiedDiffStats {
+  const byPath = new Map<string, UnifiedDiffPathStats>();
+  for (const stat of stats) {
+    for (const entry of stat.byPath) {
+      const target = ensureDiffPathStats(byPath, entry.path);
+      target.additions += entry.additions;
+      target.deletions += entry.deletions;
+    }
+  }
+  return diffStatsFromMap(byPath);
+}
+
+function ensureDiffPathStats(byPath: Map<string, UnifiedDiffPathStats>, pathName: string): UnifiedDiffPathStats {
+  const existing = byPath.get(pathName);
+  if (existing) {
+    return existing;
+  }
+  const created = { path: pathName, additions: 0, deletions: 0 };
+  byPath.set(pathName, created);
+  return created;
+}
+
+function diffStatsFromMap(byPath: Map<string, UnifiedDiffPathStats>): UnifiedDiffStats {
+  const entries = [...byPath.values()].sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    files: entries.length,
+    additions: entries.reduce((total, entry) => total + entry.additions, 0),
+    deletions: entries.reduce((total, entry) => total + entry.deletions, 0),
+    byPath: entries,
+  };
+}
+
+function emptyDiffStats(): UnifiedDiffStats {
+  return { files: 0, additions: 0, deletions: 0, byPath: [] };
+}
+
+function formatDiffStats(stats: UnifiedDiffStats): string {
+  return `files:${stats.files},+${stats.additions},-${stats.deletions}`;
 }
 
 function extractUnifiedDiffPaths(patch: string): string[] {
@@ -8077,7 +8434,7 @@ Usage:
   soloclaw config show [--workspace path] [--json]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -8092,8 +8449,8 @@ Usage:
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
-  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent pause <session-id> [reason]
   agent cancel <session-id> [reason]
   agent identity show
@@ -8181,7 +8538,7 @@ Usage:
   agent tool run_command [--execution-mode strict|balanced|trusted|full_access] [--org org-id] [--project project-id] [--room room-id] "npm test"
   agent tool apply_patch [--execution-mode strict|balanced|trusted|full_access] <unified-diff>
   agent approvals [pending|approved|denied]
-  agent approve <approval-id> [--local-agent|--actor user:id|agent:id] [--auto-replay] [--auto-resume] [reason]
+  agent approve <approval-id> [--local-agent|--actor user:id|agent:id] [--auto-replay] [--auto-resume|--queue-resume worker-id] [reason]
   agent deny <approval-id> [--local-agent|--actor user:id|agent:id] [reason]
   agent replay <approval-id>
   agent delegate [--parent-session session-id] [--room room-id] [--assigned-agent agent-id] "subtask objective"
@@ -8232,7 +8589,7 @@ Usage:
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id]
   agent artifacts list [--project id] [--session id] [--status active|deleted]
   agent artifacts delete <artifact-id> [--delete-file] [--force]
@@ -8328,6 +8685,7 @@ Examples:
   agent tool create_file --execution-mode balanced --room room_xxxxxxxx --input-file .agent/tmp/replay-create-input.json
   agent approvals pending
   agent replay appr_xxxxxxxx
+  agent approve appr_xxxxxxxx --queue-resume worker_xxxxxxxx "approved for queued continuation"
   agent delegate "inspect this workspace as a child task"
   agent delegate --room room_xxxxxxxx "inspect this workspace as a room task"
   agent skills load
@@ -9993,6 +10351,7 @@ type LifecycleCliOptions = {
   requirePatch?: boolean;
   requireRecovery?: boolean;
   requireTimeout?: boolean;
+  requireDiffStat?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
   allowNoCommand?: boolean;
@@ -10036,6 +10395,10 @@ function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; pos
     }
     if (arg === "--require-timeout") {
       options.requireTimeout = true;
+      continue;
+    }
+    if (arg === "--require-diff-stat" || arg === "--require-diff-stats") {
+      options.requireDiffStat = true;
       continue;
     }
     const executionProfilesValue = inlineOptionValue(arg, "--require-execution-profiles") ?? inlineOptionValue(arg, "--require-execution-profile");
@@ -10215,6 +10578,7 @@ type ApprovalCliOptions = {
   localAgent?: boolean;
   autoReplay?: boolean;
   autoResume?: boolean;
+  queueResumeWorkerId?: string;
 };
 
 type SecretCliOptions = {
@@ -10565,6 +10929,12 @@ function parseApprovalArgs(args: string[]): { options: ApprovalCliOptions; posit
     if (arg === "--auto-resume") {
       options.autoResume = true;
       options.autoReplay = true;
+      continue;
+    }
+    if ((arg === "--queue-resume" || arg === "--enqueue-resume") && next) {
+      options.queueResumeWorkerId = next;
+      options.autoReplay = true;
+      index += 1;
       continue;
     }
     positionals.push(arg);

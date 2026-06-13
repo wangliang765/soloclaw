@@ -197,7 +197,7 @@ export class AgentLoop {
               reason: approvalId ? `Waiting for approval ${approvalId}` : "Waiting for tool approval",
             });
             return approvalId
-              ? `Session ${session.id} paused waiting for approval ${approvalId}. Run: agent approve ${approvalId} --auto-replay --auto-resume`
+              ? `Session ${session.id} paused waiting for approval ${approvalId}. Run: agent approve ${approvalId} --auto-replay --auto-resume, or use --queue-resume <worker-id> for worker continuation.`
               : `Session ${session.id} paused waiting for tool approval.`;
           }
           await this.store.appendMessage({
