@@ -63,6 +63,7 @@ agent local status --json --limit 10
 agent local logs --limit 20
 soloclaw agent status --json
 soloclaw agent logs --limit 20
+agent run --require-model-ready --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env LOCAL_LLM_API_KEY "inspect this workspace"
 agent session bundle <session-id> --json --output .agent/tmp/session-bundle.json
 agent session bundle <session-id> --json --require-change --require-patch --require-recovery --require-diff-stat --require-execution-profile local-safe
 ```
@@ -74,6 +75,8 @@ agent session bundle <session-id> --json --require-change --require-patch --requ
 `agent local logs` is the merged local execution log. It combines safe audit events, file changes, approval requests, and approval decisions across recent sessions, attaching session ids/statuses when available. It is intended for foreground supervision, TUI reuse, and future daemon log panels; it does not imply an installed OS service.
 
 The interactive `soloclaw` shell exposes the same views as `/agent status` and `/agent logs`, with `/agent` defaulting to status. These commands use the currently selected workspace, so operators can switch with `/workspace ...` and inspect the matching local agent state without leaving the TUI.
+
+For supervised real-model tasks, add `--require-model-ready` to `agent run`, `agent ask`, `agent plan`, `agent build`, or `agent goal`. The command checks the selected provider, model, base URL, API-key environment names, and configured secret-ref state before the local platform/session is opened; failures return `status=blocked` in JSON mode or a `Model readiness gate failed.` text block with the same fields as `soloclaw model check`.
 
 The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, and a short review hint when the session contains completed `apply_patch` evidence. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
 

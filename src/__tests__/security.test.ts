@@ -1269,6 +1269,106 @@ test("agent run can emit session evidence and verify the completed run", async (
   assert.match(failedGate.stdout, /\[fail\] change evidence/);
 });
 
+test("agent run can require model readiness before opening a session", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-run-model-ready-gate-"));
+  const envName = "AGENT_READY_GATE_MISSING_API_KEY";
+  const previousKey = process.env[envName];
+  delete process.env[envName];
+  t.after(async () => {
+    if (previousKey === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = previousKey;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Run Model Ready Gate\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const blocked = await run(process.execPath, [
+    cli,
+    "run",
+    "--json",
+    "--require-model-ready",
+    "--provider",
+    "openai_compatible",
+    "--base-url",
+    "http://localhost:11434/v1",
+    "--model",
+    "qwen-local",
+    "--api-key-env",
+    envName,
+    "inspect",
+    "this",
+    "workspace",
+  ], dir);
+  assert.equal(blocked.exitCode, 1, blocked.stderr);
+  const parsed = JSON.parse(blocked.stdout) as {
+    status?: string;
+    workspace?: string;
+    session?: unknown;
+    modelReadiness?: {
+      ready?: boolean;
+      status?: string;
+      provider?: string;
+      model?: string;
+      missingApiKeyEnvNames?: string[];
+      usesApiKeySecretRef?: boolean;
+    };
+  };
+  assert.equal(parsed.status, "blocked");
+  assert.equal(parsed.workspace, dir);
+  assert.equal(parsed.session, undefined);
+  assert.equal(parsed.modelReadiness?.ready, false);
+  assert.equal(parsed.modelReadiness?.status, "missing_api_key");
+  assert.equal(parsed.modelReadiness?.provider, "openai_compatible");
+  assert.equal(parsed.modelReadiness?.model, "qwen-local");
+  assert.deepEqual(parsed.modelReadiness?.missingApiKeyEnvNames, [envName]);
+  assert.equal(parsed.modelReadiness?.usesApiKeySecretRef, false);
+  assert.equal(await exists(path.join(dir, ".agent", "agent.db")), false);
+
+  const text = await run(process.execPath, [
+    cli,
+    "plan",
+    "--require-model-ready",
+    "--provider",
+    "openai_compatible",
+    "--base-url",
+    "http://localhost:11434/v1",
+    "--model",
+    "qwen-local",
+    "--api-key-env",
+    envName,
+    "inspect",
+    "this",
+    "workspace",
+  ], dir);
+  assert.equal(text.exitCode, 1);
+  assert.match(text.stdout, /Model readiness gate failed/);
+  assert.match(text.stdout, /status=missing_api_key/);
+  assert.match(text.stdout, new RegExp(`missingApiKeyEnv=${envName}`));
+  assert.match(text.stdout, /apiKeySecretRef=-/);
+  assert.equal(await exists(path.join(dir, ".agent", "agent.db")), false);
+
+  const ready = await run(process.execPath, [
+    cli,
+    "run",
+    "--json",
+    "--require-model-ready",
+    "--provider",
+    "mock",
+    "--allow-no-command",
+    "inspect",
+    "this",
+    "workspace",
+  ], dir);
+  assert.equal(ready.exitCode, 0, ready.stderr);
+  const readyParsed = JSON.parse(ready.stdout) as { session?: { id?: string; status?: string }; finalAnswer?: string };
+  assert.match(readyParsed.session?.id ?? "", /^sess_/);
+  assert.equal(readyParsed.session?.status, "completed");
+  assert.match(readyParsed.finalAnswer ?? "", /Blueprint agent loop is working/);
+});
+
 test("agent resume can emit session evidence and verify the resumed run", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-resume-session-evidence-"));
   t.after(async () => {
@@ -7555,6 +7655,11 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       runSessionOutcome?: string;
       runSessionToolResults?: number;
       runSessionVerificationStatus?: string;
+      modelReadinessWorkspace?: string;
+      modelReadinessStatus?: string;
+      modelReadinessMissingApiKeyEnvNames?: string[];
+      modelReadinessAgentDbCreated?: boolean;
+      modelReadinessUsesApiKeySecretRef?: boolean;
       agentRepairWorkspace?: string;
       agentRepairSessionId?: string;
       agentRepairOutcome?: string;
@@ -7603,6 +7708,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReview?: string;
       localAgentStatus?: string;
       localAgentLogs?: string;
+      modelReadinessGate?: string;
     };
   };
 
@@ -7702,6 +7808,11 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.runSessionOutcome, "succeeded");
   assert.equal((parsed.evidence?.runSessionToolResults ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.runSessionVerificationStatus, "pass");
+  assert.match(parsed.evidence?.modelReadinessWorkspace ?? "", /phase2-model-ready-/);
+  assert.equal(parsed.evidence?.modelReadinessStatus, "missing_api_key");
+  assert.deepEqual(parsed.evidence?.modelReadinessMissingApiKeyEnvNames, ["AGENT_PHASE2_MODEL_READY_GATE_API_KEY"]);
+  assert.equal(parsed.evidence?.modelReadinessAgentDbCreated, false);
+  assert.equal(parsed.evidence?.modelReadinessUsesApiKeySecretRef, false);
   assert.match(parsed.evidence?.agentRepairWorkspace ?? "", /phase2-agent-repair-/);
   assert.match(parsed.evidence?.agentRepairSessionId ?? "", /^sess_/);
   assert.equal(parsed.evidence?.agentRepairOutcome, "succeeded");
@@ -7759,6 +7870,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "model-readiness-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "policy-boundary-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-timeout-evidence"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-timeout"), true);
@@ -7772,6 +7884,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionReview?.includes("agent session review"), true);
   assert.equal(parsed.commands?.localAgentStatus?.includes("agent local status"), true);
   assert.equal(parsed.commands?.localAgentLogs?.includes("agent local logs"), true);
+  assert.equal(parsed.commands?.modelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
@@ -7779,6 +7892,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "target-mode-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "lifecycle-evidence"), true);
   assert.equal(await exists(parsed.sampleWorkspace ?? path.join(dir, "missing")), false);
+  assert.equal(await exists(parsed.evidence?.modelReadinessWorkspace ?? path.join(dir, "missing-model-ready")), false);
   assert.equal(await exists(parsed.evidence?.agentRepairWorkspace ?? path.join(dir, "missing-repair")), false);
   assert.equal(await exists(parsed.evidence?.targetModeWorkspace ?? path.join(dir, "missing-target-modes")), false);
 });

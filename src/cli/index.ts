@@ -4153,6 +4153,26 @@ async function main() {
   }
   parsed.options.knowledgeQuery = task;
 
+  if (parsed.cli.requireModelReady) {
+    const modelReadiness = await buildRunModelReadinessView(workspace, parsed.options);
+    if (!modelReadiness.ready) {
+      if (parsed.cli.json) {
+        console.log(JSON.stringify({
+          generatedAt: new Date().toISOString(),
+          status: "blocked",
+          workspace,
+          task,
+          modelReadiness,
+        }, null, 2));
+      } else {
+        console.log("Model readiness gate failed.");
+        printModelCheckView(modelReadiness);
+      }
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   const { agent, store } = await createLocalPlatform(workspace, parsed.options);
 
   const runResult = await agent.runWithSession(task);
@@ -4218,6 +4238,7 @@ type RunCliOptions = {
   json?: boolean;
   sessionResult?: boolean;
   verifySession?: boolean;
+  requireModelReady?: boolean;
   requireChange?: boolean;
   requirePatch?: boolean;
   requireRecovery?: boolean;
@@ -4228,8 +4249,10 @@ type RunCliOptions = {
   allowNoCommand?: boolean;
 };
 
+type RunPlatformOptions = NonNullable<Parameters<typeof createLocalPlatform>[1]>;
+
 function parseRunArgs(args: string[]) {
-  const options: Parameters<typeof createLocalPlatform>[1] = {};
+  const options: RunPlatformOptions = {};
   const cli: RunCliOptions = {};
   const taskParts: string[] = [];
 
@@ -4249,6 +4272,10 @@ function parseRunArgs(args: string[]) {
       continue;
     }
     if (applyRunEvidenceFlag(arg, cli)) {
+      continue;
+    }
+    if (arg === "--require-model-ready" || arg === "--model-ready") {
+      cli.requireModelReady = true;
       continue;
     }
     if (arg === "--provider" && next) {
@@ -4430,6 +4457,30 @@ function parseRunArgs(args: string[]) {
     cli,
     task: taskParts.join(" ").trim(),
   };
+}
+
+async function buildRunModelReadinessView(workspace: string, options: RunPlatformOptions): Promise<ModelCheckView> {
+  const result = await buildModelCheckView(workspace, buildRunModelCheckArgs(options), options.provider, {
+    apiKeySecretRef: options.apiKeySecretRef,
+  });
+  return result.view;
+}
+
+function buildRunModelCheckArgs(options: RunPlatformOptions): string[] {
+  const args: string[] = [];
+  if (options.provider) {
+    args.push("--provider", options.provider);
+  }
+  if (options.model) {
+    args.push("--model", options.model);
+  }
+  if (options.baseUrl) {
+    args.push("--base-url", options.baseUrl);
+  }
+  if (options.apiKeyEnv) {
+    args.push("--api-key-env", options.apiKeyEnv);
+  }
+  return args;
 }
 
 function parseRunEvidenceArgs(args: string[]): RunCliOptions {
@@ -4853,6 +4904,11 @@ type PhaseTwoEngineeringSmokeResult = {
     runSessionOutcome?: string;
     runSessionToolResults: number;
     runSessionVerificationStatus?: string;
+    modelReadinessWorkspace?: string;
+    modelReadinessStatus?: ModelCheckStatus;
+    modelReadinessMissingApiKeyEnvNames: string[];
+    modelReadinessAgentDbCreated: boolean;
+    modelReadinessUsesApiKeySecretRef: boolean;
     agentRepairWorkspace?: string;
     agentRepairSessionId?: string;
     agentRepairOutcome?: string;
@@ -4910,6 +4966,7 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentStatus?: string;
     localAgentLogs?: string;
     runJson?: string;
+    modelReadinessGate?: string;
     agentRepairResult?: string;
     agentRepairVerify?: string;
     resumeResult?: string;
@@ -5342,6 +5399,16 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `verification=${runSessionVerification?.status ?? "-"}`,
     });
 
+    const modelReadinessGate = await runPhaseTwoModelReadinessGateSmoke(cwd, { cleanup: options.cleanup });
+    checks.push({
+      id: "model-readiness-gate",
+      label: "model readiness gate",
+      status: modelReadinessGate.ok ? "pass" : "fail",
+      summary:
+        `status=${modelReadinessGate.status}, missingApiKeyEnv=${modelReadinessGate.missingApiKeyEnvNames.join(",") || "-"}, ` +
+        `agentDbCreated=${modelReadinessGate.agentDbCreated}`,
+    });
+
     const agentRepair = await runPhaseTwoAgentRepairSmoke(cwd, { cleanup: options.cleanup });
     checks.push({
       id: "agent-loop-repair-evidence",
@@ -5501,6 +5568,11 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         runSessionOutcome: runSessionResult?.summary.outcome,
         runSessionToolResults: runSessionResult?.summary.toolResults ?? 0,
         runSessionVerificationStatus: runSessionVerification?.status,
+        modelReadinessWorkspace: modelReadinessGate.workspace,
+        modelReadinessStatus: modelReadinessGate.status,
+        modelReadinessMissingApiKeyEnvNames: modelReadinessGate.missingApiKeyEnvNames,
+        modelReadinessAgentDbCreated: modelReadinessGate.agentDbCreated,
+        modelReadinessUsesApiKeySecretRef: modelReadinessGate.usesApiKeySecretRef,
         agentRepairWorkspace: agentRepair.workspace,
         agentRepairSessionId: agentRepair.sessionId,
         agentRepairOutcome: agentRepair.outcome,
@@ -5560,6 +5632,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentStatus: `cd ${sampleWorkspace} && agent local status --json --limit 5`,
         localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --verify-session "inspect this workspace"`,
+        modelReadinessGate: modelReadinessGate.command,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
           ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery`
@@ -5644,6 +5717,10 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- runSessionOutcome=${result.evidence.runSessionOutcome ?? "-"}`);
   console.log(`- runSessionToolResults=${result.evidence.runSessionToolResults}`);
   console.log(`- runSessionVerificationStatus=${result.evidence.runSessionVerificationStatus ?? "-"}`);
+  console.log(`- modelReadinessWorkspace=${result.evidence.modelReadinessWorkspace ?? "-"}`);
+  console.log(`- modelReadinessStatus=${result.evidence.modelReadinessStatus ?? "-"}`);
+  console.log(`- modelReadinessMissingApiKeyEnv=${result.evidence.modelReadinessMissingApiKeyEnvNames.join(",") || "-"}`);
+  console.log(`- modelReadinessAgentDbCreated=${result.evidence.modelReadinessAgentDbCreated}`);
   console.log(`- agentRepairWorkspace=${result.evidence.agentRepairWorkspace ?? "-"}`);
   console.log(`- agentRepairSessionId=${result.evidence.agentRepairSessionId ?? "-"}`);
   console.log(`- agentRepairOutcome=${result.evidence.agentRepairOutcome ?? "-"}`);
@@ -5687,6 +5764,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.localAgentStatus}`);
     console.log(`- ${result.commands.localAgentLogs}`);
     console.log(`- ${result.commands.runJson}`);
+    if (result.commands.modelReadinessGate) {
+      console.log(`- ${result.commands.modelReadinessGate}`);
+    }
     if (result.commands.agentRepairResult) {
       console.log(`- ${result.commands.agentRepairResult}`);
     }
@@ -5698,6 +5778,49 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     }
     if (result.commands.targetModeResult) {
       console.log(`- ${result.commands.targetModeResult}`);
+    }
+  }
+}
+
+async function runPhaseTwoModelReadinessGateSmoke(cwd: string, options: { cleanup?: boolean } = {}) {
+  const workspace = path.join(cwd, ".agent", "tmp", `phase2-model-ready-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const envName = "AGENT_PHASE2_MODEL_READY_GATE_API_KEY";
+  const previousKey = process.env[envName];
+  delete process.env[envName];
+  await fs.mkdir(workspace, { recursive: true });
+  await fs.writeFile(path.join(workspace, "README.md"), "# Phase 2 Model Readiness Gate\n", "utf8");
+  try {
+    const readiness = await buildRunModelReadinessView(workspace, {
+      provider: "openai_compatible",
+      baseUrl: "http://localhost:11434/v1",
+      model: "qwen-local",
+      apiKeyEnv: envName,
+      knowledgeQuery: "inspect this workspace",
+    });
+    const agentDbCreated = await pathExists(path.join(workspace, ".agent", "agent.db"));
+    return {
+      workspace,
+      ok:
+        !readiness.ready &&
+        readiness.status === "missing_api_key" &&
+        readiness.missingApiKeyEnvNames.includes(envName) &&
+        !agentDbCreated,
+      status: readiness.status,
+      missingApiKeyEnvNames: readiness.missingApiKeyEnvNames,
+      usesApiKeySecretRef: readiness.usesApiKeySecretRef,
+      agentDbCreated,
+      command:
+        `cd ${workspace} && agent run --require-model-ready --provider openai_compatible ` +
+        `--base-url http://localhost:11434/v1 --model qwen-local --api-key-env ${envName} "inspect this workspace"`,
+    };
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = previousKey;
+    }
+    if (options.cleanup) {
+      await fs.rm(workspace, { recursive: true, force: true });
     }
   }
 }
@@ -8118,6 +8241,7 @@ function printModelCheckView(view: ModelCheckView): void {
   console.log(`apiKeyEnv=${view.apiKeyEnvNames.join(",") || "-"}`);
   console.log(`presentApiKeyEnv=${view.presentApiKeyEnvNames.join(",") || "-"}`);
   console.log(`missingApiKeyEnv=${view.missingApiKeyEnvNames.join(",") || "-"}`);
+  console.log(`apiKeySecretRef=${view.usesApiKeySecretRef ? "configured" : "-"}`);
   if (view.status === "missing_api_key") {
     const envName = view.missingApiKeyEnvNames[0];
     console.log(`next=powershell: $env:${envName}="<api-key>"`);
@@ -8189,6 +8313,7 @@ type ModelCheckView = {
   apiKeyEnvNames: string[];
   presentApiKeyEnvNames: string[];
   missingApiKeyEnvNames: string[];
+  usesApiKeySecretRef: boolean;
 };
 
 function workspaceHistoryPath(historyRoot: string): string {
@@ -8312,7 +8437,12 @@ async function initializeSoloclawWorkspace(historyRoot: string, workspaceRoot: s
   };
 }
 
-async function buildModelCheckView(workspaceRoot: string, args: string[], activeProvider?: ModelProviderName): Promise<{ json: boolean; view: ModelCheckView }> {
+async function buildModelCheckView(
+  workspaceRoot: string,
+  args: string[],
+  activeProvider?: ModelProviderName,
+  options: { apiKeySecretRef?: string } = {},
+): Promise<{ json: boolean; view: ModelCheckView }> {
   const parsed = parseModelProfileArgs(args);
   const profiles = new LocalProviderProfileStore(path.join(workspaceRoot, ".agent"));
   const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
@@ -8324,7 +8454,8 @@ async function buildModelCheckView(workspaceRoot: string, args: string[], active
   const apiKeyEnvNames = resolveModelApiKeyEnvNames(parsed.options, providerInput, profile.apiKeyEnvNames);
   const baseUrl = parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? profile.defaultBaseUrl;
   const presentApiKeyEnvNames = apiKeyEnvNames.filter((envName) => Boolean(process.env[envName]));
-  const missingApiKeyEnvNames = profile.protocol === "mock" || apiKeyEnvNames.length === 0 || presentApiKeyEnvNames.length > 0 ? [] : apiKeyEnvNames;
+  const usesApiKeySecretRef = Boolean(options.apiKeySecretRef);
+  const missingApiKeyEnvNames = profile.protocol === "mock" || usesApiKeySecretRef || apiKeyEnvNames.length === 0 || presentApiKeyEnvNames.length > 0 ? [] : apiKeyEnvNames;
   const status: ModelCheckStatus =
     profile.protocol !== "mock" && !baseUrl
       ? "missing_base_url"
@@ -8346,6 +8477,7 @@ async function buildModelCheckView(workspaceRoot: string, args: string[], active
       apiKeyEnvNames,
       presentApiKeyEnvNames,
       missingApiKeyEnvNames,
+      usesApiKeySecretRef,
     },
   };
 }
@@ -8391,6 +8523,15 @@ function printWorkspaceHistory(history: WorkspaceHistoryFile): void {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function splitCliWords(input: string): string[] {
@@ -9332,7 +9473,7 @@ Usage:
   soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -9523,6 +9664,7 @@ Examples:
   agent run --project proj_xxxxxxxx "fix the failing tests"
   agent run --provider openai --model gpt-4o-mini "explain this project"
   agent run --provider deepseek --api-key-env DEEPSEEK_API_KEY "inspect this workspace"
+  agent run --require-model-ready --provider deepseek --api-key-env DEEPSEEK_API_KEY "inspect this workspace"
   agent run --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-secret sec_xxxxxxxx "inspect this workspace"
   agent run --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env MY_API_KEY "inspect this workspace"
   agent run --provider openai_compatible --base-url http://localhost:8000/v1 --fallback-provider mock --model-retries 2 "inspect this workspace"
