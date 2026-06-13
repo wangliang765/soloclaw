@@ -7791,6 +7791,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       agentRepairFileChanges?: number;
       agentRepairPatches?: number;
       agentRepairToolResults?: number;
+      agentRepairModelCalls?: number;
+      agentRepairModelFailedCalls?: number;
       agentRepairChangedPaths?: string[];
       resumeSessionId?: string;
       resumeOutcome?: string;
@@ -7813,6 +7815,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
         verificationStatus?: string;
         toolResults?: number;
         commandsFinished?: number;
+        modelCalls?: number;
+        modelFailedCalls?: number;
       }>;
       lifecycleAuditEvents?: number;
       lifecycleSessionIds?: string[];
@@ -7832,6 +7836,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       runJson?: string;
       modelReadinessGate?: string;
       resumeModelReadinessGate?: string;
+      agentRepairVerify?: string;
     };
   };
 
@@ -7967,6 +7972,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.agentRepairFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.agentRepairPatches ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.agentRepairToolResults ?? 0) >= 3, true);
+  assert.equal((parsed.evidence?.agentRepairModelCalls ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.agentRepairModelFailedCalls, 0);
   assert.equal(parsed.evidence?.agentRepairChangedPaths?.includes("src/math.js"), true);
   assert.equal((parsed.evidence?.runSessionModelCalls ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.runSessionModelFailedCalls, 0);
@@ -7988,6 +7995,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => /^sess_/.test(entry.sessionId ?? "")), true);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => entry.outcome === "succeeded"), true);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => entry.verificationStatus === "pass"), true);
+  assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => (entry.modelCalls ?? 0) >= 1), true);
+  assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => entry.modelFailedCalls === 0), true);
   assert.equal(parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "plan")?.toolResults, 0);
   assert.equal((parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "build")?.toolResults ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "goal")?.toolResults ?? 0) >= 1, true);
@@ -8036,6 +8045,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.modelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("agent resume"), true);
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("--require-model-ready"), true);
+  assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-model-call"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);

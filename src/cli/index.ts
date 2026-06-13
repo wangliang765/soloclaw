@@ -5045,6 +5045,8 @@ type PhaseTwoEngineeringSmokeResult = {
     agentRepairFileChanges: number;
     agentRepairPatches: number;
     agentRepairToolResults: number;
+    agentRepairModelCalls: number;
+    agentRepairModelFailedCalls: number;
     agentRepairChangedPaths: string[];
     resumeSessionId?: string;
     resumeOutcome?: string;
@@ -5067,6 +5069,8 @@ type PhaseTwoEngineeringSmokeResult = {
       verificationStatus?: string;
       toolResults: number;
       commandsFinished: number;
+      modelCalls: number;
+      modelFailedCalls: number;
     }>;
     lifecycleAuditEvents: number;
     lifecycleSessionIds: string[];
@@ -5588,12 +5592,14 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         agentRepair.recovered &&
         agentRepair.verificationStatus === "pass" &&
         agentRepair.changedPaths.includes("src/math.js") &&
-        agentRepair.patches >= 1
+        agentRepair.patches >= 1 &&
+        agentRepair.modelCalls >= 1 &&
+        agentRepair.modelFailedCalls === 0
           ? "pass"
           : "fail",
       summary:
         `agentRepair=${agentRepair.sessionId ?? "-"}, outcome=${agentRepair.outcome ?? "-"}, ` +
-        `verification=${agentRepair.verificationStatus ?? "-"}, patches=${agentRepair.patches}`,
+        `verification=${agentRepair.verificationStatus ?? "-"}, patches=${agentRepair.patches}, modelCalls=${agentRepair.modelCalls}`,
     });
 
     const resumeSmoke = await runPhaseTwoResumeSmoke(platform, actor);
@@ -5634,14 +5640,16 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       entry.sessionId &&
       entry.outcome === "succeeded" &&
       entry.verificationStatus === "pass" &&
-      entry.targetMode === entry.mode
+      entry.targetMode === entry.mode &&
+      entry.modelCalls >= 1 &&
+      entry.modelFailedCalls === 0
     );
     checks.push({
       id: "target-mode-evidence",
       label: "target mode evidence",
       status: targetModePass ? "pass" : "fail",
       summary: targetModes.sessions
-        .map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}`)
+        .map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`)
         .join(", "),
     });
 
@@ -5778,6 +5786,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         agentRepairFileChanges: agentRepair.fileChanges,
         agentRepairPatches: agentRepair.patches,
         agentRepairToolResults: agentRepair.toolResults,
+        agentRepairModelCalls: agentRepair.modelCalls,
+        agentRepairModelFailedCalls: agentRepair.modelFailedCalls,
         agentRepairChangedPaths: agentRepair.changedPaths,
         resumeSessionId: resumeSmoke.sessionId,
         resumeOutcome: resumeSmoke.outcome,
@@ -5800,6 +5810,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
           verificationStatus: entry.verificationStatus,
           toolResults: entry.toolResults,
           commandsFinished: entry.commandsFinished,
+          modelCalls: entry.modelCalls,
+          modelFailedCalls: entry.modelFailedCalls,
         })),
         lifecycleAuditEvents: lifecycle.auditEvents,
         lifecycleSessionIds: lifecycle.sessionIds,
@@ -5831,7 +5843,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         resumeModelReadinessGate: resumeModelReadinessGate.command,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
-          ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery`
+          ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery --require-model-call`
           : undefined,
         resumeResult: resumeSmoke.sessionId ? `cd ${sampleWorkspace} && agent session result ${resumeSmoke.sessionId}` : undefined,
         targetModeResult: targetModes.sessions[0]?.sessionId ? `cd ${targetModes.workspace} && agent session result ${targetModes.sessions[0].sessionId}` : undefined,
@@ -5944,6 +5956,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- agentRepairFileChanges=${result.evidence.agentRepairFileChanges}`);
   console.log(`- agentRepairPatches=${result.evidence.agentRepairPatches}`);
   console.log(`- agentRepairToolResults=${result.evidence.agentRepairToolResults}`);
+  console.log(`- agentRepairModelCalls=${result.evidence.agentRepairModelCalls} failed=${result.evidence.agentRepairModelFailedCalls}`);
   console.log(`- agentRepairChangedPaths=${result.evidence.agentRepairChangedPaths.join(",") || "-"}`);
   console.log(`- resumeSessionId=${result.evidence.resumeSessionId ?? "-"}`);
   console.log(`- resumeOutcome=${result.evidence.resumeOutcome ?? "-"}`);
@@ -5958,7 +5971,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- queuedApprovalToolResults=${result.evidence.queuedApprovalToolResults}`);
   console.log(`- queuedApprovalAuditEvents=${result.evidence.queuedApprovalAuditEvents}`);
   console.log(`- targetModeWorkspace=${result.evidence.targetModeWorkspace ?? "-"}`);
-  console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}`).join(",") || "-"}`);
+  console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`).join(",") || "-"}`);
   console.log(`- lifecycleAuditEvents=${result.evidence.lifecycleAuditEvents}`);
   console.log(`- lifecycleStatuses=pause:${result.evidence.pauseStatus ?? "-"},resume:${result.evidence.resumeStatus ?? "-"},cancel:${result.evidence.cancelStatus ?? "-"}`);
   if (result.commands.inspectSession) {
@@ -6337,6 +6350,8 @@ async function runPhaseTwoTargetModeSmoke(cwd: string, options: { cleanup?: bool
     verificationStatus?: string;
     toolResults: number;
     commandsFinished: number;
+    modelCalls: number;
+    modelFailedCalls: number;
   }> = [];
   try {
     for (const mode of modes) {
@@ -6351,6 +6366,7 @@ async function runPhaseTwoTargetModeSmoke(cwd: string, options: { cleanup?: bool
         const verification = session
           ? await buildSessionVerification(platform.store, session.id, {
               requireCommand: false,
+              requireModelCall: true,
             })
           : undefined;
         sessions.push({
@@ -6361,6 +6377,8 @@ async function runPhaseTwoTargetModeSmoke(cwd: string, options: { cleanup?: bool
           verificationStatus: verification?.status,
           toolResults: result?.summary.toolResults ?? 0,
           commandsFinished: result?.summary.commandsFinished ?? 0,
+          modelCalls: result?.summary.modelCalls ?? 0,
+          modelFailedCalls: result?.summary.modelFailedCalls ?? 0,
         });
       } finally {
         platform.locks.close?.();
@@ -6390,6 +6408,7 @@ async function runPhaseTwoAgentRepairSmoke(cwd: string, options: { cleanup?: boo
           requireChange: true,
           requirePatch: true,
           requireRecovery: true,
+          requireModelCall: true,
         })
       : undefined;
     return {
@@ -6404,6 +6423,8 @@ async function runPhaseTwoAgentRepairSmoke(cwd: string, options: { cleanup?: boo
       fileChanges: result?.summary.fileChanges ?? 0,
       patches: result?.summary.patches ?? 0,
       toolResults: result?.summary.toolResults ?? 0,
+      modelCalls: result?.summary.modelCalls ?? 0,
+      modelFailedCalls: result?.summary.modelFailedCalls ?? 0,
       changedPaths: result?.summary.changedPaths ?? [],
     };
   } finally {
