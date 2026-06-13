@@ -7765,6 +7765,10 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       runSessionId?: string;
       runSessionOutcome?: string;
       runSessionToolResults?: number;
+      runSessionModelCalls?: number;
+      runSessionModelFailedCalls?: number;
+      runSessionModelCallsWithUsage?: number;
+      runSessionModelTotalTokens?: number;
       runSessionVerificationStatus?: string;
       modelReadinessWorkspace?: string;
       modelReadinessStatus?: string;
@@ -7963,6 +7967,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.agentRepairPatches ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.agentRepairToolResults ?? 0) >= 3, true);
   assert.equal(parsed.evidence?.agentRepairChangedPaths?.includes("src/math.js"), true);
+  assert.equal((parsed.evidence?.runSessionModelCalls ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.runSessionModelFailedCalls, 0);
   assert.match(parsed.evidence?.resumeSessionId ?? "", /^sess_/);
   assert.equal(parsed.evidence?.resumeOutcome, "succeeded");
   assert.equal(parsed.evidence?.resumeVerificationStatus, "pass");
@@ -8148,6 +8154,27 @@ test("agent session report summarizes engineering execution evidence", async (t)
     metadata: { command: "npm test", exitCode: 0, stdoutBytes: 4, stderrBytes: 0, executionProfile: "local-safe" },
     createdAt: "2026-06-13T00:00:03.000Z",
   });
+  await platform.store.recordAuditEvent({
+    id: "audit_report_model_called",
+    type: "model.called",
+    actor,
+    sessionId: session.id,
+    summary: "Model call completed",
+    metadata: {
+      ok: true,
+      provider: "mock",
+      model: "mock-model",
+      durationMs: 123,
+      messageCount: 2,
+      messageCharCount: 42,
+      toolCount: 1,
+      responseType: "message",
+      toolCallCount: 0,
+      usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+    },
+    artifactRefs: [],
+    createdAt: "2026-06-13T00:00:03.250Z",
+  });
   await platform.store.createApprovalRequest({
     id: "appr_report_write",
     status: "pending",
@@ -8275,7 +8302,19 @@ test("agent session report summarizes engineering execution evidence", async (t)
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
       approvals?: number;
       pendingApprovals?: number;
+      modelCalls?: number;
+      modelSuccessfulCalls?: number;
+      modelFailedCalls?: number;
+      modelCallsWithUsage?: number;
+      modelPromptTokens?: number;
+      modelCompletionTokens?: number;
+      modelTotalTokens?: number;
+      modelDurationMs?: number;
       changedPaths?: string[];
+    };
+    modelUsage?: {
+      entries?: Array<{ provider?: string; model?: string; calls?: number; promptTokens?: number; completionTokens?: number; totalTokens?: number; durationMs?: number }>;
+      totals?: { calls?: number; successfulCalls?: number; failedCalls?: number; callsWithUsage?: number; promptTokens?: number; completionTokens?: number; totalTokens?: number; durationMs?: number };
     };
     approvals?: Array<{ id?: string; status?: string; action?: string; toolName?: string; reason?: string }>;
     fileChanges?: Array<{ kind?: string; path?: string; summary?: string }>;
@@ -8306,6 +8345,18 @@ test("agent session report summarizes engineering execution evidence", async (t)
   ), true);
   assert.equal(parsed.summary?.approvals, 1);
   assert.equal(parsed.summary?.pendingApprovals, 1);
+  assert.equal(parsed.summary?.modelCalls, 1);
+  assert.equal(parsed.summary?.modelSuccessfulCalls, 1);
+  assert.equal(parsed.summary?.modelFailedCalls, 0);
+  assert.equal(parsed.summary?.modelCallsWithUsage, 1);
+  assert.equal(parsed.summary?.modelPromptTokens, 10);
+  assert.equal(parsed.summary?.modelCompletionTokens, 5);
+  assert.equal(parsed.summary?.modelTotalTokens, 15);
+  assert.equal(parsed.summary?.modelDurationMs, 123);
+  assert.equal(parsed.modelUsage?.entries?.[0]?.provider, "mock");
+  assert.equal(parsed.modelUsage?.entries?.[0]?.model, "mock-model");
+  assert.equal(parsed.modelUsage?.entries?.[0]?.totalTokens, 15);
+  assert.equal(parsed.modelUsage?.totals?.calls, 1);
   assert.equal(parsed.approvals?.[0]?.action, "workspace.write");
   assert.equal(parsed.approvals?.[0]?.toolName, "apply_patch");
   assert.equal(parsed.fileChanges?.[0]?.kind, "patch");
@@ -8322,6 +8373,9 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(text.stdout, /profile=local-safe/);
   assert.match(text.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(text.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
+  assert.match(text.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
+  assert.match(text.stdout, /Model usage:/);
+  assert.match(text.stdout, /mock\tmock-model\tcalls=1/);
   assert.match(text.stdout, /Approvals:/);
   assert.match(text.stdout, /workspace\.write/);
   assert.match(text.stdout, /src\/math\.js/);
@@ -8453,6 +8507,14 @@ test("agent session report summarizes engineering execution evidence", async (t)
       fileChanges?: number;
       approvals?: number;
       pendingApprovals?: number;
+      modelCalls?: number;
+      modelSuccessfulCalls?: number;
+      modelFailedCalls?: number;
+      modelCallsWithUsage?: number;
+      modelPromptTokens?: number;
+      modelCompletionTokens?: number;
+      modelTotalTokens?: number;
+      modelDurationMs?: number;
       nextActions?: number;
       nextActionStatuses?: Record<string, number>;
     };
@@ -8465,6 +8527,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
     commands?: Array<{ status?: string; command?: string; exitCode?: number; executionProfile?: string }>;
     approvals?: Array<{ status?: string; action?: string; toolName?: string }>;
     nextActions?: Array<{ id?: string; status?: string; command?: string; reason?: string }>;
+    modelUsage?: {
+      entries?: Array<{ provider?: string; model?: string; calls?: number; totalTokens?: number }>;
+      totals?: { calls?: number; totalTokens?: number };
+    };
     reviewCommands?: { diff?: string; report?: string; audit?: string };
   };
   assert.equal(sessionResult.session?.id, session.id);
@@ -8481,6 +8547,18 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionResult.summary?.fileChanges, 1);
   assert.equal(sessionResult.summary?.approvals, 1);
   assert.equal(sessionResult.summary?.pendingApprovals, 1);
+  assert.equal(sessionResult.summary?.modelCalls, 1);
+  assert.equal(sessionResult.summary?.modelSuccessfulCalls, 1);
+  assert.equal(sessionResult.summary?.modelFailedCalls, 0);
+  assert.equal(sessionResult.summary?.modelCallsWithUsage, 1);
+  assert.equal(sessionResult.summary?.modelPromptTokens, 10);
+  assert.equal(sessionResult.summary?.modelCompletionTokens, 5);
+  assert.equal(sessionResult.summary?.modelTotalTokens, 15);
+  assert.equal(sessionResult.summary?.modelDurationMs, 123);
+  assert.equal(sessionResult.modelUsage?.entries?.[0]?.provider, "mock");
+  assert.equal(sessionResult.modelUsage?.entries?.[0]?.model, "mock-model");
+  assert.equal(sessionResult.modelUsage?.entries?.[0]?.totalTokens, 15);
+  assert.equal(sessionResult.modelUsage?.totals?.calls, 1);
   assert.equal((sessionResult.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((sessionResult.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(sessionResult.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required" && /agent approve appr_report_write --auto-replay/.test(action.command ?? "")), true);
@@ -8504,6 +8582,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(resultText.stdout, /Recovery:/);
   assert.match(resultText.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(resultText.stdout, /fileSummaries=src\/math\.js:modified:\+1\/-1/);
+  assert.match(resultText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
+  assert.match(resultText.stdout, /mock\tmock-model\tcalls=1/);
   assert.match(resultText.stdout, /Changed files:/);
   assert.match(resultText.stdout, /Approvals:/);
   assert.match(resultText.stdout, /Next actions:/);
@@ -8520,6 +8600,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
       executionProfiles?: Record<string, number>;
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
+      modelCalls?: number;
+      modelSuccessfulCalls?: number;
+      modelFailedCalls?: number;
+      modelTotalTokens?: number;
       nextActions?: number;
       nextActionStatuses?: Record<string, number>;
     };
@@ -8535,6 +8619,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.summary?.diffStats?.additions, 1);
   assert.equal(status.summary?.diffStats?.deletions, 1);
   assert.equal(status.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(status.summary?.modelCalls, 1);
+  assert.equal(status.summary?.modelSuccessfulCalls, 1);
+  assert.equal(status.summary?.modelFailedCalls, 0);
+  assert.equal(status.summary?.modelTotalTokens, 15);
   assert.equal((status.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((status.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(status.nextActions?.some((action) => action.id === "resolve-pending-approvals"), true);
@@ -8545,6 +8633,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(statusText.exitCode, 0, statusText.stderr);
   assert.match(statusText.stdout, /Session status:/);
   assert.match(statusText.stdout, /nextActions=/);
+  assert.match(statusText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(statusText.stdout, /Latest timeline:/);
 
   const localStatusJson = await run(process.execPath, [cli, "local", "status", "--json", "--limit", "10"], dir);
@@ -8654,6 +8743,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
       timelineItems?: number;
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      modelCalls?: number;
+      modelSuccessfulCalls?: number;
+      modelFailedCalls?: number;
+      modelTotalTokens?: number;
       nextActions?: number;
       nextActionStatuses?: Record<string, number>;
     };
@@ -8682,6 +8775,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(review.summary?.diffStats?.additions, 1);
   assert.equal(review.summary?.diffStats?.deletions, 1);
   assert.equal(review.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(review.summary?.modelCalls, 1);
+  assert.equal(review.summary?.modelSuccessfulCalls, 1);
+  assert.equal(review.summary?.modelFailedCalls, 0);
+  assert.equal(review.summary?.modelTotalTokens, 15);
   assert.equal((review.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((review.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(reviewChecklist["change-summary"], "pass");
@@ -8719,6 +8816,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(reviewText.stdout, /Checklist:/);
   assert.match(reviewText.stdout, /Changed paths:/);
   assert.match(reviewText.stdout, /File summary:/);
+  assert.match(reviewText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(reviewText.stdout, /Approvals:/);
   assert.match(reviewText.stdout, /Next actions:/);
   assert.match(reviewText.stdout, /Run evidence gate/);
@@ -8789,6 +8887,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
       changedPaths?: string[];
       diffStats?: { files?: number; additions?: number; deletions?: number };
       fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number }>;
+      modelCalls?: number;
+      modelSuccessfulCalls?: number;
+      modelFailedCalls?: number;
+      modelTotalTokens?: number;
       timelineItems?: number;
       returnedTimelineItems?: number;
       nextActions?: number;
@@ -8796,11 +8898,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
     };
     sections?: {
       diff?: { summary?: { patches?: number } };
-      report?: { summary?: { fileChanges?: number } };
-      status?: { summary?: { outcome?: string; nextActions?: number } };
+      report?: { summary?: { fileChanges?: number; modelCalls?: number }; modelUsage?: { totals?: { totalTokens?: number } } };
+      status?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number } };
       timeline?: { summary?: { returnedItems?: number } };
       review?: { summary?: { reviewState?: string; nextActions?: number }; nextActions?: Array<{ id?: string; status?: string }> };
-      result?: { summary?: { outcome?: string; nextActions?: number }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
+      result?: { summary?: { outcome?: string; modelCalls?: number; nextActions?: number }; modelUsage?: { totals?: { totalTokens?: number } }; nextActions?: Array<{ id?: string; status?: string; command?: string }> };
       verification?: { status?: string; checks?: Array<{ id?: string; status?: string }> };
     };
     output?: { path?: string; bytes?: number };
@@ -8814,17 +8916,26 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundle.summary?.diffStats?.additions, 1);
   assert.equal(bundle.summary?.diffStats?.deletions, 1);
   assert.equal(bundle.summary?.fileSummaries?.some((entry) => entry.path === "src/math.js" && entry.changeType === "modified"), true);
+  assert.equal(bundle.summary?.modelCalls, 1);
+  assert.equal(bundle.summary?.modelSuccessfulCalls, 1);
+  assert.equal(bundle.summary?.modelFailedCalls, 0);
+  assert.equal(bundle.summary?.modelTotalTokens, 15);
   assert.equal(bundle.summary?.returnedTimelineItems, 5);
   assert.equal((bundle.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((bundle.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(bundle.sections?.diff?.summary?.patches, 1);
   assert.equal(bundle.sections?.report?.summary?.fileChanges, 1);
+  assert.equal(bundle.sections?.report?.summary?.modelCalls, 1);
+  assert.equal(bundle.sections?.report?.modelUsage?.totals?.totalTokens, 15);
   assert.equal(bundle.sections?.status?.summary?.outcome, "succeeded");
+  assert.equal(bundle.sections?.status?.summary?.modelCalls, 1);
   assert.equal((bundle.sections?.status?.summary?.nextActions ?? 0) >= 4, true);
   assert.equal(bundle.sections?.timeline?.summary?.returnedItems, 5);
   assert.equal(bundle.sections?.review?.summary?.reviewState, "waiting_for_approval");
   assert.equal((bundle.sections?.review?.summary?.nextActions ?? 0) >= 4, true);
   assert.equal(bundle.sections?.result?.summary?.outcome, "succeeded");
+  assert.equal(bundle.sections?.result?.summary?.modelCalls, 1);
+  assert.equal(bundle.sections?.result?.modelUsage?.totals?.totalTokens, 15);
   assert.equal(bundle.sections?.result?.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required"), true);
   assert.equal(bundle.sections?.verification?.status, "pass");
   assert.equal(bundle.sections?.verification?.checks?.every((check) => check.status === "pass"), true);
@@ -8840,6 +8951,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(bundleText.exitCode, 0, bundleText.stderr);
   assert.match(bundleText.stdout, /Session bundle:/);
   assert.match(bundleText.stdout, /verification=pass/);
+  assert.match(bundleText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(bundleText.stdout, /Sections:/);
   assert.match(bundleText.stdout, /Next actions:/);
   assert.match(bundleText.stdout, /agent session bundle/);

@@ -5009,6 +5009,10 @@ type PhaseTwoEngineeringSmokeResult = {
     runSessionId?: string;
     runSessionOutcome?: string;
     runSessionToolResults: number;
+    runSessionModelCalls: number;
+    runSessionModelFailedCalls: number;
+    runSessionModelCallsWithUsage: number;
+    runSessionModelTotalTokens: number;
     runSessionVerificationStatus?: string;
     modelReadinessWorkspace?: string;
     modelReadinessStatus?: ModelCheckStatus;
@@ -5536,12 +5540,13 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         runSmoke.session &&
         runSessionResult?.summary.outcome === "succeeded" &&
         (runSessionResult.summary.toolResults ?? 0) >= 1 &&
+        (runSessionResult.summary.modelCalls ?? 0) >= 1 &&
         runSessionVerification?.status === "pass"
           ? "pass"
           : "fail",
       summary:
         `runSession=${runSmoke.session?.id ?? "-"}, outcome=${runSessionResult?.summary.outcome ?? "-"}, ` +
-        `verification=${runSessionVerification?.status ?? "-"}`,
+        `modelCalls=${runSessionResult?.summary.modelCalls ?? 0}, verification=${runSessionVerification?.status ?? "-"}`,
     });
 
     const modelReadinessGate = await runPhaseTwoModelReadinessGateSmoke(cwd, { cleanup: options.cleanup });
@@ -5737,6 +5742,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         runSessionId: runSmoke.session?.id,
         runSessionOutcome: runSessionResult?.summary.outcome,
         runSessionToolResults: runSessionResult?.summary.toolResults ?? 0,
+        runSessionModelCalls: runSessionResult?.summary.modelCalls ?? 0,
+        runSessionModelFailedCalls: runSessionResult?.summary.modelFailedCalls ?? 0,
+        runSessionModelCallsWithUsage: runSessionResult?.summary.modelCallsWithUsage ?? 0,
+        runSessionModelTotalTokens: runSessionResult?.summary.modelTotalTokens ?? 0,
         runSessionVerificationStatus: runSessionVerification?.status,
         modelReadinessWorkspace: modelReadinessGate.workspace,
         modelReadinessStatus: modelReadinessGate.status,
@@ -5902,6 +5911,10 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
   console.log(`- runSessionOutcome=${result.evidence.runSessionOutcome ?? "-"}`);
   console.log(`- runSessionToolResults=${result.evidence.runSessionToolResults}`);
+  console.log(
+    `- runSessionModelCalls=${result.evidence.runSessionModelCalls} failed=${result.evidence.runSessionModelFailedCalls} ` +
+    `withUsage=${result.evidence.runSessionModelCallsWithUsage} totalTokens=${result.evidence.runSessionModelTotalTokens}`,
+  );
   console.log(`- runSessionVerificationStatus=${result.evidence.runSessionVerificationStatus ?? "-"}`);
   console.log(`- modelReadinessWorkspace=${result.evidence.modelReadinessWorkspace ?? "-"}`);
   console.log(`- modelReadinessStatus=${result.evidence.modelReadinessStatus ?? "-"}`);
@@ -6483,6 +6496,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
   const toolResults = await store.getToolResults(sessionId);
   const fileChanges = await store.listFileChanges(sessionId);
   const auditEvents = await store.listAuditEvents({ sessionId, limit: 100 });
+  const modelUsage = await new ModelUsageService(store).summarize({ filters: { sessionId, limit: 1000 } });
   const approvals = (await store.listApprovalRequests())
     .filter((approval) => approval.sessionId === sessionId)
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
@@ -6532,8 +6546,17 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
       pendingApprovals: pendingApprovals.length,
       approvedApprovals: approvedApprovals.length,
       deniedApprovals: deniedApprovals.length,
+      modelCalls: modelUsage.totals.calls,
+      modelSuccessfulCalls: modelUsage.totals.successfulCalls,
+      modelFailedCalls: modelUsage.totals.failedCalls,
+      modelCallsWithUsage: modelUsage.totals.callsWithUsage,
+      modelPromptTokens: modelUsage.totals.promptTokens,
+      modelCompletionTokens: modelUsage.totals.completionTokens,
+      modelTotalTokens: modelUsage.totals.totalTokens,
+      modelDurationMs: modelUsage.totals.durationMs,
       auditEvents: auditEvents.length,
     },
+    modelUsage,
     approvals: approvals.map((approval) => ({
       id: approval.id,
       status: approval.status,
@@ -6587,7 +6610,18 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
   console.log(`- diffStats=${formatDiffStats(report.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(report.summary.fileSummaries)}`);
   console.log(`- approvals=${report.summary.approvals} pending=${report.summary.pendingApprovals}`);
+  console.log(
+    `- modelCalls=${report.summary.modelCalls} ok=${report.summary.modelSuccessfulCalls} ` +
+    `failed=${report.summary.modelFailedCalls} totalTokens=${report.summary.modelTotalTokens} durationMs=${report.summary.modelDurationMs}`,
+  );
   console.log(`- auditEvents=${report.summary.auditEvents}`);
+  if (report.modelUsage.entries.length > 0) {
+    console.log("");
+    console.log("Model usage:");
+    for (const entry of report.modelUsage.entries) {
+      console.log(`- ${formatModelUsageEntry(entry)}`);
+    }
+  }
   if (report.fileChanges.length > 0) {
     console.log("");
     console.log("File changes:");
@@ -6724,6 +6758,14 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
+      modelCalls: result.summary.modelCalls,
+      modelSuccessfulCalls: result.summary.modelSuccessfulCalls,
+      modelFailedCalls: result.summary.modelFailedCalls,
+      modelCallsWithUsage: result.summary.modelCallsWithUsage,
+      modelPromptTokens: result.summary.modelPromptTokens,
+      modelCompletionTokens: result.summary.modelCompletionTokens,
+      modelTotalTokens: result.summary.modelTotalTokens,
+      modelDurationMs: result.summary.modelDurationMs,
       lastCommand: result.summary.lastCommand,
       timelineItems: timeline.summary.totalItems,
       latestAt: timeline.summary.latestAt,
@@ -6732,6 +6774,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
     },
     latestTimeline: timeline.items,
     nextActions: result.nextActions,
+    modelUsage: result.modelUsage,
     reviewCommands: {
       timeline: `agent session timeline ${sessionId}`,
       review: `agent session review ${sessionId}`,
@@ -7292,6 +7335,14 @@ async function buildSessionEvidenceBundle(
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
+      modelCalls: result.summary.modelCalls,
+      modelSuccessfulCalls: result.summary.modelSuccessfulCalls,
+      modelFailedCalls: result.summary.modelFailedCalls,
+      modelCallsWithUsage: result.summary.modelCallsWithUsage,
+      modelPromptTokens: result.summary.modelPromptTokens,
+      modelCompletionTokens: result.summary.modelCompletionTokens,
+      modelTotalTokens: result.summary.modelTotalTokens,
+      modelDurationMs: result.summary.modelDurationMs,
       timelineItems: timeline.summary.totalItems,
       returnedTimelineItems: timeline.summary.returnedItems,
       nextActions: result.nextActions.length,
@@ -7347,6 +7398,10 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- commandsFinished=${bundle.summary.commandsFinished} failed=${bundle.summary.failedCommands} timedOut=${bundle.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(bundle.summary.executionProfiles)}`);
   console.log(`- approvals=${bundle.summary.approvals} pending=${bundle.summary.pendingApprovals}`);
+  console.log(
+    `- modelCalls=${bundle.summary.modelCalls} ok=${bundle.summary.modelSuccessfulCalls} ` +
+    `failed=${bundle.summary.modelFailedCalls} totalTokens=${bundle.summary.modelTotalTokens} durationMs=${bundle.summary.modelDurationMs}`,
+  );
   console.log(`- nextActions=${bundle.summary.nextActions} statuses=${formatRecordCounts(bundle.summary.nextActionStatuses)}`);
   console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
   console.log(`- verificationChecks=${bundle.sections.verification.checks.length}`);
@@ -7418,6 +7473,10 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- fileSummaries=${formatDiffFileSummaryList(status.summary.fileSummaries)}`);
   console.log(`- pendingApprovals=${status.summary.pendingApprovals}`);
   console.log(`- toolResults=${status.summary.toolResults} failed=${status.summary.failedToolResults}`);
+  console.log(
+    `- modelCalls=${status.summary.modelCalls} ok=${status.summary.modelSuccessfulCalls} ` +
+    `failed=${status.summary.modelFailedCalls} totalTokens=${status.summary.modelTotalTokens} durationMs=${status.summary.modelDurationMs}`,
+  );
   console.log(`- nextActions=${status.summary.nextActions} statuses=${formatRecordCounts(status.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
   if (status.latestTimeline.length > 0) {
@@ -7463,6 +7522,14 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
+      modelCalls: result.summary.modelCalls,
+      modelSuccessfulCalls: result.summary.modelSuccessfulCalls,
+      modelFailedCalls: result.summary.modelFailedCalls,
+      modelCallsWithUsage: result.summary.modelCallsWithUsage,
+      modelPromptTokens: result.summary.modelPromptTokens,
+      modelCompletionTokens: result.summary.modelCompletionTokens,
+      modelTotalTokens: result.summary.modelTotalTokens,
+      modelDurationMs: result.summary.modelDurationMs,
       timelineItems: timeline.summary.totalItems,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
@@ -7487,6 +7554,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     recovery: result.recovery,
     approvals: result.approvals,
     nextActions: result.nextActions,
+    modelUsage: result.modelUsage,
     latestTimeline: timeline.items,
     reviewCommands: {
       diff: `agent session diff ${sessionId}`,
@@ -7589,6 +7657,10 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(`- fileSummaries=${formatDiffFileSummaryList(review.summary.fileSummaries)}`);
   console.log(`- commandsFinished=${review.summary.commandsFinished} failed=${review.summary.failedCommands} timedOut=${review.summary.timedOutCommands}`);
   console.log(`- pendingApprovals=${review.summary.pendingApprovals}`);
+  console.log(
+    `- modelCalls=${review.summary.modelCalls} ok=${review.summary.modelSuccessfulCalls} ` +
+    `failed=${review.summary.modelFailedCalls} totalTokens=${review.summary.modelTotalTokens} durationMs=${review.summary.modelDurationMs}`,
+  );
   console.log(`- nextActions=${review.summary.nextActions} statuses=${formatRecordCounts(review.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${review.summary.timelineItems}`);
   console.log("");
@@ -7918,6 +7990,14 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       pendingApprovals: report.summary.pendingApprovals,
       approvedApprovals: report.summary.approvedApprovals,
       deniedApprovals: report.summary.deniedApprovals,
+      modelCalls: report.summary.modelCalls,
+      modelSuccessfulCalls: report.summary.modelSuccessfulCalls,
+      modelFailedCalls: report.summary.modelFailedCalls,
+      modelCallsWithUsage: report.summary.modelCallsWithUsage,
+      modelPromptTokens: report.summary.modelPromptTokens,
+      modelCompletionTokens: report.summary.modelCompletionTokens,
+      modelTotalTokens: report.summary.modelTotalTokens,
+      modelDurationMs: report.summary.modelDurationMs,
       toolResults: report.summary.toolResults,
       failedToolResults: report.summary.failedToolResults,
       nextActions: nextActions.length,
@@ -7971,6 +8051,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
     })),
     approvals: report.approvals,
     nextActions,
+    modelUsage: report.modelUsage,
     fileChanges: report.fileChanges,
     patches: diff.patches.map((patch) => ({
       ordinal: patch.ordinal,
@@ -8029,7 +8110,18 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- executionProfiles=${formatRecordCounts(result.summary.executionProfiles)}`);
   console.log(`- approvals=${result.summary.approvals} pending=${result.summary.pendingApprovals}`);
   console.log(`- toolResults=${result.summary.toolResults} failed=${result.summary.failedToolResults}`);
+  console.log(
+    `- modelCalls=${result.summary.modelCalls} ok=${result.summary.modelSuccessfulCalls} ` +
+    `failed=${result.summary.modelFailedCalls} totalTokens=${result.summary.modelTotalTokens} durationMs=${result.summary.modelDurationMs}`,
+  );
   console.log(`- nextActions=${result.summary.nextActions} statuses=${formatRecordCounts(result.summary.nextActionStatuses)}`);
+  if (result.modelUsage.entries.length > 0) {
+    console.log("");
+    console.log("Model usage:");
+    for (const entry of result.modelUsage.entries) {
+      console.log(`- ${formatModelUsageEntry(entry)}`);
+    }
+  }
   if (result.recovery.observedFailure) {
     const failed = result.recovery.firstFailedCommand;
     const recovered = result.recovery.recoveryCommand;
