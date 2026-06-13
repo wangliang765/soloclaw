@@ -1,0 +1,23 @@
+{
+  "name": "agent-blueprint",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "soloclaw": "./dist/cli/bin.js",
+    "agent": "./dist/cli/bin.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/__tests__/*.test.js\""
+  },
+  "dependencies": {
+    "@types/node": "^24.13.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
