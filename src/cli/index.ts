@@ -4997,6 +4997,10 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultChangedPaths: string[];
     sessionResultNextActions: number;
     sessionResultNextActionStatuses: Record<string, number>;
+    sessionResultInspectionState?: string;
+    sessionResultInspectionIssues: number;
+    sessionResultInspectionIssueSeverities: Record<string, number>;
+    sessionResultInspectionFocusPaths: string[];
     sessionTimelineItems: number;
     sessionTimelineReturnedItems: number;
     sessionTimelineKinds: Record<string, number>;
@@ -5004,6 +5008,8 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionStatusTimelineItems: number;
     sessionStatusNextActions: number;
     sessionStatusNextActionStatuses: Record<string, number>;
+    sessionStatusInspectionState?: string;
+    sessionStatusInspectionIssues: number;
     sessionListReturned: number;
     sessionListOutcome?: string;
     sessionListPendingApprovals: number;
@@ -5033,6 +5039,8 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewTimelineItems: number;
     sessionReviewNextActions: number;
     sessionReviewNextActionStatuses: Record<string, number>;
+    sessionReviewInspectionState?: string;
+    sessionReviewInspectionIssues: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
     sessionBundleVerificationStatus?: string;
@@ -5041,6 +5049,8 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionBundleTimelineItems: number;
     sessionBundleNextActions: number;
     sessionBundleNextActionStatuses: Record<string, number>;
+    sessionBundleInspectionState?: string;
+    sessionBundleInspectionIssues: number;
     sessionBundleReviewProfile: UnifiedDiffReviewProfile;
     sessionBundleLocalAgentState?: string;
     sessionBundleLocalAgentDaemonState?: string;
@@ -5399,6 +5409,20 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary:
         `session result outcome=${sessionResult.summary.outcome}, recovered=${sessionResult.summary.recovered}, ` +
         `commands=${sessionResult.summary.commandsFinished}, timedOut=${sessionResult.summary.timedOutCommands}, pendingApprovals=${sessionResult.summary.pendingApprovals}`,
+    });
+    const sessionInspectionPass =
+      sessionResult.inspection.state === "blocked" &&
+      sessionResult.inspection.issues.some((issue) => issue.id === "pending-approvals" && issue.severity === "required") &&
+      sessionResult.inspection.issues.some((issue) => issue.id === "timeouts" && issue.severity === "warning") &&
+      sessionResult.inspection.issues.some((issue) => issue.id === "diff-review" && issue.severity === "info") &&
+      sessionResult.inspection.focusPaths.includes("src/math.js");
+    checks.push({
+      id: "session-inspection-evidence",
+      label: "session inspection evidence",
+      status: sessionInspectionPass ? "pass" : "fail",
+      summary:
+        `inspection=${sessionResult.inspection.state}, issues=${sessionResult.inspection.issues.length}, ` +
+        `severities=${formatRecordCounts(sessionResult.summary.inspectionIssueSeverities)}, focus=${sessionResult.inspection.focusPaths.join(",") || "-"}`,
     });
 
     const executionProfilePass = requiredExecutionProfiles.every((profile) =>
@@ -5826,6 +5850,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultChangedPaths: sessionResult.summary.changedPaths,
         sessionResultNextActions: sessionResult.summary.nextActions,
         sessionResultNextActionStatuses: sessionResult.summary.nextActionStatuses,
+        sessionResultInspectionState: sessionResult.inspection.state,
+        sessionResultInspectionIssues: sessionResult.inspection.issues.length,
+        sessionResultInspectionIssueSeverities: sessionResult.summary.inspectionIssueSeverities,
+        sessionResultInspectionFocusPaths: sessionResult.inspection.focusPaths,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
         sessionTimelineReturnedItems: sessionTimeline.summary.returnedItems,
         sessionTimelineKinds: sessionTimeline.summary.byKind,
@@ -5833,6 +5861,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionStatusTimelineItems: sessionStatus.summary.timelineItems,
         sessionStatusNextActions: sessionStatus.summary.nextActions,
         sessionStatusNextActionStatuses: sessionStatus.summary.nextActionStatuses,
+        sessionStatusInspectionState: sessionStatus.summary.inspectionState,
+        sessionStatusInspectionIssues: sessionStatus.summary.inspectionIssues,
         sessionListReturned: sessionList.summary.returned,
         sessionListOutcome: sessionListEntry?.summary.outcome,
         sessionListPendingApprovals: sessionListEntry?.summary.pendingApprovals ?? 0,
@@ -5862,6 +5892,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
         sessionReviewNextActions: sessionReview.summary.nextActions,
         sessionReviewNextActionStatuses: sessionReview.summary.nextActionStatuses,
+        sessionReviewInspectionState: sessionReview.inspection.state,
+        sessionReviewInspectionIssues: sessionReview.inspection.issues.length,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
         sessionBundleVerificationStatus: sessionBundle.summary.verificationStatus,
@@ -5870,6 +5902,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleTimelineItems: sessionBundle.summary.timelineItems,
         sessionBundleNextActions: sessionBundle.summary.nextActions,
         sessionBundleNextActionStatuses: sessionBundle.summary.nextActionStatuses,
+        sessionBundleInspectionState: sessionBundle.summary.inspectionState,
+        sessionBundleInspectionIssues: sessionBundle.summary.inspectionIssues,
         sessionBundleReviewProfile: sessionBundle.summary.reviewProfile,
         sessionBundleLocalAgentState: sessionBundle.summary.localAgentState,
         sessionBundleLocalAgentDaemonState: sessionBundle.summary.localAgentDaemonState,
@@ -6030,11 +6064,16 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionResultFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionResultFileSummaries)}`);
   console.log(`- sessionResultReviewProfile=${formatDiffReviewProfile(result.evidence.sessionResultReviewProfile)}`);
   console.log(`- sessionResultChangedPaths=${result.evidence.sessionResultChangedPaths.join(",") || "-"}`);
+  console.log(
+    `- sessionResultInspection=${result.evidence.sessionResultInspectionState ?? "-"} issues=${result.evidence.sessionResultInspectionIssues} ` +
+    `severities=${formatRecordCounts(result.evidence.sessionResultInspectionIssueSeverities)} focus=${result.evidence.sessionResultInspectionFocusPaths.join(",") || "-"}`,
+  );
   console.log(`- sessionResultNextActions=${result.evidence.sessionResultNextActions} statuses=${formatRecordCounts(result.evidence.sessionResultNextActionStatuses)}`);
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
   console.log(`- sessionTimelineKinds=${formatRecordCounts(result.evidence.sessionTimelineKinds)}`);
   console.log(`- sessionStatusOutcome=${result.evidence.sessionStatusOutcome ?? "-"}`);
   console.log(`- sessionStatusTimelineItems=${result.evidence.sessionStatusTimelineItems}`);
+  console.log(`- sessionStatusInspection=${result.evidence.sessionStatusInspectionState ?? "-"} issues=${result.evidence.sessionStatusInspectionIssues}`);
   console.log(`- sessionStatusNextActions=${result.evidence.sessionStatusNextActions} statuses=${formatRecordCounts(result.evidence.sessionStatusNextActionStatuses)}`);
   console.log(`- sessionListReturned=${result.evidence.sessionListReturned}`);
   console.log(`- sessionListOutcome=${result.evidence.sessionListOutcome ?? "-"}`);
@@ -6061,12 +6100,14 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReviewFileSummaries)}`);
   console.log(`- sessionReviewReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReviewReviewProfile)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
+  console.log(`- sessionReviewInspection=${result.evidence.sessionReviewInspectionState ?? "-"} issues=${result.evidence.sessionReviewInspectionIssues}`);
   console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
   console.log(`- sessionBundleVerificationStatus=${result.evidence.sessionBundleVerificationStatus ?? "-"}`);
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
+  console.log(`- sessionBundleInspection=${result.evidence.sessionBundleInspectionState ?? "-"} issues=${result.evidence.sessionBundleInspectionIssues}`);
   console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
   console.log(`- sessionBundleReviewProfile=${formatDiffReviewProfile(result.evidence.sessionBundleReviewProfile)}`);
   console.log(`- sessionBundleLocalAgent=${result.evidence.sessionBundleLocalAgentState ?? "-"}/${result.evidence.sessionBundleLocalAgentDaemonState ?? "-"} logs=${result.evidence.sessionBundleLocalAgentLogItems}`);
@@ -6956,6 +6997,10 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       lastCommand: result.summary.lastCommand,
       timelineItems: timeline.summary.totalItems,
       latestAt: timeline.summary.latestAt,
+      inspectionState: result.inspection.state,
+      inspectionIssues: result.inspection.issues.length,
+      inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
+      inspectionFocusPaths: result.inspection.focusPaths,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
@@ -7633,6 +7678,10 @@ async function buildSessionEvidenceBundle(
       modelDurationMs: result.summary.modelDurationMs,
       timelineItems: timeline.summary.totalItems,
       returnedTimelineItems: timeline.summary.returnedItems,
+      inspectionState: result.inspection.state,
+      inspectionIssues: result.inspection.issues.length,
+      inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
+      inspectionFocusPaths: result.inspection.focusPaths,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
       localAgentState: localStatus.summary.state,
@@ -7700,6 +7749,10 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(
     `- modelCalls=${bundle.summary.modelCalls} ok=${bundle.summary.modelSuccessfulCalls} ` +
     `failed=${bundle.summary.modelFailedCalls} totalTokens=${bundle.summary.modelTotalTokens} durationMs=${bundle.summary.modelDurationMs}`,
+  );
+  console.log(
+    `- inspection=${bundle.summary.inspectionState} issues=${bundle.summary.inspectionIssues} ` +
+    `severities=${formatRecordCounts(bundle.summary.inspectionIssueSeverities)} focus=${bundle.summary.inspectionFocusPaths.join(",") || "-"}`,
   );
   console.log(`- nextActions=${bundle.summary.nextActions} statuses=${formatRecordCounts(bundle.summary.nextActionStatuses)}`);
   console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
@@ -7785,6 +7838,10 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
     `- modelCalls=${status.summary.modelCalls} ok=${status.summary.modelSuccessfulCalls} ` +
     `failed=${status.summary.modelFailedCalls} totalTokens=${status.summary.modelTotalTokens} durationMs=${status.summary.modelDurationMs}`,
   );
+  console.log(
+    `- inspection=${status.summary.inspectionState} issues=${status.summary.inspectionIssues} ` +
+    `severities=${formatRecordCounts(status.summary.inspectionIssueSeverities)} focus=${status.summary.inspectionFocusPaths.join(",") || "-"}`,
+  );
   console.log(`- nextActions=${status.summary.nextActions} statuses=${formatRecordCounts(status.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
   if (status.latestTimeline.length > 0) {
@@ -7840,6 +7897,10 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       modelTotalTokens: result.summary.modelTotalTokens,
       modelDurationMs: result.summary.modelDurationMs,
       timelineItems: timeline.summary.totalItems,
+      inspectionState: result.inspection.state,
+      inspectionIssues: result.inspection.issues.length,
+      inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
+      inspectionFocusPaths: result.inspection.focusPaths,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
@@ -7863,6 +7924,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     commands: result.commands,
     recovery: result.recovery,
     approvals: result.approvals,
+    inspection: result.inspection,
     nextActions: result.nextActions,
     modelUsage: result.modelUsage,
     latestTimeline: timeline.items,
@@ -7972,6 +8034,10 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
     `- modelCalls=${review.summary.modelCalls} ok=${review.summary.modelSuccessfulCalls} ` +
     `failed=${review.summary.modelFailedCalls} totalTokens=${review.summary.modelTotalTokens} durationMs=${review.summary.modelDurationMs}`,
   );
+  console.log(
+    `- inspection=${review.inspection.state} issues=${review.inspection.issues.length} ` +
+    `severities=${formatRecordCounts(review.summary.inspectionIssueSeverities)} focus=${review.inspection.focusPaths.join(",") || "-"}`,
+  );
   console.log(`- nextActions=${review.summary.nextActions} statuses=${formatRecordCounts(review.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${review.summary.timelineItems}`);
   console.log("");
@@ -8007,6 +8073,17 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
     console.log("Approvals:");
     for (const approval of review.approvals) {
       console.log(`- ${approval.status}\t${approval.action}\t${approval.toolName ?? "-"}\t${approval.reason}`);
+    }
+  }
+  if (review.inspection.issues.length > 0) {
+    console.log("");
+    console.log("Inspection:");
+    console.log(`- state=${review.inspection.state}\t${review.inspection.summary}`);
+    for (const issue of review.inspection.issues) {
+      console.log(`- [${issue.severity}] ${issue.label}: ${issue.summary}`);
+      if (issue.command) {
+        console.log(`  ${issue.command}`);
+      }
     }
   }
   if (review.nextActions.length > 0) {
@@ -8259,6 +8336,157 @@ function countNextActionStatuses(actions: SessionOperatorNextAction[]): Record<s
   return counts;
 }
 
+function countInspectionSeverities(issues: SessionInspectionIssue[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const issue of issues) {
+    counts[issue.severity] = (counts[issue.severity] ?? 0) + 1;
+  }
+  return counts;
+}
+
+type SessionInspectionState = "clean" | "needs_attention" | "blocked";
+type SessionInspectionSeverity = "required" | "warning" | "info";
+
+type SessionInspectionIssue = {
+  id: string;
+  label: string;
+  severity: SessionInspectionSeverity;
+  summary: string;
+  command?: string;
+};
+
+type SessionInspectionSummary = {
+  state: SessionInspectionState;
+  summary: string;
+  issues: SessionInspectionIssue[];
+  focusPaths: string[];
+  signals: {
+    outcome: string;
+    recovered: boolean;
+    pendingApprovals: number;
+    failedCommands: number;
+    timedOutCommands: number;
+    failedToolResults: number;
+    modelFailedCalls: number;
+    reviewSize: UnifiedDiffReviewProfile["reviewSize"];
+    reviewFiles: number;
+  };
+};
+
+function buildSessionInspection(sessionId: string, input: {
+  outcome: string;
+  recovered: boolean;
+  pendingApprovals: number;
+  failedCommands: number;
+  timedOutCommands: number;
+  failedToolResults: number;
+  modelFailedCalls: number;
+  reviewProfile: UnifiedDiffReviewProfile;
+  fileSummaries: UnifiedDiffFileSummary[];
+}): SessionInspectionSummary {
+  const issues: SessionInspectionIssue[] = [];
+  if (input.outcome !== "succeeded") {
+    issues.push({
+      id: "session-outcome",
+      label: "Session outcome is not succeeded",
+      severity: "required",
+      summary: `outcome=${input.outcome}`,
+      command: `agent session status ${sessionId}`,
+    });
+  }
+  if (input.pendingApprovals > 0) {
+    issues.push({
+      id: "pending-approvals",
+      label: "Pending approvals remain",
+      severity: "required",
+      summary: `${input.pendingApprovals} pending approval request(s) block a clean handoff.`,
+      command: "agent approvals pending",
+    });
+  }
+  if (input.failedCommands > 0 && !input.recovered) {
+    issues.push({
+      id: "unrecovered-failures",
+      label: "Unrecovered command failures",
+      severity: "required",
+      summary: `${input.failedCommands} failed command(s) were not followed by a successful recovery command.`,
+      command: `agent session report ${sessionId} --json`,
+    });
+  }
+  if (input.failedToolResults > 0) {
+    issues.push({
+      id: "tool-errors",
+      label: "Failed tool results",
+      severity: "required",
+      summary: `${input.failedToolResults} failed tool result(s) need inspection.`,
+      command: `agent session timeline ${sessionId}`,
+    });
+  }
+  if (input.modelFailedCalls > 0) {
+    issues.push({
+      id: "model-failures",
+      label: "Model call failures",
+      severity: "required",
+      summary: `${input.modelFailedCalls} model call(s) failed.`,
+      command: `agent models usage --session ${sessionId}`,
+    });
+  }
+  if (input.timedOutCommands > 0) {
+    issues.push({
+      id: "timeouts",
+      label: "Timed-out commands observed",
+      severity: "warning",
+      summary: `${input.timedOutCommands} command timeout(s) should be reviewed before handoff.`,
+      command: `agent session timeline ${sessionId}`,
+    });
+  }
+  if (input.reviewProfile.reviewSize === "medium" || input.reviewProfile.reviewSize === "large") {
+    issues.push({
+      id: "review-size",
+      label: "Broad diff review",
+      severity: input.reviewProfile.reviewSize === "large" ? "required" : "warning",
+      summary: input.reviewProfile.reviewHint,
+      command: `agent session diff ${sessionId}`,
+    });
+  } else if (input.reviewProfile.files > 0) {
+    issues.push({
+      id: "diff-review",
+      label: "Diff review available",
+      severity: "info",
+      summary: input.reviewProfile.reviewHint,
+      command: `agent session diff ${sessionId}`,
+    });
+  }
+
+  const required = issues.some((issue) => issue.severity === "required");
+  const warning = issues.some((issue) => issue.severity === "warning");
+  const state: SessionInspectionState = required ? "blocked" : warning ? "needs_attention" : "clean";
+  const focusPaths = input.fileSummaries
+    .slice()
+    .sort((left, right) => (right.additions + right.deletions) - (left.additions + left.deletions) || left.path.localeCompare(right.path))
+    .slice(0, 5)
+    .map((entry) => entry.path);
+  return {
+    state,
+    summary:
+      state === "clean"
+        ? "No blocking inspection issues were found."
+        : `${issues.filter((issue) => issue.severity === "required").length} required and ${issues.filter((issue) => issue.severity === "warning").length} warning inspection issue(s).`,
+    issues,
+    focusPaths,
+    signals: {
+      outcome: input.outcome,
+      recovered: input.recovered,
+      pendingApprovals: input.pendingApprovals,
+      failedCommands: input.failedCommands,
+      timedOutCommands: input.timedOutCommands,
+      failedToolResults: input.failedToolResults,
+      modelFailedCalls: input.modelFailedCalls,
+      reviewSize: input.reviewProfile.reviewSize,
+      reviewFiles: input.reviewProfile.files,
+    },
+  };
+}
+
 async function buildSessionResult(store: AgentStore, sessionId: string) {
   const report = await buildSessionReport(store, sessionId);
   const diff = await buildSessionDiff(store, sessionId);
@@ -8284,6 +8512,17 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
     timedOutCommands: timedOutCommands.length,
     modelCalls: report.summary.modelCalls,
     recovered: Boolean(recoveryCommand),
+  });
+  const inspection = buildSessionInspection(sessionId, {
+    outcome,
+    recovered: Boolean(recoveryCommand),
+    pendingApprovals: report.summary.pendingApprovals,
+    failedCommands: failedCommands.length,
+    timedOutCommands: timedOutCommands.length,
+    failedToolResults: report.summary.failedToolResults,
+    modelFailedCalls: report.summary.modelFailedCalls,
+    reviewProfile: diff.summary.reviewProfile,
+    fileSummaries: diff.summary.fileSummaries,
   });
 
   return {
@@ -8318,6 +8557,10 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       modelDurationMs: report.summary.modelDurationMs,
       toolResults: report.summary.toolResults,
       failedToolResults: report.summary.failedToolResults,
+      inspectionState: inspection.state,
+      inspectionIssues: inspection.issues.length,
+      inspectionIssueSeverities: countInspectionSeverities(inspection.issues),
+      inspectionFocusPaths: inspection.focusPaths,
       nextActions: nextActions.length,
       nextActionStatuses: countNextActionStatuses(nextActions),
       lastCommand: lastCommand
@@ -8368,6 +8611,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       stderrBytes: event.stderrBytes,
     })),
     approvals: report.approvals,
+    inspection,
     nextActions,
     modelUsage: report.modelUsage,
     fileChanges: report.fileChanges,
@@ -8433,6 +8677,10 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
     `- modelCalls=${result.summary.modelCalls} ok=${result.summary.modelSuccessfulCalls} ` +
     `failed=${result.summary.modelFailedCalls} totalTokens=${result.summary.modelTotalTokens} durationMs=${result.summary.modelDurationMs}`,
   );
+  console.log(
+    `- inspection=${result.inspection.state} issues=${result.inspection.issues.length} ` +
+    `severities=${formatRecordCounts(result.summary.inspectionIssueSeverities)} focus=${result.inspection.focusPaths.join(",") || "-"}`,
+  );
   console.log(`- nextActions=${result.summary.nextActions} statuses=${formatRecordCounts(result.summary.nextActionStatuses)}`);
   if (result.modelUsage.entries.length > 0) {
     console.log("");
@@ -8470,6 +8718,17 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
     console.log("Approvals:");
     for (const approval of result.approvals) {
       console.log(`- ${approval.status}\t${approval.action}\t${approval.toolName ?? "-"}\t${approval.reason}`);
+    }
+  }
+  if (result.inspection.issues.length > 0) {
+    console.log("");
+    console.log("Inspection:");
+    console.log(`- state=${result.inspection.state}\t${result.inspection.summary}`);
+    for (const issue of result.inspection.issues) {
+      console.log(`- [${issue.severity}] ${issue.label}: ${issue.summary}`);
+      if (issue.command) {
+        console.log(`  ${issue.command}`);
+      }
     }
   }
   if (result.nextActions.length > 0) {
