@@ -4870,11 +4870,15 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultFileSummaries: UnifiedDiffFileSummary[];
     sessionResultPendingApprovals: number;
     sessionResultChangedPaths: string[];
+    sessionResultNextActions: number;
+    sessionResultNextActionStatuses: Record<string, number>;
     sessionTimelineItems: number;
     sessionTimelineReturnedItems: number;
     sessionTimelineKinds: Record<string, number>;
     sessionStatusOutcome?: string;
     sessionStatusTimelineItems: number;
+    sessionStatusNextActions: number;
+    sessionStatusNextActionStatuses: Record<string, number>;
     sessionListReturned: number;
     sessionListOutcome?: string;
     sessionListPendingApprovals: number;
@@ -4890,12 +4894,16 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewDiffStats: UnifiedDiffStats;
     sessionReviewFileSummaries: UnifiedDiffFileSummary[];
     sessionReviewTimelineItems: number;
+    sessionReviewNextActions: number;
+    sessionReviewNextActionStatuses: Record<string, number>;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
     sessionBundleVerificationStatus?: string;
     sessionBundleSections: string[];
     sessionBundleOutputBytes: number;
     sessionBundleTimelineItems: number;
+    sessionBundleNextActions: number;
+    sessionBundleNextActionStatuses: Record<string, number>;
     policyBoundaryApprovalActions: string[];
     policyBoundaryApprovalCount: number;
     timeoutCommandTimedOut: boolean;
@@ -5379,6 +5387,24 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `outputBytes=${sessionBundleOutput.bytes}`,
     });
 
+    const nextActionEvidencePass =
+      sessionResult.nextActions.some((action) => action.id === "resolve-pending-approvals" && action.status === "required" && action.command.includes("agent approve")) &&
+      sessionResult.nextActions.some((action) => action.id === "review-diff" && action.command.includes("agent session diff")) &&
+      sessionResult.nextActions.some((action) => action.id === "verify-session" && action.command.includes("--require-timeout")) &&
+      sessionReview.nextActions.length === sessionResult.nextActions.length &&
+      sessionStatus.nextActions.length === sessionResult.nextActions.length &&
+      sessionBundle.summary.nextActions === sessionResult.nextActions.length &&
+      (sessionBundle.summary.nextActionStatuses.required ?? 0) >= 1;
+    checks.push({
+      id: "operator-next-actions-evidence",
+      label: "operator next actions evidence",
+      status: nextActionEvidencePass ? "pass" : "fail",
+      summary:
+        `result=${sessionResult.nextActions.length}, review=${sessionReview.nextActions.length}, ` +
+        `status=${sessionStatus.nextActions.length}, bundle=${sessionBundle.summary.nextActions}, ` +
+        `statuses=${formatRecordCounts(sessionResult.summary.nextActionStatuses)}`,
+    });
+
     const runSmoke = await platform.agent.runWithSession("inspect this workspace through the engineering run path");
     const runSessionResult = runSmoke.session ? await buildSessionResult(platform.store, runSmoke.session.id) : undefined;
     const runSessionVerification = runSmoke.session
@@ -5534,11 +5560,15 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultFileSummaries: sessionResult.summary.fileSummaries,
         sessionResultPendingApprovals: sessionResult.summary.pendingApprovals,
         sessionResultChangedPaths: sessionResult.summary.changedPaths,
+        sessionResultNextActions: sessionResult.summary.nextActions,
+        sessionResultNextActionStatuses: sessionResult.summary.nextActionStatuses,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
         sessionTimelineReturnedItems: sessionTimeline.summary.returnedItems,
         sessionTimelineKinds: sessionTimeline.summary.byKind,
         sessionStatusOutcome: sessionStatus.summary.outcome,
         sessionStatusTimelineItems: sessionStatus.summary.timelineItems,
+        sessionStatusNextActions: sessionStatus.summary.nextActions,
+        sessionStatusNextActionStatuses: sessionStatus.summary.nextActionStatuses,
         sessionListReturned: sessionList.summary.returned,
         sessionListOutcome: sessionListEntry?.summary.outcome,
         sessionListPendingApprovals: sessionListEntry?.summary.pendingApprovals ?? 0,
@@ -5554,12 +5584,16 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewDiffStats: sessionReview.changes.diffStats,
         sessionReviewFileSummaries: sessionReview.changes.fileSummaries,
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
+        sessionReviewNextActions: sessionReview.summary.nextActions,
+        sessionReviewNextActionStatuses: sessionReview.summary.nextActionStatuses,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
         sessionBundleVerificationStatus: sessionBundle.summary.verificationStatus,
         sessionBundleSections,
         sessionBundleOutputBytes: sessionBundleOutput.bytes,
         sessionBundleTimelineItems: sessionBundle.summary.timelineItems,
+        sessionBundleNextActions: sessionBundle.summary.nextActions,
+        sessionBundleNextActionStatuses: sessionBundle.summary.nextActionStatuses,
         policyBoundaryApprovalActions: [...policyBoundaryActionSet],
         policyBoundaryApprovalCount: policyBoundaryApprovals.length,
         timeoutCommandTimedOut: timeoutObserved,
@@ -5688,10 +5722,12 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionResultDiffStats=${formatDiffStats(result.evidence.sessionResultDiffStats)}`);
   console.log(`- sessionResultFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionResultFileSummaries)}`);
   console.log(`- sessionResultChangedPaths=${result.evidence.sessionResultChangedPaths.join(",") || "-"}`);
+  console.log(`- sessionResultNextActions=${result.evidence.sessionResultNextActions} statuses=${formatRecordCounts(result.evidence.sessionResultNextActionStatuses)}`);
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
   console.log(`- sessionTimelineKinds=${formatRecordCounts(result.evidence.sessionTimelineKinds)}`);
   console.log(`- sessionStatusOutcome=${result.evidence.sessionStatusOutcome ?? "-"}`);
   console.log(`- sessionStatusTimelineItems=${result.evidence.sessionStatusTimelineItems}`);
+  console.log(`- sessionStatusNextActions=${result.evidence.sessionStatusNextActions} statuses=${formatRecordCounts(result.evidence.sessionStatusNextActionStatuses)}`);
   console.log(`- sessionListReturned=${result.evidence.sessionListReturned}`);
   console.log(`- sessionListOutcome=${result.evidence.sessionListOutcome ?? "-"}`);
   console.log(`- sessionListPendingApprovals=${result.evidence.sessionListPendingApprovals}`);
@@ -5707,11 +5743,13 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewDiffStats=${formatDiffStats(result.evidence.sessionReviewDiffStats)}`);
   console.log(`- sessionReviewFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReviewFileSummaries)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
+  console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
   console.log(`- sessionBundleVerificationStatus=${result.evidence.sessionBundleVerificationStatus ?? "-"}`);
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
+  console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
   console.log(`- timeoutCommandTimedOut=${result.evidence.timeoutCommandTimedOut}`);
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
   console.log(`- runSessionOutcome=${result.evidence.runSessionOutcome ?? "-"}`);
@@ -6451,8 +6489,11 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       lastCommand: result.summary.lastCommand,
       timelineItems: timeline.summary.totalItems,
       latestAt: timeline.summary.latestAt,
+      nextActions: result.nextActions.length,
+      nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
     latestTimeline: timeline.items,
+    nextActions: result.nextActions,
     reviewCommands: {
       timeline: `agent session timeline ${sessionId}`,
       review: `agent session review ${sessionId}`,
@@ -6857,6 +6898,8 @@ async function buildSessionEvidenceBundle(
       failedToolResults: result.summary.failedToolResults,
       timelineItems: timeline.summary.totalItems,
       returnedTimelineItems: timeline.summary.returnedItems,
+      nextActions: result.nextActions.length,
+      nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
     sections: {
       diff,
@@ -6908,6 +6951,7 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- commandsFinished=${bundle.summary.commandsFinished} failed=${bundle.summary.failedCommands} timedOut=${bundle.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(bundle.summary.executionProfiles)}`);
   console.log(`- approvals=${bundle.summary.approvals} pending=${bundle.summary.pendingApprovals}`);
+  console.log(`- nextActions=${bundle.summary.nextActions} statuses=${formatRecordCounts(bundle.summary.nextActionStatuses)}`);
   console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
   console.log(`- verificationChecks=${bundle.sections.verification.checks.length}`);
   if (bundle.output) {
@@ -6922,6 +6966,14 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log("- review");
   console.log("- result");
   console.log("- verification");
+  if (bundle.sections.result.nextActions.length > 0) {
+    console.log("");
+    console.log("Next actions:");
+    for (const action of bundle.sections.result.nextActions) {
+      console.log(`- [${action.status}] ${action.label}: ${action.command}`);
+      console.log(`  ${action.reason}`);
+    }
+  }
   console.log("");
   console.log("Review:");
   console.log(`- ${bundle.reviewCommands.bundle}`);
@@ -6970,6 +7022,7 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- fileSummaries=${formatDiffFileSummaryList(status.summary.fileSummaries)}`);
   console.log(`- pendingApprovals=${status.summary.pendingApprovals}`);
   console.log(`- toolResults=${status.summary.toolResults} failed=${status.summary.failedToolResults}`);
+  console.log(`- nextActions=${status.summary.nextActions} statuses=${formatRecordCounts(status.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
   if (status.latestTimeline.length > 0) {
     console.log("");
@@ -7015,6 +7068,8 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
       timelineItems: timeline.summary.totalItems,
+      nextActions: result.nextActions.length,
+      nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
     checklist,
     changes: {
@@ -7035,6 +7090,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     commands: result.commands,
     recovery: result.recovery,
     approvals: result.approvals,
+    nextActions: result.nextActions,
     latestTimeline: timeline.items,
     reviewCommands: {
       diff: `agent session diff ${sessionId}`,
@@ -7137,6 +7193,7 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(`- fileSummaries=${formatDiffFileSummaryList(review.summary.fileSummaries)}`);
   console.log(`- commandsFinished=${review.summary.commandsFinished} failed=${review.summary.failedCommands} timedOut=${review.summary.timedOutCommands}`);
   console.log(`- pendingApprovals=${review.summary.pendingApprovals}`);
+  console.log(`- nextActions=${review.summary.nextActions} statuses=${formatRecordCounts(review.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${review.summary.timelineItems}`);
   console.log("");
   console.log("Checklist:");
@@ -7171,6 +7228,14 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
     console.log("Approvals:");
     for (const approval of review.approvals) {
       console.log(`- ${approval.status}\t${approval.action}\t${approval.toolName ?? "-"}\t${approval.reason}`);
+    }
+  }
+  if (review.nextActions.length > 0) {
+    console.log("");
+    console.log("Next actions:");
+    for (const action of review.nextActions) {
+      console.log(`- [${action.status}] ${action.label}: ${action.command}`);
+      console.log(`  ${action.reason}`);
     }
   }
   console.log("");
@@ -7294,6 +7359,122 @@ function actorLabel(actor: { type: string; id: string }): string {
   return `${actor.type}:${actor.id}`;
 }
 
+type SessionOperatorNextActionStatus = "required" | "recommended" | "optional";
+
+type SessionOperatorNextAction = {
+  id: string;
+  label: string;
+  status: SessionOperatorNextActionStatus;
+  command: string;
+  reason: string;
+};
+
+function buildSessionNextActions(sessionId: string, input: {
+  outcome: string;
+  sessionStatus: Session["status"];
+  pendingApprovalIds: string[];
+  changedPaths: string[];
+  patches: number;
+  commandsFinished: number;
+  failedCommands: number;
+  timedOutCommands: number;
+  recovered: boolean;
+}): SessionOperatorNextAction[] {
+  const actions: SessionOperatorNextAction[] = [];
+  if (input.pendingApprovalIds.length > 0) {
+    const firstApprovalId = input.pendingApprovalIds[0];
+    actions.push({
+      id: "resolve-pending-approvals",
+      label: "Resolve pending approvals",
+      status: "required",
+      command: firstApprovalId ? `agent approve ${firstApprovalId} --auto-replay` : "agent approvals pending",
+      reason: `${input.pendingApprovalIds.length} pending approval request(s) need an operator decision.`,
+    });
+  }
+  if (input.sessionStatus === "paused" || input.outcome === "paused") {
+    actions.push({
+      id: "resume-session",
+      label: "Resume paused session",
+      status: "recommended",
+      command: `agent resume ${sessionId} --session-result --verify-session`,
+      reason: "The session is paused and can be continued from durable state.",
+    });
+  }
+  if (input.outcome === "failed" || (input.failedCommands > 0 && !input.recovered)) {
+    actions.push({
+      id: "inspect-failure",
+      label: "Inspect failed execution",
+      status: "required",
+      command: `agent session report ${sessionId} --json`,
+      reason: `${input.failedCommands} failed command(s) remain unrecovered.`,
+    });
+  }
+  if (input.changedPaths.length > 0 || input.patches > 0) {
+    actions.push({
+      id: "review-diff",
+      label: "Review persisted diff",
+      status: "recommended",
+      command: `agent session diff ${sessionId}`,
+      reason: `${input.changedPaths.length} changed path(s) and ${input.patches} persisted patch(es) are available for review.`,
+    });
+  }
+  if (input.timedOutCommands > 0) {
+    actions.push({
+      id: "inspect-timeouts",
+      label: "Inspect timed-out commands",
+      status: "recommended",
+      command: `agent session timeline ${sessionId}`,
+      reason: `${input.timedOutCommands} command(s) timed out during execution.`,
+    });
+  }
+  actions.push({
+    id: "verify-session",
+    label: "Run evidence gate",
+    status: input.commandsFinished > 0 || input.changedPaths.length > 0 ? "recommended" : "optional",
+    command: buildSessionVerifyNextActionCommand(sessionId, input),
+    reason: "Verify the session evidence before handoff or archival.",
+  });
+  actions.push({
+    id: "export-bundle",
+    label: "Export evidence bundle",
+    status: "optional",
+    command: `agent session bundle ${sessionId} --json --output .agent/tmp/session-bundle.json`,
+    reason: "Package diff, report, status, timeline, review, result, and verification evidence for handoff.",
+  });
+  return actions;
+}
+
+function buildSessionVerifyNextActionCommand(sessionId: string, input: {
+  changedPaths: string[];
+  patches: number;
+  failedCommands: number;
+  timedOutCommands: number;
+  recovered: boolean;
+}): string {
+  const flags = [];
+  if (input.changedPaths.length > 0) {
+    flags.push("--require-change");
+  }
+  if (input.patches > 0) {
+    flags.push("--require-patch", "--require-diff-stat");
+  }
+  if (input.failedCommands > 0 && input.recovered) {
+    flags.push("--require-recovery");
+  }
+  if (input.timedOutCommands > 0) {
+    flags.push("--require-timeout");
+  }
+  return `agent session verify ${sessionId}${flags.length > 0 ? ` ${flags.join(" ")}` : ""}`;
+}
+
+function countNextActionStatuses(actions: SessionOperatorNextAction[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const action of actions) {
+    counts[action.status] = (counts[action.status] ?? 0) + 1;
+  }
+  return counts;
+}
+
 async function buildSessionResult(store: AgentStore, sessionId: string) {
   const report = await buildSessionReport(store, sessionId);
   const diff = await buildSessionDiff(store, sessionId);
@@ -7307,6 +7488,18 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
   const lastCommand = finishedCommands.at(-1);
   const outcome = sessionResultOutcome(report.session.status, lastCommand?.exitCode, lastCommand?.timedOut);
   const changedPaths = [...new Set([...report.summary.changedPaths, ...diff.summary.changedPaths])].sort();
+  const pendingApprovalIds = report.approvals.filter((approval) => approval.status === "pending").map((approval) => approval.id);
+  const nextActions = buildSessionNextActions(sessionId, {
+    outcome,
+    sessionStatus: report.session.status,
+    pendingApprovalIds,
+    changedPaths,
+    patches: diff.summary.patches,
+    commandsFinished: finishedCommands.length,
+    failedCommands: failedCommands.length,
+    timedOutCommands: timedOutCommands.length,
+    recovered: Boolean(recoveryCommand),
+  });
 
   return {
     generatedAt: new Date().toISOString(),
@@ -7331,6 +7524,8 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       deniedApprovals: report.summary.deniedApprovals,
       toolResults: report.summary.toolResults,
       failedToolResults: report.summary.failedToolResults,
+      nextActions: nextActions.length,
+      nextActionStatuses: countNextActionStatuses(nextActions),
       lastCommand: lastCommand
         ? {
             command: lastCommand.command,
@@ -7379,6 +7574,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       stderrBytes: event.stderrBytes,
     })),
     approvals: report.approvals,
+    nextActions,
     fileChanges: report.fileChanges,
     patches: diff.patches.map((patch) => ({
       ordinal: patch.ordinal,
@@ -7437,6 +7633,7 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- executionProfiles=${formatRecordCounts(result.summary.executionProfiles)}`);
   console.log(`- approvals=${result.summary.approvals} pending=${result.summary.pendingApprovals}`);
   console.log(`- toolResults=${result.summary.toolResults} failed=${result.summary.failedToolResults}`);
+  console.log(`- nextActions=${result.summary.nextActions} statuses=${formatRecordCounts(result.summary.nextActionStatuses)}`);
   if (result.recovery.observedFailure) {
     const failed = result.recovery.firstFailedCommand;
     const recovered = result.recovery.recoveryCommand;
@@ -7466,6 +7663,14 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
     console.log("Approvals:");
     for (const approval of result.approvals) {
       console.log(`- ${approval.status}\t${approval.action}\t${approval.toolName ?? "-"}\t${approval.reason}`);
+    }
+  }
+  if (result.nextActions.length > 0) {
+    console.log("");
+    console.log("Next actions:");
+    for (const action of result.nextActions) {
+      console.log(`- [${action.status}] ${action.label}: ${action.command}`);
+      console.log(`  ${action.reason}`);
     }
   }
   console.log("");

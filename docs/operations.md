@@ -78,7 +78,7 @@ The interactive `soloclaw` shell exposes the same views as `/agent status` and `
 
 For supervised real-model tasks, add `--require-model-ready` to `agent run`, `agent ask`, `agent plan`, `agent build`, or `agent goal`. The command checks the selected provider, model, base URL, API-key environment names, and configured secret-ref state before the local platform/session is opened; failures return `status=blocked` in JSON mode or a `Model readiness gate failed.` text block with the same fields as `soloclaw model check`.
 
-The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, and a short review hint when the session contains completed `apply_patch` evidence. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
+The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, a short review hint when the session contains completed `apply_patch` evidence, and operator next actions such as resolving pending approvals, reviewing diffs, running evidence gates, or exporting the bundle. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
 
 ## Audit Export
 
