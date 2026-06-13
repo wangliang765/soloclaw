@@ -16528,6 +16528,81 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(html, /\/members\/'\s*\+\s*encodeURIComponent\(actorId\)\s*\+\s*'\/status/);
   assert.match(html, /\/api\/sessions\//);
 
+  const webSessionStore = new SqliteAgentStore(path.join(dir, ".agent", "agent.db"));
+  const webSessionActor = { type: "user" as const, id: "local-user", displayName: "Local User" };
+  const webSession = await webSessionStore.createSession({
+    objective: "inspect through web API",
+    status: "completed",
+    risk: "medium",
+    createdBy: webSessionActor,
+  });
+  await webSessionStore.recordFileChange({
+    id: "web_inspect_change",
+    sessionId: webSession.id,
+    actor: webSessionActor,
+    kind: "patch",
+    path: "src/web-target.ts",
+    summary: "Updated web target",
+    createdAt: "2024-01-01T00:00:00.000Z",
+  });
+  await webSessionStore.recordAuditEvent({
+    id: "web_inspect_patch",
+    type: "tool.completed",
+    actor: webSessionActor,
+    sessionId: webSession.id,
+    summary: "Applied patch",
+    metadata: {
+      tool: "apply_patch",
+      ok: true,
+      input: {
+        patch: [
+          "--- a/src/web-target.ts",
+          "+++ b/src/web-target.ts",
+          "@@",
+          "-old",
+          "+new",
+          "",
+        ].join("\n"),
+      },
+    },
+    createdAt: "2024-01-01T00:00:01.000Z",
+  });
+  await webSessionStore.createApprovalRequest({
+    id: "web_inspect_approval",
+    status: "pending",
+    requestedBy: webSessionActor,
+    action: "workspace.write",
+    reason: "Need operator review",
+    sessionId: webSession.id,
+    toolName: "apply_patch",
+    createdAt: "2024-01-01T00:00:02.000Z",
+  });
+  webSessionStore.close();
+
+  const deniedInspection = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/inspect`);
+  assert.equal(deniedInspection.status, 401);
+
+  const webSessionInspection = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/inspect`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionInspectionJson = await webSessionInspection.json() as {
+    summary?: { inspectionState?: string; inspectionFocusPaths?: string[]; pendingApprovals?: number };
+    inspection?: { issues?: Array<{ id?: string }> };
+    reviewCommands?: { result?: string; bundle?: string };
+  };
+  assert.equal(webSessionInspection.status, 200);
+  assert.equal(webSessionInspectionJson.summary?.inspectionState, "blocked");
+  assert.equal(webSessionInspectionJson.summary?.pendingApprovals, 1);
+  assert.deepEqual(webSessionInspectionJson.summary?.inspectionFocusPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionInspectionJson.inspection?.issues?.some((issue) => issue.id === "pending-approvals"), true);
+  assert.match(webSessionInspectionJson.reviewCommands?.result ?? "", new RegExp(`agent session result ${webSession.id}`));
+  assert.match(webSessionInspectionJson.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${webSession.id} --json`));
+
+  const missingInspection = await fetch(`${server.baseUrl}/api/sessions/missing-session/inspect`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingInspection.status, 404);
+
   const webMcpRegistry = new LocalMcpRegistry(path.join(dir, ".agent"));
   await webMcpRegistry.register({
     id: "web_mcp_disabled",

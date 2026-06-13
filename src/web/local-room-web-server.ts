@@ -457,6 +457,18 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
         return;
       }
 
+      const sessionInspectionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/inspect$/);
+      if (request.method === "GET" && sessionInspectionMatch) {
+        const sessionId = decodeURIComponent(sessionInspectionMatch[1]);
+        const inspection = await control.getSessionInspection(sessionId);
+        if (!inspection) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, inspection);
+        return;
+      }
+
       const sessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
       if (request.method === "GET" && sessionMatch) {
         const session = await control.getSession(decodeURIComponent(sessionMatch[1]));

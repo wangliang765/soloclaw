@@ -54,6 +54,7 @@ import { createLocalPlatform } from "../platform/local-platform.js";
 import { RemoteRoomRunner } from "../remote/remote-room-runner.js";
 import type { SchedulerRunResult, SchedulerTickResult } from "../scheduler/local-scheduler-service.js";
 import type { PutSecretInput } from "../secrets/secret-store.js";
+import { buildSessionInspectView } from "../sessions/session-inspection-view.js";
 import type { KnowledgeEvalCase, KnowledgeEvalThresholds, KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { parseSpecificationClarificationStatus, parseSpecificationStatus, parseSpecificationTaskStatus } from "../specifications/specification-service.js";
 import type { SpecificationEvidenceConclusion, SpecificationEvidenceProvider, SpecificationVerificationStatus } from "../specifications/specification-service.js";
@@ -5022,6 +5023,10 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionInspectFocusPaths: string[];
     sessionInspectNextActions: number;
     sessionInspectReviewCommand?: string;
+    controlPlaneSessionInspectState?: string;
+    controlPlaneSessionInspectIssues: number;
+    controlPlaneSessionInspectNextActions: number;
+    controlPlaneSessionInspectReviewCommand?: string;
     sessionTimelineItems: number;
     sessionTimelineReturnedItems: number;
     sessionTimelineKinds: Record<string, number>;
@@ -5461,6 +5466,21 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `inspect=${sessionInspect.inspection.state}, issues=${sessionInspect.inspection.issues.length}, ` +
         `nextActions=${sessionInspect.summary.nextActions}, focus=${sessionInspect.summary.inspectionFocusPaths.join(",") || "-"}`,
     });
+    const controlPlaneSessionInspect = await new ControlPlaneService(platform).getSessionInspection(session.id);
+    const controlPlaneSessionInspectPass =
+      controlPlaneSessionInspect?.inspection.state === sessionInspect.inspection.state &&
+      controlPlaneSessionInspect.inspection.issues.length === sessionInspect.inspection.issues.length &&
+      controlPlaneSessionInspect.summary.nextActions === sessionInspect.summary.nextActions &&
+      controlPlaneSessionInspect.reviewCommands.inspect.includes(`agent session inspect ${session.id}`);
+    checks.push({
+      id: "control-plane-session-inspection-evidence",
+      label: "control plane session inspection evidence",
+      status: controlPlaneSessionInspectPass ? "pass" : "fail",
+      summary:
+        `inspect=${controlPlaneSessionInspect?.inspection.state ?? "-"}, ` +
+        `issues=${controlPlaneSessionInspect?.inspection.issues.length ?? 0}, ` +
+        `nextActions=${controlPlaneSessionInspect?.summary.nextActions ?? 0}`,
+    });
 
     const executionProfilePass = requiredExecutionProfiles.every((profile) =>
       (sessionReport.summary.executionProfiles[profile] ?? 0) > 0 &&
@@ -5897,6 +5917,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionInspectFocusPaths: sessionInspect.summary.inspectionFocusPaths,
         sessionInspectNextActions: sessionInspect.summary.nextActions,
         sessionInspectReviewCommand: sessionInspect.reviewCommands.result,
+        controlPlaneSessionInspectState: controlPlaneSessionInspect?.inspection.state,
+        controlPlaneSessionInspectIssues: controlPlaneSessionInspect?.inspection.issues.length ?? 0,
+        controlPlaneSessionInspectNextActions: controlPlaneSessionInspect?.summary.nextActions ?? 0,
+        controlPlaneSessionInspectReviewCommand: controlPlaneSessionInspect?.reviewCommands.inspect,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
         sessionTimelineReturnedItems: sessionTimeline.summary.returnedItems,
         sessionTimelineKinds: sessionTimeline.summary.byKind,
@@ -7068,44 +7092,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
 }
 
 async function buildSessionInspect(store: AgentStore, sessionId: string) {
-  const result = await buildSessionResult(store, sessionId);
-  return {
-    generatedAt: new Date().toISOString(),
-    session: result.session,
-    summary: {
-      outcome: result.summary.outcome,
-      status: result.summary.status,
-      targetMode: result.summary.targetMode,
-      recovered: result.summary.recovered,
-      inspectionState: result.inspection.state,
-      inspectionSummary: result.inspection.summary,
-      inspectionIssues: result.inspection.issues.length,
-      inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
-      inspectionFocusPaths: result.inspection.focusPaths,
-      pendingApprovals: result.summary.pendingApprovals,
-      failedCommands: result.summary.failedCommands,
-      timedOutCommands: result.summary.timedOutCommands,
-      failedToolResults: result.summary.failedToolResults,
-      modelFailedCalls: result.summary.modelFailedCalls,
-      reviewProfile: result.summary.reviewProfile,
-      nextActions: result.nextActions.length,
-      nextActionStatuses: result.summary.nextActionStatuses,
-    },
-    inspection: result.inspection,
-    nextActions: result.nextActions,
-    reviewCommands: {
-      inspect: `agent session inspect ${sessionId}`,
-      result: `agent session result ${sessionId}`,
-      review: `agent session review ${sessionId}`,
-      status: `agent session status ${sessionId}`,
-      diff: `agent session diff ${sessionId}`,
-      timeline: `agent session timeline ${sessionId}`,
-      report: `agent session report ${sessionId} --json`,
-      verify: `agent session verify ${sessionId}`,
-      bundle: `agent session bundle ${sessionId} --json`,
-      audit: `agent audit list --session ${sessionId}`,
-    },
-  };
+  return buildSessionInspectView(store, sessionId);
 }
 
 type SessionListOptions = {

@@ -13,6 +13,7 @@ import type { OperatorRowsOptions } from "../operator/operator-rows.js";
 import { collectOperatorRows } from "../operator/operator-rows.js";
 import { buildOperatorDetail } from "../operator/operator-detail.js";
 import { projectOperatorDetail, projectOperatorView, type OperatorProjectionMode } from "../operator/operator-access.js";
+import { buildSessionInspectView } from "../sessions/session-inspection-view.js";
 import { replayApprovedTool } from "../tools/tool-replay.js";
 import { createWorkspaceTools } from "../tools/workspace-tools.js";
 
@@ -639,6 +640,14 @@ export class ControlPlaneService {
       summaries: await this.platform.store.getSessionSummaries(sessionId),
       links: await this.platform.store.listSessionLinks(sessionId),
     };
+  }
+
+  async getSessionInspection(sessionId: string) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionInspectView(this.platform.store, sessionId);
   }
 
   async pauseSession(input: { sessionId: string; actor: ActorRef; reason?: string }) {

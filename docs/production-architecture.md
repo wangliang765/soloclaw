@@ -48,7 +48,7 @@ Web UI / CLI
 
 Use this for organizations, shared projects, long-running tasks, PR automation, and auditability.
 
-Current local implementation note: `agent web` hosts a token-gated local control-plane API and room console on a configurable host/port. It reuses the same SQLite-backed platform services as the CLI and exposes local JSON endpoints for room state, sessions, session lifecycle actions, approvals, artifacts, retention policies, audit events, and worker registration/heartbeat. This is a bridge toward the private-team control plane, not the production API boundary.
+Current local implementation note: `agent web` hosts a token-gated local control-plane API and room console on a configurable host/port. It reuses the same SQLite-backed platform services as the CLI and exposes local JSON endpoints for room state, sessions, focused session inspection, session lifecycle actions, approvals, artifacts, retention policies, audit events, and worker registration/heartbeat. This is a bridge toward the private-team control plane, not the production API boundary.
 
 ### Distributed Agent Mesh
 
