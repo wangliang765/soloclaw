@@ -7845,6 +7845,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       pauseStatus?: string;
       resumeStatus?: string;
       cancelStatus?: string;
+      localDaemonRunStopReason?: string;
+      localDaemonRunTicks?: number;
+      localDaemonRunIdleTicks?: number;
+      localDaemonRunLifecyclePhase?: string;
+      localDaemonRunLifecycleStopReason?: string;
+      localDaemonRunMetricTicks?: number;
+      localDaemonRunMetricIdle?: number;
+      localDaemonRunWorkerPolls?: number;
+      localDaemonRunWorkerStopReasons?: string[];
       cleanup?: boolean;
     };
     commands?: {
@@ -7859,6 +7868,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       modelReadinessGate?: string;
       resumeModelReadinessGate?: string;
       agentRepairVerify?: string;
+      localDaemonRun?: string;
     };
   };
 
@@ -8048,6 +8058,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.pauseStatus, "paused");
   assert.equal(parsed.evidence?.resumeStatus, "running");
   assert.equal(parsed.evidence?.cancelStatus, "cancelled");
+  assert.equal(parsed.evidence?.localDaemonRunStopReason, "idle");
+  assert.equal((parsed.evidence?.localDaemonRunTicks ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.localDaemonRunIdleTicks ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.localDaemonRunLifecyclePhase, "stopped");
+  assert.equal(parsed.evidence?.localDaemonRunLifecycleStopReason, "idle");
+  assert.equal((parsed.evidence?.localDaemonRunMetricTicks ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.localDaemonRunMetricIdle ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.localDaemonRunWorkerPolls ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.localDaemonRunWorkerStopReasons?.includes("idle"), true);
   assert.equal(parsed.evidence?.cleanup, true);
   assert.equal(parsed.checks?.every((check) => check.status === "pass"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "failing-test-observed"), true);
@@ -8093,12 +8112,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-model-call"), true);
   assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-review-profile"), true);
+  assert.equal(parsed.commands?.localDaemonRun?.includes("agent scheduler run"), true);
+  assert.equal(parsed.commands?.localDaemonRun?.includes("--stop-when-idle"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "queued-approval-continuation-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "target-mode-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "lifecycle-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "local-daemon-run-lifecycle-evidence"), true);
   assert.equal(await exists(parsed.sampleWorkspace ?? path.join(dir, "missing")), false);
   assert.equal(await exists(parsed.evidence?.modelReadinessWorkspace ?? path.join(dir, "missing-model-ready")), false);
   assert.equal(await exists(parsed.evidence?.resumeModelReadinessWorkspace ?? path.join(dir, "missing-resume-model-ready")), false);
@@ -8801,6 +8823,20 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(localStatus.commands?.logs ?? "", /agent local logs/);
   assert.match(localStatus.commands?.approvals ?? "", /agent approvals pending/);
   assert.match(localStatus.commands?.workerPoll ?? "", new RegExp(`agent workers poll ${worker.id}`));
+
+  const workerPollJson = await run(process.execPath, [cli, "workers", "poll", worker.id, "--limit", "0", "--idle-limit", "1"], dir);
+  assert.equal(workerPollJson.exitCode, 0, workerPollJson.stderr);
+  const workerPoll = JSON.parse(workerPollJson.stdout) as {
+    stopReason?: string;
+    lifecycle?: { service?: string; phase?: string; stopReason?: string; metrics?: { tickCount?: number; idleCount?: number } };
+    metrics?: { tickCount?: number; idleCount?: number; runsAttempted?: number };
+  };
+  assert.equal(workerPoll.stopReason, "limit_reached");
+  assert.equal(workerPoll.lifecycle?.service, "worker");
+  assert.equal(workerPoll.lifecycle?.phase, "stopped");
+  assert.equal(workerPoll.lifecycle?.stopReason, "limit_reached");
+  assert.equal(workerPoll.metrics?.tickCount, 0);
+  assert.equal(workerPoll.metrics?.runsAttempted, 0);
 
   const localStatusText = await run(process.execPath, [cli, "local", "status", "--limit", "10"], dir);
   assert.equal(localStatusText.exitCode, 0, localStatusText.stderr);

@@ -5110,6 +5110,15 @@ type PhaseTwoEngineeringSmokeResult = {
     pauseStatus?: string;
     resumeStatus?: string;
     cancelStatus?: string;
+    localDaemonRunStopReason?: SchedulerRunResult["stopReason"];
+    localDaemonRunTicks: number;
+    localDaemonRunIdleTicks: number;
+    localDaemonRunLifecyclePhase?: string;
+    localDaemonRunLifecycleStopReason?: string;
+    localDaemonRunMetricTicks: number;
+    localDaemonRunMetricIdle: number;
+    localDaemonRunWorkerPolls: number;
+    localDaemonRunWorkerStopReasons: string[];
     cleanup: boolean;
     initialTestOutputExcerpt?: string;
     recoveredTestOutputExcerpt?: string;
@@ -5135,6 +5144,7 @@ type PhaseTwoEngineeringSmokeResult = {
     agentRepairVerify?: string;
     resumeResult?: string;
     targetModeResult?: string;
+    localDaemonRun?: string;
   };
 };
 
@@ -5505,6 +5515,42 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary:
         `logs=${localAgentLogs.summary.returnedItems}/${localAgentLogs.summary.totalItems}, ` +
         `byKind=${formatRecordCounts(localAgentLogs.summary.byKind)}`,
+    });
+
+    const localDaemonRun = await platform.scheduler.run({
+      actor,
+      workerId: localStatusWorker.id,
+      leaseTtlSeconds: 60,
+      maxRunsPerWorker: 1,
+      maxIdlePolls: 1,
+      idleIntervalMs: 0,
+      intervalMs: 0,
+      maxTicks: 3,
+      stopWhenIdle: true,
+      idleTickLimit: 1,
+    });
+    const localDaemonRunWorkerStopReasons = localDaemonRun.tickResults.flatMap((tick) =>
+      tick.workerResults.map((worker) => worker.stopReason)
+    );
+    checks.push({
+      id: "local-daemon-run-lifecycle-evidence",
+      label: "local daemon run lifecycle evidence",
+      status:
+        localDaemonRun.stopReason === "idle" &&
+        localDaemonRun.ticks >= 1 &&
+        localDaemonRun.idleTicks >= 1 &&
+        localDaemonRun.lifecycle.phase === "stopped" &&
+        localDaemonRun.lifecycle.stopReason === "idle" &&
+        localDaemonRun.metrics.tickCount >= 1 &&
+        localDaemonRun.metrics.idleCount >= 1 &&
+        localDaemonRun.workersPolled >= 1 &&
+        localDaemonRunWorkerStopReasons.includes("idle")
+          ? "pass"
+          : "fail",
+      summary:
+        `stop=${localDaemonRun.stopReason}, ticks=${localDaemonRun.ticks}, idleTicks=${localDaemonRun.idleTicks}, ` +
+        `lifecycle=${localDaemonRun.lifecycle.phase}/${localDaemonRun.lifecycle.stopReason ?? "-"}, ` +
+        `workersPolled=${localDaemonRun.workersPolled}, workerStops=${localDaemonRunWorkerStopReasons.join(",") || "-"}`,
     });
 
     const sessionReview = await buildSessionReview(platform.store, session.id, { limit: 20 });
@@ -5893,6 +5939,15 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         pauseStatus: lifecycle.pauseStatus,
         resumeStatus: lifecycle.resumeStatus,
         cancelStatus: lifecycle.cancelStatus,
+        localDaemonRunStopReason: localDaemonRun.stopReason,
+        localDaemonRunTicks: localDaemonRun.ticks,
+        localDaemonRunIdleTicks: localDaemonRun.idleTicks,
+        localDaemonRunLifecyclePhase: localDaemonRun.lifecycle.phase,
+        localDaemonRunLifecycleStopReason: localDaemonRun.lifecycle.stopReason,
+        localDaemonRunMetricTicks: localDaemonRun.metrics.tickCount,
+        localDaemonRunMetricIdle: localDaemonRun.metrics.idleCount,
+        localDaemonRunWorkerPolls: localDaemonRun.workersPolled,
+        localDaemonRunWorkerStopReasons: localDaemonRunWorkerStopReasons,
         cleanup: Boolean(options.cleanup),
         initialTestOutputExcerpt: toolOutputExcerpt(initialTest.output),
         recoveredTestOutputExcerpt: toolOutputExcerpt(recoveredTest.output),
@@ -5922,6 +5977,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
           : undefined,
         resumeResult: resumeSmoke.sessionId ? `cd ${sampleWorkspace} && agent session result ${resumeSmoke.sessionId}` : undefined,
         targetModeResult: targetModes.sessions[0]?.sessionId ? `cd ${targetModes.workspace} && agent session result ${targetModes.sessions[0].sessionId}` : undefined,
+        localDaemonRun: `cd ${sampleWorkspace} && agent scheduler run --worker ${localStatusWorker.id} --interval-ms 0 --max-ticks 3 --stop-when-idle --idle-ticks 1 --runs-per-worker 1 --idle-limit 1`,
       },
     };
   } finally {
@@ -6059,6 +6115,13 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`).join(",") || "-"}`);
   console.log(`- lifecycleAuditEvents=${result.evidence.lifecycleAuditEvents}`);
   console.log(`- lifecycleStatuses=pause:${result.evidence.pauseStatus ?? "-"},resume:${result.evidence.resumeStatus ?? "-"},cancel:${result.evidence.cancelStatus ?? "-"}`);
+  console.log(
+    `- localDaemonRun=stop:${result.evidence.localDaemonRunStopReason ?? "-"},ticks:${result.evidence.localDaemonRunTicks},` +
+    `idleTicks:${result.evidence.localDaemonRunIdleTicks},lifecycle:${result.evidence.localDaemonRunLifecyclePhase ?? "-"}/` +
+    `${result.evidence.localDaemonRunLifecycleStopReason ?? "-"},metricTicks:${result.evidence.localDaemonRunMetricTicks},` +
+    `metricIdle:${result.evidence.localDaemonRunMetricIdle},workersPolled:${result.evidence.localDaemonRunWorkerPolls},` +
+    `workerStops:${result.evidence.localDaemonRunWorkerStopReasons.join(",") || "-"}`,
+  );
   if (result.commands.inspectSession) {
     console.log("");
     console.log("Inspect:");
@@ -6093,6 +6156,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     }
     if (result.commands.targetModeResult) {
       console.log(`- ${result.commands.targetModeResult}`);
+    }
+    if (result.commands.localDaemonRun) {
+      console.log(`- ${result.commands.localDaemonRun}`);
     }
   }
 }
@@ -13229,6 +13295,8 @@ function printWorkerPoll(result: WorkerPollResult): void {
         assignmentsCompleted: result.assignmentsCompleted,
         idlePolls: result.idlePolls,
         results: result.results,
+        lifecycle: result.lifecycle,
+        metrics: result.metrics,
       },
       null,
       2,
