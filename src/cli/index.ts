@@ -29,6 +29,7 @@ import type {
   WorkerHeartbeatEnvelope,
   WorkerRegistration,
   WorkerStatus,
+  Session,
 } from "../domain/index.js";
 import { ControlPlaneService } from "../control-plane/control-plane-service.js";
 import { DEFAULT_ROOM_AGENT_RESPONSE_MODE, DEFAULT_ROOM_WIDE_MENTION_POLICY } from "../domain/index.js";
@@ -147,6 +148,43 @@ async function main() {
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "local" || command === "agent") {
+    const workspace = await resolveInitialWorkspace(process.cwd(), rest);
+    const args = stripWorkspaceOption(rest);
+    const subcommand = args[0] ?? "status";
+    const parsed = parseLocalAgentArgs(args.slice(1));
+    const { locks, store } = await createLocalPlatform(workspace);
+    try {
+      if (subcommand === "status") {
+        const status = await buildLocalAgentStatus(store, workspace, parsed.options);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(status, null, 2));
+        } else {
+          printLocalAgentStatus(status);
+        }
+        return;
+      }
+      if (subcommand === "logs" || subcommand === "timeline") {
+        const logs = await buildLocalAgentLogs(store, workspace, parsed.options);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(logs, null, 2));
+        } else {
+          printLocalAgentLogs(logs);
+        }
+        return;
+      }
+      console.error(`Unknown local agent command: ${subcommand}`);
+      process.exitCode = 1;
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    } finally {
+      locks.close?.();
+      store.close();
     }
     return;
   }
@@ -4789,6 +4827,11 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionListReturned: number;
     sessionListOutcome?: string;
     sessionListPendingApprovals: number;
+    localAgentState?: string;
+    localAgentSessions: number;
+    localAgentPendingApprovals: number;
+    localAgentLogItems: number;
+    localAgentLogKinds: Record<string, number>;
     sessionReviewState?: string;
     sessionReviewChecklist: Record<string, string>;
     sessionReviewChangedPaths: string[];
@@ -4864,6 +4907,8 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResult?: string;
     sessionVerify?: string;
     sessionBundle?: string;
+    localAgentStatus?: string;
+    localAgentLogs?: string;
     runJson?: string;
     agentRepairResult?: string;
     agentRepairVerify?: string;
@@ -5175,6 +5220,37 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `outcome=${sessionListEntry?.summary.outcome ?? "-"}, pendingApprovals=${sessionListEntry?.summary.pendingApprovals ?? 0}`,
     });
 
+    const localAgentStatus = await buildLocalAgentStatus(platform.store, sampleWorkspace, { limit: 5 });
+    const localAgentStatusSession = localAgentStatus.sessions.find((entry) => entry.session.id === session.id);
+    checks.push({
+      id: "local-agent-status-evidence",
+      label: "local agent status evidence",
+      status:
+        localAgentStatus.summary.state === "needs_attention" &&
+        localAgentStatusSession?.summary.outcome === "succeeded" &&
+        localAgentStatus.summary.pendingApprovals >= requiredPolicyBoundaryActions.length &&
+        localAgentStatus.commands.logs.includes("agent local logs")
+          ? "pass"
+          : "fail",
+      summary:
+        `state=${localAgentStatus.summary.state}, sessions=${localAgentStatus.summary.sessions.returned}, ` +
+        `pendingApprovals=${localAgentStatus.summary.pendingApprovals}, workers=${localAgentStatus.summary.workers.total}`,
+    });
+
+    const localAgentLogs = await buildLocalAgentLogs(platform.store, sampleWorkspace, { limit: 20 });
+    const localAgentLogsPass =
+      localAgentLogs.items.some((item) => item.session?.id === session.id && item.kind === "audit" && item.title === "command.finished") &&
+      localAgentLogs.items.some((item) => item.session?.id === session.id && item.kind === "approval" && item.action === "workspace.write") &&
+      (localAgentLogs.summary.byKind.audit ?? 0) >= 6;
+    checks.push({
+      id: "local-agent-logs-evidence",
+      label: "local agent logs evidence",
+      status: localAgentLogsPass ? "pass" : "fail",
+      summary:
+        `logs=${localAgentLogs.summary.returnedItems}/${localAgentLogs.summary.totalItems}, ` +
+        `byKind=${formatRecordCounts(localAgentLogs.summary.byKind)}`,
+    });
+
     const sessionReview = await buildSessionReview(platform.store, session.id, { limit: 20 });
     const sessionReviewChecklist = Object.fromEntries(sessionReview.checklist.map((item) => [item.id, item.status]));
     const sessionReviewPass =
@@ -5399,6 +5475,11 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionListReturned: sessionList.summary.returned,
         sessionListOutcome: sessionListEntry?.summary.outcome,
         sessionListPendingApprovals: sessionListEntry?.summary.pendingApprovals ?? 0,
+        localAgentState: localAgentStatus.summary.state,
+        localAgentSessions: localAgentStatus.summary.sessions.returned,
+        localAgentPendingApprovals: localAgentStatus.summary.pendingApprovals,
+        localAgentLogItems: localAgentLogs.summary.returnedItems,
+        localAgentLogKinds: localAgentLogs.summary.byKind,
         sessionReviewState: sessionReview.summary.reviewState,
         sessionReviewChecklist,
         sessionReviewChangedPaths: sessionReview.changes.changedPaths,
@@ -5476,6 +5557,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
           `--require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+        localAgentStatus: `cd ${sampleWorkspace} && agent local status --json --limit 5`,
+        localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --verify-session "inspect this workspace"`,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
@@ -5539,6 +5622,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionListReturned=${result.evidence.sessionListReturned}`);
   console.log(`- sessionListOutcome=${result.evidence.sessionListOutcome ?? "-"}`);
   console.log(`- sessionListPendingApprovals=${result.evidence.sessionListPendingApprovals}`);
+  console.log(`- localAgentState=${result.evidence.localAgentState ?? "-"}`);
+  console.log(`- localAgentSessions=${result.evidence.localAgentSessions}`);
+  console.log(`- localAgentPendingApprovals=${result.evidence.localAgentPendingApprovals}`);
+  console.log(`- localAgentLogItems=${result.evidence.localAgentLogItems}`);
+  console.log(`- localAgentLogKinds=${formatRecordCounts(result.evidence.localAgentLogKinds)}`);
   console.log(`- sessionReviewState=${result.evidence.sessionReviewState ?? "-"}`);
   console.log(`- sessionReviewChecklist=${Object.entries(result.evidence.sessionReviewChecklist).map(([key, value]) => `${key}:${value}`).join(",") || "-"}`);
   console.log(`- sessionReviewChangedPaths=${result.evidence.sessionReviewChangedPaths.join(",") || "-"}`);
@@ -5596,6 +5684,8 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.sessionResult}`);
     console.log(`- ${result.commands.sessionVerify}`);
     console.log(`- ${result.commands.sessionBundle}`);
+    console.log(`- ${result.commands.localAgentStatus}`);
+    console.log(`- ${result.commands.localAgentLogs}`);
     console.log(`- ${result.commands.runJson}`);
     if (result.commands.agentRepairResult) {
       console.log(`- ${result.commands.agentRepairResult}`);
@@ -6257,6 +6347,22 @@ type SessionListOptions = {
   json?: boolean;
 };
 
+type LocalAgentCliOptions = {
+  limit?: number;
+  json?: boolean;
+};
+
+type LocalAgentState = "idle" | "active" | "needs_attention";
+
+type LocalAgentLogItem = SessionTimelineItem & {
+  session?: {
+    id: string;
+    status: Session["status"];
+    targetMode: Session["targetMode"];
+    objective: string;
+  };
+};
+
 async function buildSessionList(store: AgentStore, options: SessionListOptions = {}) {
   const limit = options.limit ?? 20;
   const scanLimit = options.status || options.targetMode ? Math.max(limit * 5, 50) : limit;
@@ -6330,6 +6436,265 @@ function countSessionListBy<T>(entries: T[], keyFn: (entry: T) => string | undef
     counts[key] = (counts[key] ?? 0) + 1;
   }
   return counts;
+}
+
+async function buildLocalAgentStatus(store: AgentStore, workspace: string, options: LocalAgentCliOptions = {}) {
+  const limit = options.limit ?? 10;
+  const scanLimit = Math.max(limit, 20);
+  const sessions = await buildSessionList(store, { limit });
+  const pendingApprovals = (await store.listApprovalRequests("pending")).slice(0, limit);
+  const workers = await store.listWorkerRegistrations({ limit: scanLimit });
+  const assignments = await store.listTaskAssignments({ limit: Math.max(limit, 50) });
+  const workerStatusCounts = countSessionListBy(workers, (worker) => worker.status);
+  const assignmentStatusCounts = countSessionListBy(assignments, (assignment) => assignment.status);
+  const activeAssignments = assignments.filter((assignment) => assignment.status === "leased" || assignment.status === "running");
+  const failedAssignments = assignments.filter((assignment) => assignment.status === "failed" || assignment.status === "expired");
+  const pendingSessions =
+    (sessions.summary.byStatus.created ?? 0) +
+    (sessions.summary.byStatus.running ?? 0);
+  const pausedSessions = sessions.summary.byStatus.paused ?? 0;
+  const failedSessions = (sessions.summary.byStatus.failed ?? 0) + (sessions.summary.byOutcome.failed ?? 0);
+  const state = localAgentState({
+    pendingApprovals: pendingApprovals.length,
+    pausedSessions,
+    failedSessions,
+    activeSessions: pendingSessions,
+    activeAssignments: activeAssignments.length,
+    failedAssignments: failedAssignments.length,
+  });
+  const firstOnlineWorker = workers.find((worker) => worker.status === "online");
+  const latestSessionId = sessions.sessions[0]?.session.id;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace,
+    summary: {
+      state,
+      sessions: sessions.summary,
+      pendingApprovals: pendingApprovals.length,
+      workers: {
+        total: workers.length,
+        byStatus: workerStatusCounts,
+        online: workerStatusCounts.online ?? 0,
+        draining: workerStatusCounts.draining ?? 0,
+        currentLoad: workers.reduce((total, worker) => total + worker.currentLoad, 0),
+        capacity: workers.reduce((total, worker) => total + worker.maxConcurrentTasks, 0),
+      },
+      assignments: {
+        total: assignments.length,
+        byStatus: assignmentStatusCounts,
+        active: activeAssignments.length,
+        failed: failedAssignments.length,
+      },
+    },
+    sessions: sessions.sessions,
+    workers: workers.slice(0, limit).map((worker) => ({
+      id: worker.id,
+      displayName: worker.displayName,
+      status: worker.status,
+      currentLoad: worker.currentLoad,
+      maxConcurrentTasks: worker.maxConcurrentTasks,
+      capabilities: worker.capabilities,
+      allowedProjects: worker.allowedProjects,
+      lastHeartbeatAt: worker.lastHeartbeatAt,
+      expiresAt: worker.expiresAt,
+    })),
+    assignments: assignments.slice(0, limit).map((assignment) => ({
+      id: assignment.id,
+      kind: assignment.kind,
+      status: assignment.status,
+      workerId: assignment.workerId,
+      sessionId: assignment.sessionId,
+      subtaskId: assignment.subtaskId,
+      attempts: assignment.attempts,
+      priority: assignment.priority,
+      leaseExpiresAt: assignment.leaseExpiresAt,
+      updatedAt: assignment.updatedAt,
+      resultSummary: assignment.resultSummary,
+    })),
+    pendingApprovals: pendingApprovals.map((approval) => ({
+      id: approval.id,
+      action: approval.action,
+      toolName: approval.toolName,
+      sessionId: approval.sessionId,
+      reason: approval.reason,
+      createdAt: approval.createdAt,
+    })),
+    commands: {
+      status: "agent local status --json",
+      logs: "agent local logs --limit 20",
+      sessions: `agent sessions --limit ${limit}`,
+      schedulerRun: "agent scheduler run --interval-ms 1000 --max-ticks 10 --stop-when-idle",
+      workerPoll: firstOnlineWorker ? `agent workers poll ${firstOnlineWorker.id} --limit 5 --idle-limit 1` : undefined,
+      latestSession: latestSessionId ? `agent session status ${latestSessionId}` : undefined,
+    },
+  };
+}
+
+async function buildLocalAgentLogs(store: AgentStore, workspace: string, options: LocalAgentCliOptions = {}) {
+  const limit = options.limit ?? 20;
+  const scanLimit = Math.max(limit * 5, 50);
+  const sessions = await store.listSessions(scanLimit);
+  const sessionMap = new Map(sessions.map((session) => [session.id, session]));
+  const auditEvents = await store.listAuditEvents({ limit: scanLimit });
+  const fileChanges = (await store.listFileChanges()).slice(-scanLimit);
+  const approvals = (await store.listApprovalRequests()).slice(-scanLimit);
+
+  const unnumbered: Array<Omit<LocalAgentLogItem, "ordinal">> = [];
+  for (const event of auditEvents) {
+    unnumbered.push(withLocalLogSession(timelineItemFromAudit(event), sessionMap, event.sessionId));
+  }
+  for (const change of fileChanges) {
+    unnumbered.push(withLocalLogSession(timelineItemFromFileChange(change), sessionMap, change.sessionId));
+  }
+  for (const approval of approvals) {
+    unnumbered.push(withLocalLogSession(timelineItemFromApproval(approval), sessionMap, approval.sessionId));
+    if (approval.decidedAt) {
+      unnumbered.push(withLocalLogSession(timelineItemFromApprovalDecision(approval), sessionMap, approval.sessionId));
+    }
+  }
+
+  const allItems = unnumbered
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || timelineKindOrder(left.kind) - timelineKindOrder(right.kind) || left.sourceId.localeCompare(right.sourceId))
+    .map((item, index) => ({ ordinal: index + 1, ...item }));
+  const items = allItems.slice(Math.max(0, allItems.length - limit));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    workspace,
+    summary: {
+      totalItems: allItems.length,
+      returnedItems: items.length,
+      sessionsScanned: sessions.length,
+      byKind: countTimelineKinds(allItems),
+      earliestAt: allItems.at(0)?.createdAt,
+      latestAt: allItems.at(-1)?.createdAt,
+    },
+    items,
+    commands: {
+      status: "agent local status",
+      sessions: "agent sessions --limit 10",
+    },
+  };
+}
+
+function localAgentState(input: {
+  pendingApprovals: number;
+  pausedSessions: number;
+  failedSessions: number;
+  activeSessions: number;
+  activeAssignments: number;
+  failedAssignments: number;
+}): LocalAgentState {
+  if (input.pendingApprovals > 0 || input.pausedSessions > 0 || input.failedSessions > 0 || input.failedAssignments > 0) {
+    return "needs_attention";
+  }
+  if (input.activeSessions > 0 || input.activeAssignments > 0) {
+    return "active";
+  }
+  return "idle";
+}
+
+function withLocalLogSession(
+  item: Omit<SessionTimelineItem, "ordinal">,
+  sessions: Map<string, Session>,
+  sessionId?: string,
+): Omit<LocalAgentLogItem, "ordinal"> {
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  return {
+    ...item,
+    session: session
+      ? {
+          id: session.id,
+          status: session.status,
+          targetMode: session.targetMode,
+          objective: session.objective,
+        }
+      : undefined,
+  };
+}
+
+function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgentStatus>>): void {
+  console.log("Local agent status:");
+  console.log(`workspace=${status.workspace}`);
+  console.log(
+    `state=${status.summary.state}\tsessions=${status.summary.sessions.returned}/${status.summary.sessions.scanned}\t` +
+    `pendingApprovals=${status.summary.pendingApprovals}\tworkers=${status.summary.workers.total}\tassignments=${status.summary.assignments.total}`,
+  );
+  console.log(
+    `workers=${formatRecordCounts(status.summary.workers.byStatus)}\t` +
+    `load=${status.summary.workers.currentLoad}/${status.summary.workers.capacity}\t` +
+    `assignments=${formatRecordCounts(status.summary.assignments.byStatus)}`,
+  );
+  if (status.sessions.length > 0) {
+    console.log("");
+    console.log("Sessions:");
+    for (const entry of status.sessions.slice(0, 5)) {
+      console.log(
+        `- ${entry.session.id}\t${entry.session.targetMode}\t${entry.session.status}\t` +
+        `outcome=${entry.summary.outcome}\tpending=${entry.summary.pendingApprovals}\t${singleLine(entry.session.objective)}`,
+      );
+    }
+  }
+  if (status.workers.length > 0) {
+    console.log("");
+    console.log("Workers:");
+    for (const worker of status.workers) {
+      console.log(`- ${worker.id}\t${worker.status}\tload=${worker.currentLoad}/${worker.maxConcurrentTasks}\t${worker.displayName}`);
+    }
+  }
+  if (status.assignments.length > 0) {
+    console.log("");
+    console.log("Assignments:");
+    for (const assignment of status.assignments) {
+      console.log(`- ${assignment.id}\t${assignment.status}\tworker=${assignment.workerId}\tsession=${assignment.sessionId ?? "-"}\tattempts=${assignment.attempts}`);
+    }
+  }
+  if (status.pendingApprovals.length > 0) {
+    console.log("");
+    console.log("Pending approvals:");
+    for (const approval of status.pendingApprovals) {
+      console.log(`- ${approval.id}\t${approval.action}\t${approval.toolName ?? "-"}\tsession=${approval.sessionId ?? "-"}\t${approval.reason}`);
+    }
+  }
+  console.log("");
+  console.log("Next:");
+  console.log(`- ${status.commands.logs}`);
+  console.log(`- ${status.commands.sessions}`);
+  console.log(`- ${status.commands.schedulerRun}`);
+  if (status.commands.workerPoll) {
+    console.log(`- ${status.commands.workerPoll}`);
+  }
+  if (status.commands.latestSession) {
+    console.log(`- ${status.commands.latestSession}`);
+  }
+}
+
+function printLocalAgentLogs(logs: Awaited<ReturnType<typeof buildLocalAgentLogs>>): void {
+  console.log("Local agent logs:");
+  console.log(`workspace=${logs.workspace}`);
+  console.log(
+    `returned=${logs.summary.returnedItems}/${logs.summary.totalItems}\t` +
+    `sessionsScanned=${logs.summary.sessionsScanned}\tbyKind=${formatRecordCounts(logs.summary.byKind)}`,
+  );
+  if (logs.items.length === 0) {
+    console.log("No local agent log items found.");
+    return;
+  }
+  for (const item of logs.items) {
+    const session = item.session ? `${item.session.id}:${item.session.status}` : "-";
+    const details = [
+      item.action ? `action=${item.action}` : undefined,
+      item.toolName ? `tool=${item.toolName}` : undefined,
+      item.command ? `command=${item.command}` : undefined,
+      item.path ? `path=${item.path}` : undefined,
+      item.executionProfile ? `profile=${item.executionProfile}` : undefined,
+    ].filter(Boolean).join("\t");
+    console.log(
+      `${item.ordinal}\t${item.createdAt}\t${item.kind}\t${session}\t${item.title}\t${singleLine(item.summary)}` +
+      (details ? `\t${details}` : ""),
+    );
+  }
 }
 
 async function buildSessionEvidenceBundle(
@@ -8926,6 +9291,8 @@ Usage:
   soloclaw model setup [--workspace path] custom --base-url url --model model --api-key-env ENV
   soloclaw config path [--workspace path]
   soloclaw config show [--workspace path] [--json]
+  soloclaw agent status [--workspace path] [--json] [--limit n]
+  soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
   soloclaw run [same options as agent run] "your task"
   agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
@@ -8935,6 +9302,8 @@ Usage:
   agent inspect [--workspace path] [--json] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n]
   agent phase1 verify [--json]
   agent phase2 verify [--workspace path] [--json] [--cleanup]
+  agent local status [--workspace path] [--json] [--limit n]
+  agent local logs [--workspace path] [--json] [--limit n]
   agent sessions [--json] [--limit n] [--status created|running|paused|cancelled|failed|completed] [--target-mode plan|build|goal]
   agent show-session <session-id>
   agent session diff <session-id> [--json]
@@ -9086,6 +9455,8 @@ Usage:
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
   agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent local status [--workspace path] [--json] [--limit n]
+  agent local logs [--workspace path] [--json] [--limit n]
   agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id]
   agent artifacts list [--project id] [--session id] [--status active|deleted]
   agent artifacts delete <artifact-id> [--delete-file] [--force]
@@ -9121,6 +9492,10 @@ Examples:
   agent run --target-mode goal --model-call-budget 20 --model-circuit-break-after 3 "finish this bounded task"
   agent models usage --provider openai --json
   agent models profiles set openai_compatible --base-url http://localhost:8000/v1 --model llama-local --api-key-env LOCAL_LLM_API_KEY
+  soloclaw agent status --json
+  soloclaw agent logs --limit 20
+  agent local status --json
+  agent local logs --limit 20
   agent sessions --json --limit 5
   agent session diff sess_xxxxxxxx
   agent session report sess_xxxxxxxx --json
@@ -10877,6 +11252,26 @@ function parseSessionListArgs(args: string[]): { options: SessionListOptions; po
     }
     if ((arg === "--target-mode" || arg === "--mode") && next) {
       options.targetMode = parseSessionTargetMode(next);
+      index += 1;
+      continue;
+    }
+    positionals.push(arg);
+  }
+  return { options, positionals };
+}
+
+function parseLocalAgentArgs(args: string[]): { options: LocalAgentCliOptions; positionals: string[] } {
+  const options: LocalAgentCliOptions = {};
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const next = args[index + 1];
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    if (arg === "--limit" && next) {
+      options.limit = parsePositiveInteger(next, "--limit");
       index += 1;
       continue;
     }

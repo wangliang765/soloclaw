@@ -7475,6 +7475,11 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionListReturned?: number;
       sessionListOutcome?: string;
       sessionListPendingApprovals?: number;
+      localAgentState?: string;
+      localAgentSessions?: number;
+      localAgentPendingApprovals?: number;
+      localAgentLogItems?: number;
+      localAgentLogKinds?: Record<string, number>;
       sessionReviewState?: string;
       sessionReviewChecklist?: Record<string, string>;
       sessionReviewChangedPaths?: string[];
@@ -7536,7 +7541,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       cancelStatus?: string;
       cleanup?: boolean;
     };
-    commands?: { sessionVerify?: string; sessionBundle?: string; sessionStatus?: string; sessionTimeline?: string; sessionReview?: string };
+    commands?: {
+      sessionVerify?: string;
+      sessionBundle?: string;
+      sessionStatus?: string;
+      sessionTimeline?: string;
+      sessionReview?: string;
+      localAgentStatus?: string;
+      localAgentLogs?: string;
+    };
   };
 
   assert.equal(parsed.status, "pass", result.stdout);
@@ -7596,6 +7609,12 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionListReturned ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionListOutcome, "succeeded");
   assert.equal((parsed.evidence?.sessionListPendingApprovals ?? 0) >= 4, true);
+  assert.equal(parsed.evidence?.localAgentState, "needs_attention");
+  assert.equal((parsed.evidence?.localAgentSessions ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.localAgentPendingApprovals ?? 0) >= 4, true);
+  assert.equal((parsed.evidence?.localAgentLogItems ?? 0) >= 10, true);
+  assert.equal((parsed.evidence?.localAgentLogKinds?.audit ?? 0) >= 6, true);
+  assert.equal((parsed.evidence?.localAgentLogKinds?.approval ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionReviewState, "waiting_for_approval");
   assert.equal(parsed.evidence?.sessionReviewChecklist?.["change-summary"], "pass");
   assert.equal(parsed.evidence?.sessionReviewChecklist?.["patch-review"], "pass");
@@ -7681,6 +7700,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-timeline-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-status-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-list-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "local-agent-status-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "local-agent-logs-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
@@ -7695,6 +7716,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionStatus?.includes("agent session status"), true);
   assert.equal(parsed.commands?.sessionTimeline?.includes("agent session timeline"), true);
   assert.equal(parsed.commands?.sessionReview?.includes("agent session review"), true);
+  assert.equal(parsed.commands?.localAgentStatus?.includes("agent local status"), true);
+  assert.equal(parsed.commands?.localAgentLogs?.includes("agent local logs"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
@@ -7898,6 +7921,28 @@ test("agent session report summarizes engineering execution evidence", async (t)
     summary: "apply_patch completed",
     metadata: { tool: "apply_patch", action: "workspace.write", input: { patch: addedDeletedPatch }, ok: true },
     createdAt: "2026-06-13T00:00:06.500Z",
+  });
+  const worker = await platform.workers.register({
+    actor,
+    agentId: "agent-local-status",
+    machineId: "machine-local-status",
+    displayName: "Local Status Worker",
+    capabilities: ["workspace.exec"],
+    maxConcurrentTasks: 2,
+    ttlSeconds: 60,
+  });
+  const queuedSession = await platform.store.createSession({
+    objective: "Queued session visible in local agent status.",
+    targetMode: "build",
+    status: "created",
+    risk: "medium",
+    createdBy: actor,
+  });
+  const assignment = await platform.assignments.assign({
+    actor,
+    workerId: worker.id,
+    sessionId: queuedSession.id,
+    leaseTtlSeconds: 60,
   });
   platform.locks.close?.();
   platform.store.close();
@@ -8172,6 +8217,76 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(statusText.exitCode, 0, statusText.stderr);
   assert.match(statusText.stdout, /Session status:/);
   assert.match(statusText.stdout, /Latest timeline:/);
+
+  const localStatusJson = await run(process.execPath, [cli, "local", "status", "--json", "--limit", "10"], dir);
+  assert.equal(localStatusJson.exitCode, 0, localStatusJson.stderr);
+  const localStatus = JSON.parse(localStatusJson.stdout) as {
+    workspace?: string;
+    summary?: {
+      state?: string;
+      pendingApprovals?: number;
+      sessions?: { returned?: number };
+      workers?: { total?: number; online?: number; currentLoad?: number; capacity?: number };
+      assignments?: { total?: number; active?: number };
+    };
+    sessions?: Array<{ session?: { id?: string; status?: string } }>;
+    workers?: Array<{ id?: string; status?: string; currentLoad?: number; maxConcurrentTasks?: number }>;
+    assignments?: Array<{ id?: string; status?: string; workerId?: string; sessionId?: string }>;
+    pendingApprovals?: Array<{ id?: string; action?: string; sessionId?: string }>;
+    commands?: { logs?: string; workerPoll?: string; latestSession?: string };
+  };
+  assert.equal(localStatus.workspace, dir);
+  assert.equal(localStatus.summary?.state, "needs_attention");
+  assert.equal(localStatus.summary?.pendingApprovals, 1);
+  assert.equal((localStatus.summary?.sessions?.returned ?? 0) >= 3, true);
+  assert.equal(localStatus.summary?.workers?.total, 1);
+  assert.equal(localStatus.summary?.workers?.online, 1);
+  assert.equal(localStatus.summary?.workers?.currentLoad, 1);
+  assert.equal(localStatus.summary?.workers?.capacity, 2);
+  assert.equal(localStatus.summary?.assignments?.active, 1);
+  assert.equal(localStatus.sessions?.some((entry) => entry.session?.id === session.id), true);
+  assert.equal(localStatus.sessions?.some((entry) => entry.session?.id === queuedSession.id && entry.session?.status === "running"), true);
+  assert.equal(localStatus.workers?.some((entry) => entry.id === worker.id && entry.status === "online"), true);
+  assert.equal(localStatus.assignments?.some((entry) => entry.id === assignment.id && entry.workerId === worker.id && entry.sessionId === queuedSession.id), true);
+  assert.equal(localStatus.pendingApprovals?.[0]?.action, "workspace.write");
+  assert.match(localStatus.commands?.logs ?? "", /agent local logs/);
+  assert.match(localStatus.commands?.workerPoll ?? "", new RegExp(`agent workers poll ${worker.id}`));
+
+  const localStatusText = await run(process.execPath, [cli, "local", "status", "--limit", "10"], dir);
+  assert.equal(localStatusText.exitCode, 0, localStatusText.stderr);
+  assert.match(localStatusText.stdout, /Local agent status:/);
+  assert.match(localStatusText.stdout, /state=needs_attention/);
+  assert.match(localStatusText.stdout, /Workers:/);
+  assert.match(localStatusText.stdout, /Assignments:/);
+  assert.match(localStatusText.stdout, /Pending approvals:/);
+
+  const soloclawAgentStatus = await run(process.execPath, [cli, "agent", "status", "--json", "--limit", "10"], dir);
+  assert.equal(soloclawAgentStatus.exitCode, 0, soloclawAgentStatus.stderr);
+  assert.equal((JSON.parse(soloclawAgentStatus.stdout) as { summary?: { state?: string } }).summary?.state, "needs_attention");
+
+  const localLogsJson = await run(process.execPath, [cli, "local", "logs", "--json", "--limit", "30"], dir);
+  assert.equal(localLogsJson.exitCode, 0, localLogsJson.stderr);
+  const localLogs = JSON.parse(localLogsJson.stdout) as {
+    summary?: { returnedItems?: number; byKind?: Record<string, number> };
+    items?: Array<{ kind?: string; title?: string; action?: string; session?: { id?: string; status?: string } }>;
+    commands?: { status?: string };
+  };
+  assert.equal((localLogs.summary?.returnedItems ?? 0) >= 10, true);
+  assert.equal((localLogs.summary?.byKind?.audit ?? 0) >= 8, true);
+  assert.equal(localLogs.items?.some((item) => item.session?.id === session.id && item.kind === "approval" && item.action === "workspace.write"), true);
+  assert.equal(localLogs.items?.some((item) => item.session?.id === queuedSession.id && item.title === "task.assigned"), true);
+  assert.equal(localLogs.items?.some((item) => item.title === "worker.registered"), true);
+  assert.match(localLogs.commands?.status ?? "", /agent local status/);
+
+  const localLogsText = await run(process.execPath, [cli, "local", "logs", "--limit", "30"], dir);
+  assert.equal(localLogsText.exitCode, 0, localLogsText.stderr);
+  assert.match(localLogsText.stdout, /Local agent logs:/);
+  assert.match(localLogsText.stdout, /worker\.registered/);
+  assert.match(localLogsText.stdout, /approval requested workspace\.write/);
+
+  const soloclawAgentLogs = await run(process.execPath, [cli, "agent", "logs", "--json", "--limit", "30"], dir);
+  assert.equal(soloclawAgentLogs.exitCode, 0, soloclawAgentLogs.stderr);
+  assert.equal(((JSON.parse(soloclawAgentLogs.stdout) as { items?: unknown[] }).items?.length ?? 0) >= 10, true);
 
   const reviewJson = await run(process.execPath, [cli, "session", "review", session.id, "--json", "--limit", "5"], dir);
   assert.equal(reviewJson.exitCode, 0, reviewJson.stderr);
