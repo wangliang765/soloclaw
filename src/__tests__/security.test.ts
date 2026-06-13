@@ -9163,6 +9163,26 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(failedReviewProfileVerification.status, "fail");
   assert.equal(failedReviewProfileVerification.checks?.some((check) => check.id === "review-profile-evidence" && check.status === "fail" && /none:files=0/.test(check.summary ?? "")), true);
 
+  const noPendingPass = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-no-pending-approvals", "--json"], dir);
+  assert.equal(noPendingPass.exitCode, 0, noPendingPass.stderr);
+  const parsedNoPendingPass = JSON.parse(noPendingPass.stdout) as {
+    status?: string;
+    options?: { requireNoPendingApprovals?: boolean };
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+  assert.equal(parsedNoPendingPass.status, "pass");
+  assert.equal(parsedNoPendingPass.options?.requireNoPendingApprovals, true);
+  assert.equal(parsedNoPendingPass.checks?.some((check) => check.id === "no-pending-approvals" && check.status === "pass" && /0 pending/.test(check.summary ?? "")), true);
+
+  const noPendingFailure = await run(process.execPath, [cli, "session", "verify", session.id, "--require-no-pending-approvals", "--json"], dir);
+  assert.equal(noPendingFailure.exitCode, 1);
+  const parsedNoPendingFailure = JSON.parse(noPendingFailure.stdout) as {
+    status?: string;
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+  assert.equal(parsedNoPendingFailure.status, "fail");
+  assert.equal(parsedNoPendingFailure.checks?.some((check) => check.id === "no-pending-approvals" && check.status === "fail" && /1 pending/.test(check.summary ?? "")), true);
+
   const modelCallFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-model-call", "--allow-no-command", "--json"], dir);
   assert.equal(modelCallFailure.exitCode, 1);
   const failedModelCallVerification = JSON.parse(modelCallFailure.stdout) as {
