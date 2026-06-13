@@ -7736,6 +7736,12 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionResultInspectionIssues?: number;
       sessionResultInspectionIssueSeverities?: Record<string, number>;
       sessionResultInspectionFocusPaths?: string[];
+      sessionInspectState?: string;
+      sessionInspectIssues?: number;
+      sessionInspectIssueSeverities?: Record<string, number>;
+      sessionInspectFocusPaths?: string[];
+      sessionInspectNextActions?: number;
+      sessionInspectReviewCommand?: string;
       sessionTimelineItems?: number;
       sessionTimelineReturnedItems?: number;
       sessionTimelineKinds?: Record<string, number>;
@@ -7870,6 +7876,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionVerify?: string;
       sessionBundle?: string;
       sessionStatus?: string;
+      sessionInspect?: string;
       sessionTimeline?: string;
       sessionReview?: string;
       localAgentStatus?: string;
@@ -7944,6 +7951,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionResultInspectionIssueSeverities?.required ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionResultInspectionIssueSeverities?.warning ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionResultInspectionFocusPaths?.includes("src/math.js"), true);
+  assert.equal(parsed.evidence?.sessionInspectState, parsed.evidence?.sessionResultInspectionState);
+  assert.equal(parsed.evidence?.sessionInspectIssues, parsed.evidence?.sessionResultInspectionIssues);
+  assert.equal((parsed.evidence?.sessionInspectIssueSeverities?.required ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.sessionInspectIssueSeverities?.warning ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionInspectFocusPaths?.includes("src/math.js"), true);
+  assert.equal(parsed.evidence?.sessionInspectNextActions, parsed.evidence?.sessionResultNextActions);
+  assert.match(parsed.evidence?.sessionInspectReviewCommand ?? "", /agent session result sess_/);
   assert.equal((parsed.evidence?.sessionResultNextActions ?? 0) >= 4, true);
   assert.equal((parsed.evidence?.sessionResultNextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionTimelineItems ?? 0) >= 10, true);
@@ -8101,6 +8115,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-report-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-result-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-inspection-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-inspect-command-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-profile-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-timeline-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-status-evidence"), true);
@@ -8125,6 +8140,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-execution-profile"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-approval-actions"), true);
   assert.equal(parsed.commands?.sessionStatus?.includes("agent session status"), true);
+  assert.equal(parsed.commands?.sessionInspect?.includes("agent session inspect"), true);
   assert.equal(parsed.commands?.sessionTimeline?.includes("agent session timeline"), true);
   assert.equal(parsed.commands?.sessionReview?.includes("agent session review"), true);
   assert.equal(parsed.commands?.localAgentStatus?.includes("agent local status"), true);
@@ -8671,7 +8687,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       entries?: Array<{ provider?: string; model?: string; calls?: number; totalTokens?: number }>;
       totals?: { calls?: number; totalTokens?: number };
     };
-    reviewCommands?: { diff?: string; report?: string; audit?: string };
+    reviewCommands?: { diff?: string; inspect?: string; report?: string; audit?: string };
   };
   assert.equal(sessionResult.session?.id, session.id);
   assert.equal(sessionResult.summary?.outcome, "succeeded");
@@ -8731,6 +8747,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionResult.commands?.some((command) => command.status === "pass" && command.exitCode === 0), true);
   assert.equal(sessionResult.commands?.every((command) => command.executionProfile === "local-safe"), true);
   assert.match(sessionResult.reviewCommands?.diff ?? "", new RegExp(`agent session diff ${session.id}`));
+  assert.match(sessionResult.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${session.id}`));
 
   const resultText = await run(process.execPath, [cli, "session", "result", session.id], dir);
   assert.equal(resultText.exitCode, 0, resultText.stderr);
@@ -8750,6 +8767,80 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(resultText.stdout, /Approvals:/);
   assert.match(resultText.stdout, /Next actions:/);
   assert.match(resultText.stdout, /Resolve pending approvals/);
+
+  const inspectJson = await run(process.execPath, [cli, "session", "inspect", session.id, "--json"], dir);
+  assert.equal(inspectJson.exitCode, 0, inspectJson.stderr);
+  const sessionInspect = JSON.parse(inspectJson.stdout) as {
+    session?: { id?: string };
+    summary?: {
+      outcome?: string;
+      inspectionState?: string;
+      inspectionSummary?: string;
+      inspectionIssues?: number;
+      inspectionIssueSeverities?: Record<string, number>;
+      inspectionFocusPaths?: string[];
+      pendingApprovals?: number;
+      failedCommands?: number;
+      timedOutCommands?: number;
+      failedToolResults?: number;
+      modelFailedCalls?: number;
+      reviewProfile?: DiffReviewProfileShape;
+      nextActions?: number;
+      nextActionStatuses?: Record<string, number>;
+    };
+    inspection?: {
+      state?: string;
+      summary?: string;
+      issues?: Array<{ id?: string; severity?: string; command?: string }>;
+      focusPaths?: string[];
+      signals?: {
+        pendingApprovals?: number;
+        failedCommands?: number;
+        timedOutCommands?: number;
+        failedToolResults?: number;
+        modelFailedCalls?: number;
+        reviewSize?: string;
+      };
+    };
+    nextActions?: Array<{ id?: string; status?: string; command?: string }>;
+    reviewCommands?: { result?: string; review?: string; diff?: string; verify?: string; bundle?: string };
+  };
+  assert.equal(sessionInspect.session?.id, session.id);
+  assert.equal(sessionInspect.summary?.outcome, "succeeded");
+  assert.equal(sessionInspect.summary?.inspectionState, "blocked");
+  assert.match(sessionInspect.summary?.inspectionSummary ?? "", /required/);
+  assert.equal((sessionInspect.summary?.inspectionIssues ?? 0) >= 2, true);
+  assert.equal((sessionInspect.summary?.inspectionIssueSeverities?.required ?? 0) >= 1, true);
+  assert.equal(sessionInspect.summary?.inspectionFocusPaths?.includes("src/math.js"), true);
+  assert.equal(sessionInspect.summary?.pendingApprovals, 1);
+  assert.equal(sessionInspect.summary?.failedCommands, 1);
+  assert.equal(sessionInspect.summary?.timedOutCommands, 0);
+  assert.equal(sessionInspect.summary?.failedToolResults, 0);
+  assert.equal(sessionInspect.summary?.modelFailedCalls, 0);
+  assert.equal(sessionInspect.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal((sessionInspect.summary?.nextActions ?? 0) >= 4, true);
+  assert.equal((sessionInspect.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(sessionInspect.inspection?.state, "blocked");
+  assert.equal(sessionInspect.inspection?.summary, sessionInspect.summary?.inspectionSummary);
+  assert.equal(sessionInspect.inspection?.issues?.some((issue) => issue.id === "pending-approvals" && issue.severity === "required"), true);
+  assert.equal(sessionInspect.inspection?.issues?.some((issue) => issue.id === "diff-review" && issue.severity === "info"), true);
+  assert.equal(sessionInspect.inspection?.focusPaths?.includes("src/math.js"), true);
+  assert.equal(sessionInspect.inspection?.signals?.pendingApprovals, 1);
+  assert.equal(sessionInspect.inspection?.signals?.failedCommands, 1);
+  assert.equal(sessionInspect.inspection?.signals?.reviewSize, "small");
+  assert.equal(sessionInspect.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required"), true);
+  assert.match(sessionInspect.reviewCommands?.result ?? "", new RegExp(`agent session result ${session.id}`));
+  assert.match(sessionInspect.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${session.id}`));
+
+  const inspectText = await run(process.execPath, [cli, "session", "inspect", session.id], dir);
+  assert.equal(inspectText.exitCode, 0, inspectText.stderr);
+  assert.match(inspectText.stdout, /Session inspect:/);
+  assert.match(inspectText.stdout, /state=blocked/);
+  assert.match(inspectText.stdout, /Issues:/);
+  assert.match(inspectText.stdout, /Pending approvals remain/);
+  assert.match(inspectText.stdout, /focusPaths=src\/math\.js/);
+  assert.match(inspectText.stdout, /Next actions:/);
+  assert.match(inspectText.stdout, /agent session bundle/);
 
   const statusJson = await run(process.execPath, [cli, "session", "status", session.id, "--json", "--limit", "5"], dir);
   assert.equal(statusJson.exitCode, 0, statusJson.stderr);
@@ -8776,7 +8867,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     };
     latestTimeline?: Array<{ kind?: string; title?: string }>;
     nextActions?: Array<{ id?: string; status?: string; command?: string }>;
-    reviewCommands?: { timeline?: string; result?: string; report?: string };
+    reviewCommands?: { timeline?: string; review?: string; inspect?: string; result?: string; report?: string };
   };
   assert.equal(status.session?.id, session.id);
   assert.equal(status.summary?.outcome, "succeeded");
@@ -8800,6 +8891,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.nextActions?.some((action) => action.id === "resolve-pending-approvals"), true);
   assert.equal(status.latestTimeline?.length, 5);
   assert.match(status.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${session.id}`));
+  assert.match(status.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${session.id}`));
 
   const statusText = await run(process.execPath, [cli, "session", "status", session.id, "--limit", "5"], dir);
   assert.equal(statusText.exitCode, 0, statusText.stderr);
@@ -8976,7 +9068,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     };
     nextActions?: Array<{ id?: string; status?: string; command?: string }>;
     latestTimeline?: Array<{ kind?: string; title?: string }>;
-    reviewCommands?: { diff?: string; status?: string; timeline?: string; result?: string; verify?: string };
+    reviewCommands?: { diff?: string; status?: string; inspect?: string; timeline?: string; result?: string; verify?: string };
   };
   const reviewChecklist = Object.fromEntries((review.checklist ?? []).map((item) => [item.id, item.status]));
   assert.equal(review.session?.id, session.id);
@@ -9036,6 +9128,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   ), true);
   assert.equal(review.latestTimeline?.length, 5);
   assert.match(review.reviewCommands?.diff ?? "", new RegExp(`agent session diff ${session.id}`));
+  assert.match(review.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${session.id}`));
   assert.match(review.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${session.id}`));
   assert.match(review.reviewCommands?.result ?? "", new RegExp(`agent session result ${session.id}`));
 
@@ -9172,7 +9265,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
       verification?: { status?: string; options?: { requireReviewProfile?: boolean; requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> };
     };
     output?: { path?: string; bytes?: number };
-    reviewCommands?: { bundle?: string; verify?: string; localStatus?: string; localLogs?: string };
+    reviewCommands?: { bundle?: string; inspect?: string; verify?: string; localStatus?: string; localLogs?: string };
   };
   assert.equal(bundle.session?.id, session.id);
   assert.equal(bundle.summary?.outcome, "succeeded");
@@ -9240,6 +9333,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal((bundle.output?.bytes ?? 0) > 100, true);
   assert.match(bundle.output?.path ?? "", /session-bundle\.json$/);
   assert.match(bundle.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${session.id}`));
+  assert.match(bundle.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${session.id}`));
   assert.match(bundle.reviewCommands?.localStatus ?? "", /agent local status/);
   assert.match(bundle.reviewCommands?.localLogs ?? "", /agent local logs/);
   assert.equal(await exists(path.join(dir, bundleOutputPath)), true);

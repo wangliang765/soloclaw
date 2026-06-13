@@ -65,6 +65,7 @@ soloclaw agent status --json
 soloclaw agent logs --limit 20
 agent run --require-model-ready --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env LOCAL_LLM_API_KEY "inspect this workspace"
 agent resume <session-id> --require-model-ready --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env LOCAL_LLM_API_KEY
+agent session inspect <session-id> --json
 agent session bundle <session-id> --json --output .agent/tmp/session-bundle.json
 agent session bundle <session-id> --json --require-change --require-patch --require-recovery --require-diff-stat --require-execution-profile local-safe
 ```
@@ -79,7 +80,9 @@ The interactive `soloclaw` shell exposes the same views as `/agent status` and `
 
 For supervised real-model tasks, add `--require-model-ready` to `agent run`, `agent ask`, `agent plan`, `agent build`, `agent goal`, or `agent resume`. The command checks the selected provider, model, base URL, API-key environment names, and configured secret-ref state before the local platform/session is opened or a paused session is continued; failures return `status=blocked` in JSON mode or a `Model readiness gate failed.` text block with the same fields as `soloclaw model check`.
 
-The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, a short review hint when the session contains completed `apply_patch` evidence, an inspection state with required/warning/info issues and focus paths, and operator next actions such as resolving pending approvals, reviewing diffs, running evidence gates, or exporting the bundle. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
+`agent session inspect` is the focused inspection view for a persisted session. It reuses the same safe session evidence as result/review/bundle, but narrows the output to inspection state, required/warning/info issues, focus paths, safe signals, next actions, and review commands for handoff or UI drilldown.
+
+The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, a short review hint when the session contains completed `apply_patch` evidence, an inspection state with required/warning/info issues and focus paths, and operator next actions such as resolving pending approvals, reviewing diffs, running evidence gates, inspecting a session, or exporting the bundle. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
 
 ## Audit Export
 

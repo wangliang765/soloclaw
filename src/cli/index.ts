@@ -3866,6 +3866,21 @@ async function main() {
         }
         return;
       }
+      if (subcommand === "inspect") {
+        const parsed = parseLifecycleArgs(args);
+        if (!sessionId) {
+          console.error("Usage: agent session inspect <session-id> [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const inspection = await buildSessionInspect(store, sessionId);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(inspection, null, 2));
+        } else {
+          printSessionInspect(inspection);
+        }
+        return;
+      }
       if (subcommand === "timeline" || subcommand === "logs") {
         const parsed = parseLifecycleArgs(args);
         if (!sessionId) {
@@ -3999,7 +4014,7 @@ async function main() {
         console.log(`${sessionId}\tdeleted`);
         return;
       }
-      console.error("Usage: agent session diff|report|status|timeline|logs|review|result|verify|compact|delete <session-id>");
+      console.error("Usage: agent session diff|report|status|inspect|timeline|logs|review|result|verify|compact|delete <session-id>");
       process.exitCode = 1;
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -5001,6 +5016,12 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultInspectionIssues: number;
     sessionResultInspectionIssueSeverities: Record<string, number>;
     sessionResultInspectionFocusPaths: string[];
+    sessionInspectState?: string;
+    sessionInspectIssues: number;
+    sessionInspectIssueSeverities: Record<string, number>;
+    sessionInspectFocusPaths: string[];
+    sessionInspectNextActions: number;
+    sessionInspectReviewCommand?: string;
     sessionTimelineItems: number;
     sessionTimelineReturnedItems: number;
     sessionTimelineKinds: Record<string, number>;
@@ -5143,6 +5164,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionTimeline?: string;
     sessionReview?: string;
     sessionResult?: string;
+    sessionInspect?: string;
     sessionVerify?: string;
     sessionBundle?: string;
     localAgentStatus?: string;
@@ -5423,6 +5445,21 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary:
         `inspection=${sessionResult.inspection.state}, issues=${sessionResult.inspection.issues.length}, ` +
         `severities=${formatRecordCounts(sessionResult.summary.inspectionIssueSeverities)}, focus=${sessionResult.inspection.focusPaths.join(",") || "-"}`,
+    });
+    const sessionInspect = await buildSessionInspect(platform.store, session.id);
+    const sessionInspectPass =
+      sessionInspect.inspection.state === sessionResult.inspection.state &&
+      sessionInspect.inspection.issues.length === sessionResult.inspection.issues.length &&
+      sessionInspect.summary.inspectionFocusPaths.includes("src/math.js") &&
+      sessionInspect.summary.nextActions === sessionResult.summary.nextActions &&
+      sessionInspect.reviewCommands.result.includes(`agent session result ${session.id}`);
+    checks.push({
+      id: "session-inspect-command-evidence",
+      label: "session inspect command evidence",
+      status: sessionInspectPass ? "pass" : "fail",
+      summary:
+        `inspect=${sessionInspect.inspection.state}, issues=${sessionInspect.inspection.issues.length}, ` +
+        `nextActions=${sessionInspect.summary.nextActions}, focus=${sessionInspect.summary.inspectionFocusPaths.join(",") || "-"}`,
     });
 
     const executionProfilePass = requiredExecutionProfiles.every((profile) =>
@@ -5854,6 +5891,12 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultInspectionIssues: sessionResult.inspection.issues.length,
         sessionResultInspectionIssueSeverities: sessionResult.summary.inspectionIssueSeverities,
         sessionResultInspectionFocusPaths: sessionResult.inspection.focusPaths,
+        sessionInspectState: sessionInspect.inspection.state,
+        sessionInspectIssues: sessionInspect.inspection.issues.length,
+        sessionInspectIssueSeverities: sessionInspect.summary.inspectionIssueSeverities,
+        sessionInspectFocusPaths: sessionInspect.summary.inspectionFocusPaths,
+        sessionInspectNextActions: sessionInspect.summary.nextActions,
+        sessionInspectReviewCommand: sessionInspect.reviewCommands.result,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
         sessionTimelineReturnedItems: sessionTimeline.summary.returnedItems,
         sessionTimelineKinds: sessionTimeline.summary.byKind,
@@ -5996,6 +6039,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionTimeline: `cd ${sampleWorkspace} && agent session timeline ${session.id} --limit 20`,
         sessionReview: `cd ${sampleWorkspace} && agent session review ${session.id}`,
         sessionResult: `cd ${sampleWorkspace} && agent session result ${session.id}`,
+        sessionInspect: `cd ${sampleWorkspace} && agent session inspect ${session.id}`,
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
           `--require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
@@ -6067,6 +6111,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(
     `- sessionResultInspection=${result.evidence.sessionResultInspectionState ?? "-"} issues=${result.evidence.sessionResultInspectionIssues} ` +
     `severities=${formatRecordCounts(result.evidence.sessionResultInspectionIssueSeverities)} focus=${result.evidence.sessionResultInspectionFocusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- sessionInspect=${result.evidence.sessionInspectState ?? "-"} issues=${result.evidence.sessionInspectIssues} ` +
+    `severities=${formatRecordCounts(result.evidence.sessionInspectIssueSeverities)} ` +
+    `focus=${result.evidence.sessionInspectFocusPaths.join(",") || "-"} nextActions=${result.evidence.sessionInspectNextActions}`,
   );
   console.log(`- sessionResultNextActions=${result.evidence.sessionResultNextActions} statuses=${formatRecordCounts(result.evidence.sessionResultNextActionStatuses)}`);
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
@@ -7010,9 +7059,51 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
     reviewCommands: {
       timeline: `agent session timeline ${sessionId}`,
       review: `agent session review ${sessionId}`,
+      inspect: `agent session inspect ${sessionId}`,
       result: `agent session result ${sessionId}`,
       report: `agent session report ${sessionId} --json`,
       verify: `agent session verify ${sessionId}`,
+    },
+  };
+}
+
+async function buildSessionInspect(store: AgentStore, sessionId: string) {
+  const result = await buildSessionResult(store, sessionId);
+  return {
+    generatedAt: new Date().toISOString(),
+    session: result.session,
+    summary: {
+      outcome: result.summary.outcome,
+      status: result.summary.status,
+      targetMode: result.summary.targetMode,
+      recovered: result.summary.recovered,
+      inspectionState: result.inspection.state,
+      inspectionSummary: result.inspection.summary,
+      inspectionIssues: result.inspection.issues.length,
+      inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
+      inspectionFocusPaths: result.inspection.focusPaths,
+      pendingApprovals: result.summary.pendingApprovals,
+      failedCommands: result.summary.failedCommands,
+      timedOutCommands: result.summary.timedOutCommands,
+      failedToolResults: result.summary.failedToolResults,
+      modelFailedCalls: result.summary.modelFailedCalls,
+      reviewProfile: result.summary.reviewProfile,
+      nextActions: result.nextActions.length,
+      nextActionStatuses: result.summary.nextActionStatuses,
+    },
+    inspection: result.inspection,
+    nextActions: result.nextActions,
+    reviewCommands: {
+      inspect: `agent session inspect ${sessionId}`,
+      result: `agent session result ${sessionId}`,
+      review: `agent session review ${sessionId}`,
+      status: `agent session status ${sessionId}`,
+      diff: `agent session diff ${sessionId}`,
+      timeline: `agent session timeline ${sessionId}`,
+      report: `agent session report ${sessionId} --json`,
+      verify: `agent session verify ${sessionId}`,
+      bundle: `agent session bundle ${sessionId} --json`,
+      audit: `agent audit list --session ${sessionId}`,
     },
   };
 }
@@ -7705,6 +7796,7 @@ async function buildSessionEvidenceBundle(
     reviewCommands: {
       bundle: `agent session bundle ${sessionId} --json`,
       diff: `agent session diff ${sessionId}`,
+      inspect: `agent session inspect ${sessionId}`,
       report: `agent session report ${sessionId} --json`,
       status: `agent session status ${sessionId}`,
       timeline: `agent session timeline ${sessionId}`,
@@ -7787,6 +7879,7 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log("Review:");
   console.log(`- ${bundle.reviewCommands.bundle}`);
   console.log(`- ${bundle.reviewCommands.review}`);
+  console.log(`- ${bundle.reviewCommands.inspect}`);
   console.log(`- ${bundle.reviewCommands.diff}`);
   console.log(`- ${bundle.reviewCommands.result}`);
   console.log(`- ${bundle.reviewCommands.verify}`);
@@ -7855,8 +7948,59 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log("Review:");
   console.log(`- ${status.reviewCommands.timeline}`);
   console.log(`- ${status.reviewCommands.review}`);
+  console.log(`- ${status.reviewCommands.inspect}`);
   console.log(`- ${status.reviewCommands.result}`);
   console.log(`- ${status.reviewCommands.report}`);
+}
+
+function printSessionInspect(inspection: Awaited<ReturnType<typeof buildSessionInspect>>): void {
+  console.log(`Session inspect: ${inspection.session.id}`);
+  console.log(
+    `state=${inspection.inspection.state}\toutcome=${inspection.summary.outcome}\t` +
+    `status=${inspection.summary.status}\ttarget=${inspection.summary.targetMode}`,
+  );
+  console.log(`objective: ${inspection.session.objective}`);
+  console.log("");
+  console.log("Summary:");
+  console.log(`- ${inspection.inspection.summary}`);
+  console.log(
+    `- issues=${inspection.summary.inspectionIssues} ` +
+    `severities=${formatRecordCounts(inspection.summary.inspectionIssueSeverities)}`,
+  );
+  console.log(`- focusPaths=${inspection.summary.inspectionFocusPaths.join(",") || "-"}`);
+  console.log(`- reviewProfile=${formatDiffReviewProfile(inspection.summary.reviewProfile)}`);
+  console.log(
+    `- signals=outcome:${inspection.inspection.signals.outcome}, recovered:${inspection.inspection.signals.recovered}, ` +
+    `pendingApprovals:${inspection.inspection.signals.pendingApprovals}, failedCommands:${inspection.inspection.signals.failedCommands}, ` +
+    `timedOut:${inspection.inspection.signals.timedOutCommands}, failedTools:${inspection.inspection.signals.failedToolResults}, ` +
+    `failedModelCalls:${inspection.inspection.signals.modelFailedCalls}`,
+  );
+  console.log(`- nextActions=${inspection.summary.nextActions} statuses=${formatRecordCounts(inspection.summary.nextActionStatuses)}`);
+  if (inspection.inspection.issues.length > 0) {
+    console.log("");
+    console.log("Issues:");
+    for (const issue of inspection.inspection.issues) {
+      console.log(`- [${issue.severity}] ${issue.label}: ${issue.summary}`);
+      if (issue.command) {
+        console.log(`  ${issue.command}`);
+      }
+    }
+  }
+  if (inspection.nextActions.length > 0) {
+    console.log("");
+    console.log("Next actions:");
+    for (const action of inspection.nextActions) {
+      console.log(`- [${action.status}] ${action.label}: ${action.command}`);
+      console.log(`  ${action.reason}`);
+    }
+  }
+  console.log("");
+  console.log("Review:");
+  console.log(`- ${inspection.reviewCommands.result}`);
+  console.log(`- ${inspection.reviewCommands.review}`);
+  console.log(`- ${inspection.reviewCommands.diff}`);
+  console.log(`- ${inspection.reviewCommands.verify}`);
+  console.log(`- ${inspection.reviewCommands.bundle}`);
 }
 
 async function buildSessionReview(store: AgentStore, sessionId: string, options: { limit?: number } = {}) {
@@ -7931,6 +8075,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     reviewCommands: {
       diff: `agent session diff ${sessionId}`,
       status: `agent session status ${sessionId}`,
+      inspect: `agent session inspect ${sessionId}`,
       timeline: `agent session timeline ${sessionId}`,
       result: `agent session result ${sessionId}`,
       report: `agent session report ${sessionId} --json`,
@@ -8097,6 +8242,7 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log("");
   console.log("Review:");
   console.log(`- ${review.reviewCommands.diff}`);
+  console.log(`- ${review.reviewCommands.inspect}`);
   console.log(`- ${review.reviewCommands.timeline}`);
   console.log(`- ${review.reviewCommands.result}`);
   console.log(`- ${review.reviewCommands.verify}`);
@@ -8625,6 +8771,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
     })),
     reviewCommands: {
       review: `agent session review ${sessionId}`,
+      inspect: `agent session inspect ${sessionId}`,
       diff: `agent session diff ${sessionId}`,
       status: `agent session status ${sessionId}`,
       timeline: `agent session timeline ${sessionId}`,
@@ -8742,6 +8889,7 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log("");
   console.log("Review:");
   console.log(`- ${result.reviewCommands.review}`);
+  console.log(`- ${result.reviewCommands.inspect}`);
   console.log(`- ${result.reviewCommands.diff}`);
   console.log(`- ${result.reviewCommands.timeline}`);
   console.log(`- ${result.reviewCommands.report}`);
@@ -10865,6 +11013,7 @@ Usage:
   agent session diff <session-id> [--json]
   agent session report <session-id> [--json]
   agent session status <session-id> [--json] [--limit n]
+  agent session inspect <session-id> [--json]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
@@ -11006,6 +11155,7 @@ Usage:
   agent session diff <session-id> [--json]
   agent session report <session-id> [--json]
   agent session status <session-id> [--json] [--limit n]
+  agent session inspect <session-id> [--json]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
@@ -11057,6 +11207,7 @@ Examples:
   agent session diff sess_xxxxxxxx
   agent session report sess_xxxxxxxx --json
   agent session status sess_xxxxxxxx
+  agent session inspect sess_xxxxxxxx
   agent session timeline sess_xxxxxxxx --limit 20
   agent session review sess_xxxxxxxx
   agent session bundle sess_xxxxxxxx --json --output .agent/tmp/session-bundle.json
