@@ -8434,7 +8434,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -8462,6 +8462,9 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /ask <task>          Ask the agent to work in the current workspace");
         console.log("  /run <task>          Run an agent task in the current workspace");
         console.log("  /status              Show workspace model and readiness status");
+        console.log("  /agent               Show local agent execution status");
+        console.log("  /agent status        Show sessions, approvals, workers, and assignments");
+        console.log("  /agent logs          Show merged local execution logs");
         console.log("  /check               Run the local readiness check");
         console.log("  /doctor              Run the local readiness check");
         console.log("  /inspect             Print the current workspace snapshot");
@@ -8508,6 +8511,40 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
       }
       if (line === "/status") {
         printSoloclawStatus(await buildSoloclawStatus(historyRoot, workspace, provider));
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/agent" || line === "/agent status" || line.startsWith("/agent status ")) {
+        const parsed = parseLocalAgentArgs(line === "/agent" ? [] : splitCliWords(line.slice("/agent status".length).trim()));
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const status = await buildLocalAgentStatus(platform.store, workspace, parsed.options);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(status, null, 2));
+          } else {
+            printLocalAgentStatus(status);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/agent logs" || line.startsWith("/agent logs ")) {
+        const parsed = parseLocalAgentArgs(splitCliWords(line.slice("/agent logs".length).trim()));
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const logs = await buildLocalAgentLogs(platform.store, workspace, parsed.options);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(logs, null, 2));
+          } else {
+            printLocalAgentLogs(logs);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
         stdout.write("soloclaw> ");
         continue;
       }
