@@ -60,6 +60,7 @@ import type { SpecificationEvidenceConclusion, SpecificationEvidenceProvider, Sp
 import type { AgentStore, ListAuditEventsInput } from "../store/agent-store.js";
 import type { ToolResult } from "../protocol/types.js";
 import type { WorkerPollResult, WorkerRunOnceResult } from "../workers/local-worker-runner.js";
+import { WorkerHealthService, type WorkerHealthSummary } from "../workers/worker-health-service.js";
 import { collectWorkspaceKeyFilePreviews, collectWorkspaceSnapshot, renderWorkspaceFilePreviews, renderWorkspaceSnapshot } from "../workspace/workspace-snapshot.js";
 import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
 
@@ -4885,6 +4886,13 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentState?: string;
     localAgentSessions: number;
     localAgentPendingApprovals: number;
+    localAgentDaemonState?: string;
+    localAgentDaemonSchedulerReady: boolean;
+    localAgentDaemonWorkerReady: boolean;
+    localAgentDaemonQueueDepth: number;
+    localAgentDaemonActiveLeases: number;
+    localAgentDaemonWorkerPollCommand?: string;
+    localAgentDaemonNextStep?: string;
     localAgentLogItems: number;
     localAgentLogKinds: Record<string, number>;
     sessionReviewState?: string;
@@ -5285,6 +5293,15 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `outcome=${sessionListEntry?.summary.outcome ?? "-"}, pendingApprovals=${sessionListEntry?.summary.pendingApprovals ?? 0}`,
     });
 
+    const localStatusWorker = await platform.workers.register({
+      actor,
+      agentId: platform.localAgent.id,
+      machineId: platform.localAgent.machineId,
+      displayName: "Phase 2 local status worker",
+      capabilities: ["workspace.exec"],
+      maxConcurrentTasks: 1,
+      ttlSeconds: 60,
+    });
     const localAgentStatus = await buildLocalAgentStatus(platform.store, sampleWorkspace, { limit: 5 });
     const localAgentStatusSession = localAgentStatus.sessions.find((entry) => entry.session.id === session.id);
     checks.push({
@@ -5294,12 +5311,17 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentStatus.summary.state === "needs_attention" &&
         localAgentStatusSession?.summary.outcome === "succeeded" &&
         localAgentStatus.summary.pendingApprovals >= requiredPolicyBoundaryActions.length &&
+        localAgentStatus.daemon.state === "needs_attention" &&
+        localAgentStatus.daemon.scheduler.ready &&
+        localAgentStatus.daemon.worker.ready &&
+        localAgentStatus.daemon.worker.command?.includes(`agent workers poll ${localStatusWorker.id}`) &&
         localAgentStatus.commands.logs.includes("agent local logs")
           ? "pass"
           : "fail",
       summary:
         `state=${localAgentStatus.summary.state}, sessions=${localAgentStatus.summary.sessions.returned}, ` +
-        `pendingApprovals=${localAgentStatus.summary.pendingApprovals}, workers=${localAgentStatus.summary.workers.total}`,
+        `pendingApprovals=${localAgentStatus.summary.pendingApprovals}, workers=${localAgentStatus.summary.workers.total}, ` +
+        `daemon=${localAgentStatus.daemon.state}, workerReady=${localAgentStatus.daemon.worker.ready}`,
     });
 
     const localAgentLogs = await buildLocalAgentLogs(platform.store, sampleWorkspace, { limit: 20 });
@@ -5575,6 +5597,13 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentState: localAgentStatus.summary.state,
         localAgentSessions: localAgentStatus.summary.sessions.returned,
         localAgentPendingApprovals: localAgentStatus.summary.pendingApprovals,
+        localAgentDaemonState: localAgentStatus.daemon.state,
+        localAgentDaemonSchedulerReady: localAgentStatus.daemon.scheduler.ready,
+        localAgentDaemonWorkerReady: localAgentStatus.daemon.worker.ready,
+        localAgentDaemonQueueDepth: localAgentStatus.daemon.queue.queueDepth,
+        localAgentDaemonActiveLeases: localAgentStatus.daemon.queue.activeLeases,
+        localAgentDaemonWorkerPollCommand: localAgentStatus.daemon.worker.command,
+        localAgentDaemonNextStep: localAgentStatus.daemon.nextStep,
         localAgentLogItems: localAgentLogs.summary.returnedItems,
         localAgentLogKinds: localAgentLogs.summary.byKind,
         sessionReviewState: sessionReview.summary.reviewState,
@@ -5734,6 +5763,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- localAgentState=${result.evidence.localAgentState ?? "-"}`);
   console.log(`- localAgentSessions=${result.evidence.localAgentSessions}`);
   console.log(`- localAgentPendingApprovals=${result.evidence.localAgentPendingApprovals}`);
+  console.log(
+    `- localAgentDaemon=state:${result.evidence.localAgentDaemonState ?? "-"},` +
+    `schedulerReady:${result.evidence.localAgentDaemonSchedulerReady},workerReady:${result.evidence.localAgentDaemonWorkerReady},` +
+    `queueDepth:${result.evidence.localAgentDaemonQueueDepth},activeLeases:${result.evidence.localAgentDaemonActiveLeases}`,
+  );
   console.log(`- localAgentLogItems=${result.evidence.localAgentLogItems}`);
   console.log(`- localAgentLogKinds=${formatRecordCounts(result.evidence.localAgentLogKinds)}`);
   console.log(`- sessionReviewState=${result.evidence.sessionReviewState ?? "-"}`);
@@ -6517,6 +6551,7 @@ type LocalAgentCliOptions = {
 };
 
 type LocalAgentState = "idle" | "active" | "needs_attention";
+type LocalAgentDaemonState = "idle" | "ready_to_run" | "running" | "needs_worker" | "needs_attention";
 
 type LocalAgentLogItem = SessionTimelineItem & {
   session?: {
@@ -6605,10 +6640,12 @@ function countSessionListBy<T>(entries: T[], keyFn: (entry: T) => string | undef
 async function buildLocalAgentStatus(store: AgentStore, workspace: string, options: LocalAgentCliOptions = {}) {
   const limit = options.limit ?? 10;
   const scanLimit = Math.max(limit, 20);
+  const now = new Date().toISOString();
   const sessions = await buildSessionList(store, { limit });
   const pendingApprovals = (await store.listApprovalRequests("pending")).slice(0, limit);
   const workers = await store.listWorkerRegistrations({ limit: scanLimit });
   const assignments = await store.listTaskAssignments({ limit: Math.max(limit, 50) });
+  const workerHealth = await new WorkerHealthService(store).getSummary({ now, limit: Math.max(limit, 50) });
   const workerStatusCounts = countSessionListBy(workers, (worker) => worker.status);
   const assignmentStatusCounts = countSessionListBy(assignments, (assignment) => assignment.status);
   const activeAssignments = assignments.filter((assignment) => assignment.status === "leased" || assignment.status === "running");
@@ -6626,11 +6663,32 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     activeAssignments: activeAssignments.length,
     failedAssignments: failedAssignments.length,
   });
-  const firstOnlineWorker = workers.find((worker) => worker.status === "online");
+  const pollableWorker = workerHealth.perWorker.find((worker) =>
+    worker.status === "online" &&
+    !worker.heartbeatExpired &&
+    worker.availableSlots > 0
+  );
   const latestSessionId = sessions.sessions[0]?.session.id;
+  const commands = {
+    status: "agent local status --json",
+    logs: "agent local logs --limit 20",
+    sessions: `agent sessions --limit ${limit}`,
+    schedulerRun: "agent scheduler run --interval-ms 1000 --max-ticks 10 --stop-when-idle",
+    workerPoll: pollableWorker ? `agent workers poll ${pollableWorker.workerId} --limit 5 --idle-limit 1` : undefined,
+    latestSession: latestSessionId ? `agent session status ${latestSessionId}` : undefined,
+  };
+  const daemon = buildLocalAgentDaemonSummary({
+    health: workerHealth,
+    pendingApprovals: pendingApprovals.length,
+    activeSessions: pendingSessions,
+    failedAssignments: failedAssignments.length,
+    schedulerRunCommand: commands.schedulerRun,
+    workerPollCommand: commands.workerPoll,
+    pollableWorkerId: pollableWorker?.workerId,
+  });
 
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt: now,
     workspace,
     summary: {
       state,
@@ -6651,6 +6709,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
         failed: failedAssignments.length,
       },
     },
+    daemon,
     sessions: sessions.sessions,
     workers: workers.slice(0, limit).map((worker) => ({
       id: worker.id,
@@ -6684,14 +6743,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
       reason: approval.reason,
       createdAt: approval.createdAt,
     })),
-    commands: {
-      status: "agent local status --json",
-      logs: "agent local logs --limit 20",
-      sessions: `agent sessions --limit ${limit}`,
-      schedulerRun: "agent scheduler run --interval-ms 1000 --max-ticks 10 --stop-when-idle",
-      workerPoll: firstOnlineWorker ? `agent workers poll ${firstOnlineWorker.id} --limit 5 --idle-limit 1` : undefined,
-      latestSession: latestSessionId ? `agent session status ${latestSessionId}` : undefined,
-    },
+    commands,
   };
 }
 
@@ -6759,6 +6811,133 @@ function localAgentState(input: {
   return "idle";
 }
 
+function buildLocalAgentDaemonSummary(input: {
+  health: WorkerHealthSummary;
+  pendingApprovals: number;
+  activeSessions: number;
+  failedAssignments: number;
+  schedulerRunCommand: string;
+  workerPollCommand?: string;
+  pollableWorkerId?: string;
+}) {
+  const queueDepth = input.health.assignments.byStatus.leased ?? 0;
+  const runningAssignments = input.health.assignments.byStatus.running ?? 0;
+  const pausedAssignments = input.health.assignments.byStatus.paused ?? 0;
+  const attentionReasons = [
+    input.pendingApprovals > 0 ? "pending_approvals" : undefined,
+    input.health.assignments.activeExpired > 0 ? "expired_leases" : undefined,
+    input.health.workers.heartbeatExpired > 0 ? "expired_worker_heartbeats" : undefined,
+    input.health.workers.drainingBlocked > 0 ? "draining_workers_blocked" : undefined,
+    input.failedAssignments > 0 ? "failed_assignments" : undefined,
+  ].filter((reason): reason is string => Boolean(reason));
+  const workerReady = Boolean(input.workerPollCommand && input.pollableWorkerId);
+  const hasRunnableWork = queueDepth > 0 || input.health.assignments.dueRetries > 0 || input.activeSessions > 0;
+  const state = localAgentDaemonState({
+    attentionReasons: attentionReasons.length,
+    activeLeases: input.health.assignments.active,
+    hasRunnableWork,
+    workerReady,
+  });
+
+  return {
+    state,
+    scheduler: {
+      ready: true,
+      command: input.schedulerRunCommand,
+      intervalMs: 1000,
+      maxTicks: 10,
+      stopWhenIdle: true,
+    },
+    worker: {
+      ready: workerReady,
+      workerId: input.pollableWorkerId,
+      command: input.workerPollCommand,
+      onlineWorkers: input.health.workers.byStatus.online ?? 0,
+      schedulableWorkers: input.health.pressure.schedulableWorkerCount,
+    },
+    queue: {
+      queueDepth,
+      activeLeases: input.health.assignments.active,
+      running: runningAssignments,
+      paused: pausedAssignments,
+      activeExpired: input.health.assignments.activeExpired,
+      delayedRetries: input.health.assignments.delayedRetries,
+      dueRetries: input.health.assignments.dueRetries,
+    },
+    capacity: {
+      onlineCapacity: input.health.workers.onlineCapacity,
+      onlineLoad: input.health.workers.onlineLoad,
+      onlineAvailable: input.health.workers.onlineAvailable,
+      loadRatio: input.health.pressure.loadRatio,
+      queuedToCapacityRatio: input.health.pressure.queuedToCapacityRatio,
+      heartbeatExpired: input.health.workers.heartbeatExpired,
+      drainingBlocked: input.health.workers.drainingBlocked,
+    },
+    attention: {
+      required: attentionReasons.length > 0,
+      reasons: attentionReasons,
+    },
+    nextStep: localAgentDaemonNextStep({
+      state,
+      attentionReasons,
+      hasRunnableWork,
+      workerReady,
+      schedulerCommand: input.schedulerRunCommand,
+      workerCommand: input.workerPollCommand,
+    }),
+  };
+}
+
+function localAgentDaemonState(input: {
+  attentionReasons: number;
+  activeLeases: number;
+  hasRunnableWork: boolean;
+  workerReady: boolean;
+}): LocalAgentDaemonState {
+  if (input.attentionReasons > 0) {
+    return "needs_attention";
+  }
+  if (input.activeLeases > 0) {
+    return "running";
+  }
+  if (input.hasRunnableWork && !input.workerReady) {
+    return "needs_worker";
+  }
+  if (input.workerReady) {
+    return "ready_to_run";
+  }
+  return "idle";
+}
+
+function localAgentDaemonNextStep(input: {
+  state: LocalAgentDaemonState;
+  attentionReasons: string[];
+  hasRunnableWork: boolean;
+  workerReady: boolean;
+  schedulerCommand: string;
+  workerCommand?: string;
+}): string {
+  if (input.attentionReasons.includes("pending_approvals")) {
+    return "Resolve pending approvals, then rerun the scheduler or worker poll loop.";
+  }
+  if (input.attentionReasons.includes("expired_leases") || input.attentionReasons.includes("expired_worker_heartbeats")) {
+    return "Run worker or assignment recovery before continuing daemon loops.";
+  }
+  if (input.attentionReasons.length > 0) {
+    return "Inspect local logs and clear the attention items before continuing.";
+  }
+  if (input.state === "needs_worker") {
+    return "Register or heartbeat an online worker before polling queued work.";
+  }
+  if (input.hasRunnableWork && input.workerReady && input.workerCommand) {
+    return `Run ${input.schedulerCommand} or ${input.workerCommand}.`;
+  }
+  if (input.workerReady && input.workerCommand) {
+    return `Worker is ready; run ${input.workerCommand} when work is queued.`;
+  }
+  return "No queued daemon work is visible.";
+}
+
 function withLocalLogSession(
   item: Omit<SessionTimelineItem, "ordinal">,
   sessions: Map<string, Session>,
@@ -6790,6 +6969,19 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
     `load=${status.summary.workers.currentLoad}/${status.summary.workers.capacity}\t` +
     `assignments=${formatRecordCounts(status.summary.assignments.byStatus)}`,
   );
+  console.log(
+    `daemon=${status.daemon.state}\tqueueDepth=${status.daemon.queue.queueDepth}\t` +
+    `activeLeases=${status.daemon.queue.activeLeases}\tonlineAvailable=${status.daemon.capacity.onlineAvailable}\t` +
+    `attention=${status.daemon.attention.reasons.join(",") || "-"}`,
+  );
+  console.log("");
+  console.log("Daemon loop:");
+  console.log(
+    `- scheduler=${status.daemon.scheduler.ready ? "ready" : "blocked"}\t` +
+    `worker=${status.daemon.worker.ready ? status.daemon.worker.workerId : "not_ready"}\t` +
+    `schedulableWorkers=${status.daemon.worker.schedulableWorkers}`,
+  );
+  console.log(`- next=${status.daemon.nextStep}`);
   if (status.sessions.length > 0) {
     console.log("");
     console.log("Sessions:");

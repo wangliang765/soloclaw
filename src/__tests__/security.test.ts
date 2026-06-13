@@ -7636,6 +7636,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       localAgentState?: string;
       localAgentSessions?: number;
       localAgentPendingApprovals?: number;
+      localAgentDaemonState?: string;
+      localAgentDaemonSchedulerReady?: boolean;
+      localAgentDaemonWorkerReady?: boolean;
+      localAgentDaemonQueueDepth?: number;
+      localAgentDaemonActiveLeases?: number;
+      localAgentDaemonWorkerPollCommand?: string;
+      localAgentDaemonNextStep?: string;
       localAgentLogItems?: number;
       localAgentLogKinds?: Record<string, number>;
       sessionReviewState?: string;
@@ -7784,6 +7791,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.localAgentState, "needs_attention");
   assert.equal((parsed.evidence?.localAgentSessions ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.localAgentPendingApprovals ?? 0) >= 4, true);
+  assert.equal(parsed.evidence?.localAgentDaemonState, "needs_attention");
+  assert.equal(parsed.evidence?.localAgentDaemonSchedulerReady, true);
+  assert.equal(parsed.evidence?.localAgentDaemonWorkerReady, true);
+  assert.equal(parsed.evidence?.localAgentDaemonQueueDepth, 0);
+  assert.equal(parsed.evidence?.localAgentDaemonActiveLeases, 0);
+  assert.match(parsed.evidence?.localAgentDaemonWorkerPollCommand ?? "", /agent workers poll worker_/);
+  assert.match(parsed.evidence?.localAgentDaemonNextStep ?? "", /Resolve pending approvals/);
   assert.equal((parsed.evidence?.localAgentLogItems ?? 0) >= 10, true);
   assert.equal((parsed.evidence?.localAgentLogKinds?.audit ?? 0) >= 6, true);
   assert.equal((parsed.evidence?.localAgentLogKinds?.approval ?? 0) >= 4, true);
@@ -8435,6 +8449,15 @@ test("agent session report summarizes engineering execution evidence", async (t)
     workers?: Array<{ id?: string; status?: string; currentLoad?: number; maxConcurrentTasks?: number }>;
     assignments?: Array<{ id?: string; status?: string; workerId?: string; sessionId?: string }>;
     pendingApprovals?: Array<{ id?: string; action?: string; sessionId?: string }>;
+    daemon?: {
+      state?: string;
+      scheduler?: { ready?: boolean; command?: string };
+      worker?: { ready?: boolean; workerId?: string; command?: string; schedulableWorkers?: number };
+      queue?: { queueDepth?: number; activeLeases?: number; running?: number; paused?: number; activeExpired?: number };
+      capacity?: { onlineAvailable?: number; onlineCapacity?: number; onlineLoad?: number; loadRatio?: number };
+      attention?: { required?: boolean; reasons?: string[] };
+      nextStep?: string;
+    };
     commands?: { logs?: string; workerPoll?: string; latestSession?: string };
   };
   assert.equal(localStatus.workspace, dir);
@@ -8451,6 +8474,18 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(localStatus.workers?.some((entry) => entry.id === worker.id && entry.status === "online"), true);
   assert.equal(localStatus.assignments?.some((entry) => entry.id === assignment.id && entry.workerId === worker.id && entry.sessionId === queuedSession.id), true);
   assert.equal(localStatus.pendingApprovals?.[0]?.action, "workspace.write");
+  assert.equal(localStatus.daemon?.state, "needs_attention");
+  assert.equal(localStatus.daemon?.scheduler?.ready, true);
+  assert.match(localStatus.daemon?.scheduler?.command ?? "", /agent scheduler run/);
+  assert.equal(localStatus.daemon?.worker?.ready, true);
+  assert.equal(localStatus.daemon?.worker?.workerId, worker.id);
+  assert.match(localStatus.daemon?.worker?.command ?? "", new RegExp(`agent workers poll ${worker.id}`));
+  assert.equal(localStatus.daemon?.queue?.queueDepth, 1);
+  assert.equal(localStatus.daemon?.queue?.activeLeases, 1);
+  assert.equal(localStatus.daemon?.capacity?.onlineAvailable, 1);
+  assert.equal(localStatus.daemon?.attention?.required, true);
+  assert.equal(localStatus.daemon?.attention?.reasons?.includes("pending_approvals"), true);
+  assert.match(localStatus.daemon?.nextStep ?? "", /Resolve pending approvals/);
   assert.match(localStatus.commands?.logs ?? "", /agent local logs/);
   assert.match(localStatus.commands?.workerPoll ?? "", new RegExp(`agent workers poll ${worker.id}`));
 
@@ -8461,6 +8496,8 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(localStatusText.stdout, /Workers:/);
   assert.match(localStatusText.stdout, /Assignments:/);
   assert.match(localStatusText.stdout, /Pending approvals:/);
+  assert.match(localStatusText.stdout, /Daemon loop:/);
+  assert.match(localStatusText.stdout, /queueDepth=1/);
 
   const soloclawAgentStatus = await run(process.execPath, [cli, "agent", "status", "--json", "--limit", "10"], dir);
   assert.equal(soloclawAgentStatus.exitCode, 0, soloclawAgentStatus.stderr);

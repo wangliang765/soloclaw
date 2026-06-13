@@ -70,7 +70,7 @@ agent session bundle <session-id> --json --require-change --require-patch --requ
 
 `agent sessions` is the local recent-session dashboard. It reuses the session status view for each returned session, so JSON callers get outcome, pending approval count, command/change counts, latest safe timeline items, and follow-up review/result commands without opening each session manually.
 
-`agent local status` is the daemon-ready local agent snapshot. It aggregates the recent session dashboard with pending approvals, worker registrations, assignment queue/load state, and next commands. `soloclaw agent status` is the same product-facing alias for the active workspace selected by `soloclaw workspace use`.
+`agent local status` is the daemon-ready local agent snapshot. It aggregates the recent session dashboard with pending approvals, worker registrations, assignment queue/load state, scheduler/worker poll readiness, active leases, capacity, attention reasons, and next commands. `soloclaw agent status` is the same product-facing alias for the active workspace selected by `soloclaw workspace use`.
 
 `agent local logs` is the merged local execution log. It combines safe audit events, file changes, approval requests, and approval decisions across recent sessions, attaching session ids/statuses when available. It is intended for foreground supervision, TUI reuse, and future daemon log panels; it does not imply an installed OS service.
 
