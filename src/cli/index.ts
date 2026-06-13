@@ -494,38 +494,57 @@ async function main() {
       return;
     }
     let workspace: string;
-    let cli: RunCliOptions;
+    let parsed: { options: RunPlatformOptions; cli: RunCliOptions };
     try {
       const resumeArgs = rest.slice(1);
       workspace = await resolveInitialWorkspace(process.cwd(), resumeArgs);
-      cli = parseRunEvidenceArgs(stripWorkspaceOption(resumeArgs));
+      parsed = parseResumeArgs(stripWorkspaceOption(resumeArgs));
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
       return;
     }
-    const { agent, store } = await createLocalPlatform(workspace);
+    if (parsed.cli.requireModelReady) {
+      const modelReadiness = await buildRunModelReadinessView(workspace, parsed.options);
+      if (!modelReadiness.ready) {
+        if (parsed.cli.json) {
+          console.log(JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            status: "blocked",
+            workspace,
+            sessionId,
+            modelReadiness,
+          }, null, 2));
+        } else {
+          console.log("Model readiness gate failed.");
+          printModelCheckView(modelReadiness);
+        }
+        process.exitCode = 1;
+        return;
+      }
+    }
+    const { agent, store } = await createLocalPlatform(workspace, parsed.options);
     try {
       const finalAnswer = await agent.resume(sessionId);
       const session = (await store.getSession(sessionId)) ?? undefined;
       let sessionResult: Awaited<ReturnType<typeof buildSessionResult>> | undefined;
       let verification: Awaited<ReturnType<typeof buildSessionVerification>> | undefined;
-      if (session && (cli.json || cli.sessionResult || cli.verifySession)) {
+      if (session && (parsed.cli.json || parsed.cli.sessionResult || parsed.cli.verifySession)) {
         sessionResult = await buildSessionResult(store, session.id);
       }
-      if (session && cli.verifySession) {
+      if (session && parsed.cli.verifySession) {
         verification = await buildSessionVerification(store, session.id, {
-          requireChange: cli.requireChange,
-          requirePatch: cli.requirePatch,
-          requireRecovery: cli.requireRecovery,
-          requireTimeout: cli.requireTimeout,
-          requireDiffStat: cli.requireDiffStat,
-          requiredExecutionProfiles: cli.requiredExecutionProfiles,
-          requiredApprovalActions: cli.requiredApprovalActions,
-          requireCommand: cli.allowNoCommand !== true,
+          requireChange: parsed.cli.requireChange,
+          requirePatch: parsed.cli.requirePatch,
+          requireRecovery: parsed.cli.requireRecovery,
+          requireTimeout: parsed.cli.requireTimeout,
+          requireDiffStat: parsed.cli.requireDiffStat,
+          requiredExecutionProfiles: parsed.cli.requiredExecutionProfiles,
+          requiredApprovalActions: parsed.cli.requiredApprovalActions,
+          requireCommand: parsed.cli.allowNoCommand !== true,
         });
       }
-      if (cli.json) {
+      if (parsed.cli.json) {
         console.log(JSON.stringify({
           generatedAt: new Date().toISOString(),
           workspace,
@@ -550,7 +569,7 @@ async function main() {
           console.log(`session: ${session.id}`);
           console.log(`review: agent session review ${session.id}`);
         }
-        if (sessionResult && cli.sessionResult) {
+        if (sessionResult && parsed.cli.sessionResult) {
           console.log("");
           printSessionResult(sessionResult);
         }
@@ -4484,11 +4503,82 @@ function buildRunModelCheckArgs(options: RunPlatformOptions): string[] {
   return args;
 }
 
-function parseRunEvidenceArgs(args: string[]): RunCliOptions {
+function parseResumeArgs(args: string[]): { options: RunPlatformOptions; cli: RunCliOptions } {
+  const options: RunPlatformOptions = {};
   const cli: RunCliOptions = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     const next = args[index + 1];
+    if (arg === "--require-model-ready" || arg === "--model-ready") {
+      cli.requireModelReady = true;
+      continue;
+    }
+    if (arg === "--provider" && next) {
+      options.provider = next as NonNullable<typeof options.provider>;
+      index += 1;
+      continue;
+    }
+    if (arg === "--model" && next) {
+      options.model = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--base-url" && next) {
+      options.baseUrl = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--api-key-env" && next) {
+      options.apiKeyEnv = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--api-key-secret" && next) {
+      options.apiKeySecretRef = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--fallback-provider" && next) {
+      options.fallbackProviders ??= [];
+      options.fallbackProviders.push(next as NonNullable<typeof options.provider>);
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-retries" && next) {
+      options.modelMaxRetries = parseNonNegativeInteger(next, "--model-retries");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-retry-base-ms" && next) {
+      options.modelRetryBaseDelayMs = parseNonNegativeInteger(next, "--model-retry-base-ms");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-retry-max-ms" && next) {
+      options.modelRetryMaxDelayMs = parseNonNegativeInteger(next, "--model-retry-max-ms");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-call-budget" && next) {
+      options.modelMaxCalls = parseNonNegativeInteger(next, "--model-call-budget");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-failure-budget" && next) {
+      options.modelMaxFailures = parseNonNegativeInteger(next, "--model-failure-budget");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-circuit-break-after" && next) {
+      options.modelCircuitBreakAfterFailures = parseNonNegativeInteger(next, "--model-circuit-break-after");
+      index += 1;
+      continue;
+    }
+    if (arg === "--model-circuit-open-ms" && next) {
+      options.modelCircuitOpenMs = parseNonNegativeInteger(next, "--model-circuit-open-ms");
+      index += 1;
+      continue;
+    }
     if ((arg === "--require-execution-profile" || arg === "--require-execution-profiles") && next) {
       cli.requiredExecutionProfiles = [...(cli.requiredExecutionProfiles ?? []), ...parseCommandExecutionProfileList(next)];
       cli.verifySession = true;
@@ -4506,7 +4596,7 @@ function parseRunEvidenceArgs(args: string[]): RunCliOptions {
     }
     throw new Error(`Unknown resume option: ${arg}`);
   }
-  return cli;
+  return { options, cli };
 }
 
 function applyRunEvidenceFlag(arg: string, cli: RunCliOptions): boolean {
@@ -4925,6 +5015,12 @@ type PhaseTwoEngineeringSmokeResult = {
     modelReadinessMissingApiKeyEnvNames: string[];
     modelReadinessAgentDbCreated: boolean;
     modelReadinessUsesApiKeySecretRef: boolean;
+    resumeModelReadinessWorkspace?: string;
+    resumeModelReadinessSessionId?: string;
+    resumeModelReadinessStatus?: ModelCheckStatus;
+    resumeModelReadinessMissingApiKeyEnvNames: string[];
+    resumeModelReadinessSessionStillPaused: boolean;
+    resumeModelReadinessToolResults: number;
     agentRepairWorkspace?: string;
     agentRepairSessionId?: string;
     agentRepairOutcome?: string;
@@ -4983,6 +5079,7 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentLogs?: string;
     runJson?: string;
     modelReadinessGate?: string;
+    resumeModelReadinessGate?: string;
     agentRepairResult?: string;
     agentRepairVerify?: string;
     resumeResult?: string;
@@ -5457,6 +5554,16 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `agentDbCreated=${modelReadinessGate.agentDbCreated}`,
     });
 
+    const resumeModelReadinessGate = await runPhaseTwoResumeModelReadinessGateSmoke(cwd, { cleanup: options.cleanup });
+    checks.push({
+      id: "resume-model-readiness-gate",
+      label: "resume model readiness gate",
+      status: resumeModelReadinessGate.ok ? "pass" : "fail",
+      summary:
+        `status=${resumeModelReadinessGate.status}, sessionStillPaused=${resumeModelReadinessGate.sessionStillPaused}, ` +
+        `toolResults=${resumeModelReadinessGate.toolResults}`,
+    });
+
     const agentRepair = await runPhaseTwoAgentRepairSmoke(cwd, { cleanup: options.cleanup });
     checks.push({
       id: "agent-loop-repair-evidence",
@@ -5636,6 +5743,12 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         modelReadinessMissingApiKeyEnvNames: modelReadinessGate.missingApiKeyEnvNames,
         modelReadinessAgentDbCreated: modelReadinessGate.agentDbCreated,
         modelReadinessUsesApiKeySecretRef: modelReadinessGate.usesApiKeySecretRef,
+        resumeModelReadinessWorkspace: resumeModelReadinessGate.workspace,
+        resumeModelReadinessSessionId: resumeModelReadinessGate.sessionId,
+        resumeModelReadinessStatus: resumeModelReadinessGate.status,
+        resumeModelReadinessMissingApiKeyEnvNames: resumeModelReadinessGate.missingApiKeyEnvNames,
+        resumeModelReadinessSessionStillPaused: resumeModelReadinessGate.sessionStillPaused,
+        resumeModelReadinessToolResults: resumeModelReadinessGate.toolResults,
         agentRepairWorkspace: agentRepair.workspace,
         agentRepairSessionId: agentRepair.sessionId,
         agentRepairOutcome: agentRepair.outcome,
@@ -5696,6 +5809,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --verify-session "inspect this workspace"`,
         modelReadinessGate: modelReadinessGate.command,
+        resumeModelReadinessGate: resumeModelReadinessGate.command,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
           ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery`
@@ -5793,6 +5907,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- modelReadinessStatus=${result.evidence.modelReadinessStatus ?? "-"}`);
   console.log(`- modelReadinessMissingApiKeyEnv=${result.evidence.modelReadinessMissingApiKeyEnvNames.join(",") || "-"}`);
   console.log(`- modelReadinessAgentDbCreated=${result.evidence.modelReadinessAgentDbCreated}`);
+  console.log(
+    `- resumeModelReadiness=status:${result.evidence.resumeModelReadinessStatus ?? "-"},` +
+    `session:${result.evidence.resumeModelReadinessSessionId ?? "-"},` +
+    `stillPaused:${result.evidence.resumeModelReadinessSessionStillPaused},toolResults:${result.evidence.resumeModelReadinessToolResults}`,
+  );
   console.log(`- agentRepairWorkspace=${result.evidence.agentRepairWorkspace ?? "-"}`);
   console.log(`- agentRepairSessionId=${result.evidence.agentRepairSessionId ?? "-"}`);
   console.log(`- agentRepairOutcome=${result.evidence.agentRepairOutcome ?? "-"}`);
@@ -5838,6 +5957,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.runJson}`);
     if (result.commands.modelReadinessGate) {
       console.log(`- ${result.commands.modelReadinessGate}`);
+    }
+    if (result.commands.resumeModelReadinessGate) {
+      console.log(`- ${result.commands.resumeModelReadinessGate}`);
     }
     if (result.commands.agentRepairResult) {
       console.log(`- ${result.commands.agentRepairResult}`);
@@ -5886,6 +6008,88 @@ async function runPhaseTwoModelReadinessGateSmoke(cwd: string, options: { cleanu
         `--base-url http://localhost:11434/v1 --model qwen-local --api-key-env ${envName} "inspect this workspace"`,
     };
   } finally {
+    if (previousKey === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = previousKey;
+    }
+    if (options.cleanup) {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  }
+}
+
+async function runPhaseTwoResumeModelReadinessGateSmoke(cwd: string, options: { cleanup?: boolean } = {}) {
+  const workspace = path.join(cwd, ".agent", "tmp", `phase2-resume-model-ready-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const envName = "AGENT_PHASE2_RESUME_MODEL_READY_GATE_API_KEY";
+  const previousKey = process.env[envName];
+  delete process.env[envName];
+  await fs.mkdir(workspace, { recursive: true });
+  await fs.writeFile(path.join(workspace, "README.md"), "# Phase 2 Resume Model Readiness Gate\n", "utf8");
+  const actor = localUserActor();
+  const platform = await createLocalPlatform(workspace, {
+    provider: "mock",
+  });
+  let platformClosed = false;
+  try {
+    const session = await platform.store.createSession({
+      objective: "Phase 2 resume model readiness smoke: stay paused when model configuration is incomplete.",
+      targetMode: "build",
+      status: "paused",
+      risk: "medium",
+      createdBy: actor,
+    });
+    await platform.store.appendMessage({
+      sessionId: session.id,
+      message: { role: "system", content: "Mock resume model readiness smoke system prompt." },
+    });
+    await platform.store.appendMessage({
+      sessionId: session.id,
+      message: { role: "user", content: "inspect this workspace after model readiness passes" },
+    });
+    platform.locks.close?.();
+    platform.store.close();
+    platformClosed = true;
+
+    const readiness = await buildRunModelReadinessView(workspace, {
+      provider: "openai_compatible",
+      baseUrl: "http://localhost:11434/v1",
+      model: "qwen-local",
+      apiKeyEnv: envName,
+      knowledgeQuery: "resume paused engineering task",
+    });
+    const checkPlatform = await createLocalPlatform(workspace, {
+      provider: "mock",
+    });
+    try {
+      const stillPaused = await checkPlatform.store.getSession(session.id);
+      const toolResults = await checkPlatform.store.getToolResults(session.id);
+      return {
+        workspace,
+        sessionId: session.id,
+        ok:
+          !readiness.ready &&
+          readiness.status === "missing_api_key" &&
+          readiness.missingApiKeyEnvNames.includes(envName) &&
+          stillPaused?.status === "paused" &&
+          toolResults.length === 0,
+        status: readiness.status,
+        missingApiKeyEnvNames: readiness.missingApiKeyEnvNames,
+        sessionStillPaused: stillPaused?.status === "paused",
+        toolResults: toolResults.length,
+        command:
+          `cd ${workspace} && agent resume ${session.id} --require-model-ready --provider openai_compatible ` +
+          `--base-url http://localhost:11434/v1 --model qwen-local --api-key-env ${envName}`,
+      };
+    } finally {
+      checkPlatform.locks.close?.();
+      checkPlatform.store.close();
+    }
+  } finally {
+    if (!platformClosed) {
+      platform.locks.close?.();
+      platform.store.close();
+    }
     if (previousKey === undefined) {
       delete process.env[envName];
     } else {
@@ -9889,7 +10093,7 @@ Usage:
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
   agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
-  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent pause <session-id> [reason]
   agent cancel <session-id> [reason]
   agent identity show
