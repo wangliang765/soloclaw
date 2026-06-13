@@ -539,6 +539,7 @@ async function main() {
           requireRecovery: parsed.cli.requireRecovery,
           requireTimeout: parsed.cli.requireTimeout,
           requireDiffStat: parsed.cli.requireDiffStat,
+          requireReviewProfile: parsed.cli.requireReviewProfile,
           requireModelCall: parsed.cli.requireModelCall,
           requiredExecutionProfiles: parsed.cli.requiredExecutionProfiles,
           requiredApprovalActions: parsed.cli.requiredApprovalActions,
@@ -3909,6 +3910,7 @@ async function main() {
           requireRecovery: parsed.options.requireRecovery,
           requireTimeout: parsed.options.requireTimeout,
           requireDiffStat: parsed.options.requireDiffStat,
+          requireReviewProfile: parsed.options.requireReviewProfile,
           requireModelCall: parsed.options.requireModelCall,
           requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
           requiredApprovalActions: parsed.options.requiredApprovalActions,
@@ -3941,7 +3943,7 @@ async function main() {
       if (subcommand === "verify") {
         const parsed = parseLifecycleArgs(args);
         if (!sessionId) {
-          console.error("Usage: agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
+          console.error("Usage: agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
           process.exitCode = 1;
           return;
         }
@@ -3951,6 +3953,7 @@ async function main() {
           requireRecovery: parsed.options.requireRecovery,
           requireTimeout: parsed.options.requireTimeout,
           requireDiffStat: parsed.options.requireDiffStat,
+          requireReviewProfile: parsed.options.requireReviewProfile,
           requireModelCall: parsed.options.requireModelCall,
           requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
           requiredApprovalActions: parsed.options.requiredApprovalActions,
@@ -4213,6 +4216,7 @@ async function main() {
       requireRecovery: parsed.cli.requireRecovery,
       requireTimeout: parsed.cli.requireTimeout,
       requireDiffStat: parsed.cli.requireDiffStat,
+      requireReviewProfile: parsed.cli.requireReviewProfile,
       requireModelCall: parsed.cli.requireModelCall,
       requiredExecutionProfiles: parsed.cli.requiredExecutionProfiles,
       requiredApprovalActions: parsed.cli.requiredApprovalActions,
@@ -4269,6 +4273,7 @@ type RunCliOptions = {
   requireRecovery?: boolean;
   requireTimeout?: boolean;
   requireDiffStat?: boolean;
+  requireReviewProfile?: boolean;
   requireModelCall?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
@@ -4652,6 +4657,11 @@ function applyRunEvidenceFlag(arg: string, cli: RunCliOptions): boolean {
   }
   if (arg === "--require-diff-stat" || arg === "--require-diff-stats") {
     cli.requireDiffStat = true;
+    cli.verifySession = true;
+    return true;
+  }
+  if (arg === "--require-review-profile" || arg === "--require-diff-review-profile") {
+    cli.requireReviewProfile = true;
     cli.verifySession = true;
     return true;
   }
@@ -5517,6 +5527,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       requireRecovery: true,
       requireTimeout: true,
       requireDiffStat: true,
+      requireReviewProfile: true,
       requiredExecutionProfiles,
       requiredApprovalActions: requiredPolicyBoundaryActions,
     });
@@ -5535,6 +5546,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       requireRecovery: true,
       requireTimeout: true,
       requireDiffStat: true,
+      requireReviewProfile: true,
       requiredExecutionProfiles,
       requiredApprovalActions: requiredPolicyBoundaryActions,
     });
@@ -5887,8 +5899,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResult: `cd ${sampleWorkspace} && agent session result ${session.id}`,
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
-          `--require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
-        sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+          `--require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+        sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         localAgentStatus: `cd ${sampleWorkspace} && agent local status --json --limit 5`,
         localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --require-model-call "inspect this workspace"`,
@@ -5896,7 +5908,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         resumeModelReadinessGate: resumeModelReadinessGate.command,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
-          ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery --require-model-call`
+          ? `cd ${agentRepair.workspace} && agent session verify ${agentRepair.sessionId} --require-change --require-patch --require-recovery --require-review-profile --require-model-call`
           : undefined,
         resumeResult: resumeSmoke.sessionId ? `cd ${sampleWorkspace} && agent session result ${resumeSmoke.sessionId}` : undefined,
         targetModeResult: targetModes.sessions[0]?.sessionId ? `cd ${targetModes.workspace} && agent session result ${targetModes.sessions[0].sessionId}` : undefined,
@@ -6471,6 +6483,7 @@ async function runPhaseTwoAgentRepairSmoke(cwd: string, options: { cleanup?: boo
           requireChange: true,
           requirePatch: true,
           requireRecovery: true,
+          requireReviewProfile: true,
           requireModelCall: true,
         })
       : undefined;
@@ -8148,7 +8161,7 @@ function buildSessionVerifyNextActionCommand(sessionId: string, input: {
     flags.push("--require-change");
   }
   if (input.patches > 0) {
-    flags.push("--require-patch", "--require-diff-stat");
+    flags.push("--require-patch", "--require-diff-stat", "--require-review-profile");
   }
   if (input.failedCommands > 0 && input.recovered) {
     flags.push("--require-recovery");
@@ -8406,6 +8419,7 @@ type SessionVerificationOptions = {
   requireRecovery?: boolean;
   requireTimeout?: boolean;
   requireDiffStat?: boolean;
+  requireReviewProfile?: boolean;
   requireModelCall?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
@@ -8469,6 +8483,14 @@ async function buildSessionVerification(store: AgentStore, sessionId: string, op
       summary: formatDiffStats(result.summary.diffStats),
     });
   }
+  if (options.requireReviewProfile) {
+    checks.push({
+      id: "review-profile-evidence",
+      label: "review profile evidence",
+      status: result.summary.reviewProfile.reviewSize !== "none" && result.summary.reviewProfile.files > 0 && result.summary.reviewProfile.largestFile ? "pass" : "fail",
+      summary: formatDiffReviewProfile(result.summary.reviewProfile),
+    });
+  }
   if (options.requireRecovery) {
     checks.push({
       id: "recovery-evidence",
@@ -8526,6 +8548,7 @@ async function buildSessionVerification(store: AgentStore, sessionId: string, op
       requireRecovery: Boolean(options.requireRecovery),
       requireTimeout: Boolean(options.requireTimeout),
       requireDiffStat: Boolean(options.requireDiffStat),
+      requireReviewProfile: Boolean(options.requireReviewProfile),
       requireModelCall: Boolean(options.requireModelCall),
       requiredExecutionProfiles: [...new Set(options.requiredExecutionProfiles ?? [])],
       requiredApprovalActions: [...new Set(options.requiredApprovalActions ?? [])],
@@ -10483,7 +10506,7 @@ Usage:
   soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-model-call] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -10501,8 +10524,8 @@ Usage:
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
-  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent pause <session-id> [reason]
   agent cancel <session-id> [reason]
   agent identity show
@@ -10642,7 +10665,7 @@ Usage:
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent local status [--workspace path] [--json] [--limit n]
   agent local logs [--workspace path] [--json] [--limit n]
   agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id]
@@ -12414,6 +12437,7 @@ type LifecycleCliOptions = {
   requireRecovery?: boolean;
   requireTimeout?: boolean;
   requireDiffStat?: boolean;
+  requireReviewProfile?: boolean;
   requireModelCall?: boolean;
   requiredExecutionProfiles?: CommandExecutionProfileName[];
   requiredApprovalActions?: PolicyAction[];
@@ -12531,6 +12555,10 @@ function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; pos
     }
     if (arg === "--require-diff-stat" || arg === "--require-diff-stats") {
       options.requireDiffStat = true;
+      continue;
+    }
+    if (arg === "--require-review-profile" || arg === "--require-diff-review-profile") {
+      options.requireReviewProfile = true;
       continue;
     }
     if (arg === "--require-model-call" || arg === "--require-model-calls") {

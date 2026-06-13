@@ -8076,7 +8076,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "command-timeout-evidence"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-timeout"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-diff-stat"), true);
+  assert.equal(parsed.commands?.sessionVerify?.includes("--require-review-profile"), true);
   assert.equal(parsed.commands?.sessionBundle?.includes("agent session bundle"), true);
+  assert.equal(parsed.commands?.sessionBundle?.includes("--require-review-profile"), true);
   assert.equal(parsed.commands?.sessionBundle?.includes("--output"), true);
   assert.equal(parsed.commands?.runJson?.includes("--require-model-call"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-execution-profile"), true);
@@ -8090,6 +8092,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("agent resume"), true);
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-model-call"), true);
+  assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-review-profile"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
@@ -8652,6 +8655,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     action.id === "verify-session" &&
     /--require-recovery/.test(action.command ?? "") &&
     /--require-diff-stat/.test(action.command ?? "") &&
+    /--require-review-profile/.test(action.command ?? "") &&
     /--require-model-call/.test(action.command ?? "")
   ), true);
   assert.equal(sessionResult.approvals?.[0]?.action, "workspace.write");
@@ -8921,6 +8925,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     action.id === "verify-session" &&
     /--require-recovery/.test(action.command ?? "") &&
     /--require-diff-stat/.test(action.command ?? "") &&
+    /--require-review-profile/.test(action.command ?? "") &&
     /--require-model-call/.test(action.command ?? "")
   ), true);
   assert.equal(review.latestTimeline?.length, 5);
@@ -8951,6 +8956,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     "--require-patch",
     "--require-recovery",
     "--require-diff-stat",
+    "--require-review-profile",
     "--require-model-call",
     "--require-execution-profile",
     "local-safe",
@@ -8960,10 +8966,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
   const verification = JSON.parse(verifyJson.stdout) as {
     status?: string;
     checks?: Array<{ id?: string; status?: string }>;
-    options?: { requireModelCall?: boolean };
+    options?: { requireReviewProfile?: boolean; requireModelCall?: boolean };
     summary?: { outcome?: string; recovered?: boolean; changedPaths?: string[] };
   };
   assert.equal(verification.status, "pass");
+  assert.equal(verification.options?.requireReviewProfile, true);
   assert.equal(verification.options?.requireModelCall, true);
   assert.equal(verification.summary?.outcome, "succeeded");
   assert.equal(verification.summary?.recovered, true);
@@ -8972,15 +8979,17 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(verification.checks?.some((check) => check.id === "change-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "patch-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "diff-stat-evidence"), true);
+  assert.equal(verification.checks?.some((check) => check.id === "review-profile-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "recovery-evidence"), true);
   assert.equal(verification.checks?.some((check) => check.id === "model-call-evidence" && check.status === "pass"), true);
   assert.equal(verification.checks?.some((check) => check.id === "execution-profile-local-safe"), true);
 
-  const verifyText = await run(process.execPath, [cli, "session", "verify", session.id, "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-model-call", "--require-execution-profile", "local-safe"], dir);
+  const verifyText = await run(process.execPath, [cli, "session", "verify", session.id, "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-review-profile", "--require-model-call", "--require-execution-profile", "local-safe"], dir);
   assert.equal(verifyText.exitCode, 0, verifyText.stderr);
   assert.match(verifyText.stdout, /Session verification:/);
   assert.match(verifyText.stdout, /status=pass/);
   assert.match(verifyText.stdout, /\[pass\] diff stat evidence/);
+  assert.match(verifyText.stdout, /\[pass\] review profile evidence: small:files=1,\+1,-1,largest=src\/math\.js:\+1\/-1/);
   assert.match(verifyText.stdout, /\[pass\] recovery evidence/);
   assert.match(verifyText.stdout, /\[pass\] model call evidence: modelCalls=1, successful=1, failed=0/);
 
@@ -8999,6 +9008,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     "--require-patch",
     "--require-recovery",
     "--require-diff-stat",
+    "--require-review-profile",
     "--require-model-call",
     "--require-execution-profile",
     "local-safe",
@@ -9042,7 +9052,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
         runbook?: { ready?: boolean; steps?: Array<{ id?: string; status?: string; command?: string }> };
       };
       localLogs?: { summary?: { returnedItems?: number; byKind?: Record<string, number> }; items?: Array<{ session?: { id?: string }; kind?: string; title?: string }> };
-      verification?: { status?: string; options?: { requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> };
+      verification?: { status?: string; options?: { requireReviewProfile?: boolean; requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> };
     };
     output?: { path?: string; bytes?: number };
     reviewCommands?: { bundle?: string; verify?: string; localStatus?: string; localLogs?: string };
@@ -9096,8 +9106,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal((bundle.sections?.localLogs?.summary?.returnedItems ?? 0) >= 5, true);
   assert.equal(bundle.sections?.localLogs?.items?.some((item) => item.session?.id === session.id && item.kind === "audit"), true);
   assert.equal(bundle.sections?.verification?.status, "pass");
+  assert.equal(bundle.sections?.verification?.options?.requireReviewProfile, true);
   assert.equal(bundle.sections?.verification?.options?.requireModelCall, true);
   assert.equal(bundle.sections?.verification?.checks?.every((check) => check.status === "pass"), true);
+  assert.equal(bundle.sections?.verification?.checks?.some((check) => check.id === "review-profile-evidence"), true);
   assert.equal(bundle.sections?.verification?.checks?.some((check) => check.id === "model-call-evidence"), true);
   assert.equal((bundle.output?.bytes ?? 0) > 100, true);
   assert.match(bundle.output?.path ?? "", /session-bundle\.json$/);
@@ -9109,7 +9121,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(writtenBundle.session?.id, session.id);
   assert.equal(writtenBundle.summary?.verificationStatus, "pass");
 
-  const bundleText = await run(process.execPath, [cli, "session", "bundle", session.id, "--limit", "5", "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-model-call", "--require-execution-profile", "local-safe"], dir);
+  const bundleText = await run(process.execPath, [cli, "session", "bundle", session.id, "--limit", "5", "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-review-profile", "--require-model-call", "--require-execution-profile", "local-safe"], dir);
   assert.equal(bundleText.exitCode, 0, bundleText.stderr);
   assert.match(bundleText.stdout, /Session bundle:/);
   assert.match(bundleText.stdout, /verification=pass/);
@@ -9141,6 +9153,15 @@ test("agent session report summarizes engineering execution evidence", async (t)
   };
   assert.equal(failedDiffStatVerification.status, "fail");
   assert.equal(failedDiffStatVerification.checks?.some((check) => check.id === "diff-stat-evidence" && check.status === "fail"), true);
+
+  const reviewProfileFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-review-profile", "--json"], dir);
+  assert.equal(reviewProfileFailure.exitCode, 1);
+  const failedReviewProfileVerification = JSON.parse(reviewProfileFailure.stdout) as {
+    status?: string;
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+  assert.equal(failedReviewProfileVerification.status, "fail");
+  assert.equal(failedReviewProfileVerification.checks?.some((check) => check.id === "review-profile-evidence" && check.status === "fail" && /none:files=0/.test(check.summary ?? "")), true);
 
   const modelCallFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-model-call", "--allow-no-command", "--json"], dir);
   assert.equal(modelCallFailure.exitCode, 1);
