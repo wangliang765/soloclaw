@@ -7449,6 +7449,10 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReviewTimelineItems?: number;
       sessionVerificationStatus?: string;
       sessionVerificationChecks?: number;
+      sessionBundleVerificationStatus?: string;
+      sessionBundleSections?: string[];
+      sessionBundleOutputBytes?: number;
+      sessionBundleTimelineItems?: number;
       policyBoundaryApprovalActions?: string[];
       policyBoundaryApprovalCount?: number;
       timeoutCommandTimedOut?: boolean;
@@ -7497,7 +7501,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       cancelStatus?: string;
       cleanup?: boolean;
     };
-    commands?: { sessionVerify?: string; sessionStatus?: string; sessionTimeline?: string; sessionReview?: string };
+    commands?: { sessionVerify?: string; sessionBundle?: string; sessionStatus?: string; sessionTimeline?: string; sessionReview?: string };
   };
 
   assert.equal(parsed.status, "pass", result.stdout);
@@ -7557,6 +7561,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionReviewTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.sessionVerificationStatus, "pass");
   assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 7, true);
+  assert.equal(parsed.evidence?.sessionBundleVerificationStatus, "pass");
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("diff"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("report"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("review"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("result"), true);
+  assert.equal(parsed.evidence?.sessionBundleSections?.includes("verification"), true);
+  assert.equal((parsed.evidence?.sessionBundleOutputBytes ?? 0) > 100, true);
+  assert.equal((parsed.evidence?.sessionBundleTimelineItems ?? 0) >= 10, true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("workspace.write"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("dependency.install"), true);
   assert.equal(parsed.evidence?.policyBoundaryApprovalActions?.includes("git.mutation"), true);
@@ -7619,10 +7631,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-status-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "policy-boundary-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-timeout-evidence"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-timeout"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-diff-stat"), true);
+  assert.equal(parsed.commands?.sessionBundle?.includes("agent session bundle"), true);
+  assert.equal(parsed.commands?.sessionBundle?.includes("--output"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-execution-profile"), true);
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-approval-actions"), true);
   assert.equal(parsed.commands?.sessionStatus?.includes("agent session status"), true);
@@ -8101,6 +8116,79 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(verifyText.stdout, /status=pass/);
   assert.match(verifyText.stdout, /\[pass\] diff stat evidence/);
   assert.match(verifyText.stdout, /\[pass\] recovery evidence/);
+
+  const bundleOutputPath = ".agent/tmp/session-bundle.json";
+  const bundleJson = await run(process.execPath, [
+    cli,
+    "session",
+    "bundle",
+    session.id,
+    "--json",
+    "--output",
+    bundleOutputPath,
+    "--limit",
+    "5",
+    "--require-change",
+    "--require-patch",
+    "--require-recovery",
+    "--require-diff-stat",
+    "--require-execution-profile",
+    "local-safe",
+  ], dir);
+  assert.equal(bundleJson.exitCode, 0, bundleJson.stderr);
+  const bundle = JSON.parse(bundleJson.stdout) as {
+    session?: { id?: string };
+    summary?: {
+      outcome?: string;
+      reviewState?: string;
+      verificationStatus?: string;
+      changedPaths?: string[];
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+      timelineItems?: number;
+      returnedTimelineItems?: number;
+    };
+    sections?: {
+      diff?: { summary?: { patches?: number } };
+      report?: { summary?: { fileChanges?: number } };
+      status?: { summary?: { outcome?: string } };
+      timeline?: { summary?: { returnedItems?: number } };
+      review?: { summary?: { reviewState?: string } };
+      result?: { summary?: { outcome?: string } };
+      verification?: { status?: string; checks?: Array<{ id?: string; status?: string }> };
+    };
+    output?: { path?: string; bytes?: number };
+    reviewCommands?: { bundle?: string; verify?: string };
+  };
+  assert.equal(bundle.session?.id, session.id);
+  assert.equal(bundle.summary?.outcome, "succeeded");
+  assert.equal(bundle.summary?.reviewState, "waiting_for_approval");
+  assert.equal(bundle.summary?.verificationStatus, "pass");
+  assert.deepEqual(bundle.summary?.changedPaths, ["src/math.js"]);
+  assert.equal(bundle.summary?.diffStats?.additions, 1);
+  assert.equal(bundle.summary?.diffStats?.deletions, 1);
+  assert.equal(bundle.summary?.returnedTimelineItems, 5);
+  assert.equal(bundle.sections?.diff?.summary?.patches, 1);
+  assert.equal(bundle.sections?.report?.summary?.fileChanges, 1);
+  assert.equal(bundle.sections?.status?.summary?.outcome, "succeeded");
+  assert.equal(bundle.sections?.timeline?.summary?.returnedItems, 5);
+  assert.equal(bundle.sections?.review?.summary?.reviewState, "waiting_for_approval");
+  assert.equal(bundle.sections?.result?.summary?.outcome, "succeeded");
+  assert.equal(bundle.sections?.verification?.status, "pass");
+  assert.equal(bundle.sections?.verification?.checks?.every((check) => check.status === "pass"), true);
+  assert.equal((bundle.output?.bytes ?? 0) > 100, true);
+  assert.match(bundle.output?.path ?? "", /session-bundle\.json$/);
+  assert.match(bundle.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${session.id}`));
+  assert.equal(await exists(path.join(dir, bundleOutputPath)), true);
+  const writtenBundle = JSON.parse(await fs.readFile(path.join(dir, bundleOutputPath), "utf8")) as { session?: { id?: string }; summary?: { verificationStatus?: string } };
+  assert.equal(writtenBundle.session?.id, session.id);
+  assert.equal(writtenBundle.summary?.verificationStatus, "pass");
+
+  const bundleText = await run(process.execPath, [cli, "session", "bundle", session.id, "--limit", "5", "--require-change", "--require-patch", "--require-recovery", "--require-diff-stat", "--require-execution-profile", "local-safe"], dir);
+  assert.equal(bundleText.exitCode, 0, bundleText.stderr);
+  assert.match(bundleText.stdout, /Session bundle:/);
+  assert.match(bundleText.stdout, /verification=pass/);
+  assert.match(bundleText.stdout, /Sections:/);
+  assert.match(bundleText.stdout, /agent session bundle/);
 
   const verifyFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-change", "--json"], dir);
   assert.equal(verifyFailure.exitCode, 1);

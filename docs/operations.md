@@ -52,6 +52,17 @@ agent approve <approval-id> --queue-resume <worker-id> "reason"
 
 MCP approvals use the same decision command. When `agent mcp capabilities`, `agent mcp call-tool`, or `agent mcp read-resource` returns an approval request, `agent approve <approval-id> --auto-replay` continues the bound MCP operation through the MCP planner, secret broker, redaction, and `mcp.executed` audit path. MCP approvals do not resume an agent session unless a later agent-tool integration creates a session-scoped MCP request.
 
+## Session Evidence Bundle
+
+Current local CLI flow:
+
+```text
+agent session bundle <session-id> --json --output .agent/tmp/session-bundle.json
+agent session bundle <session-id> --json --require-change --require-patch --require-recovery --require-diff-stat --require-execution-profile local-safe
+```
+
+The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
+
 ## Audit Export
 
 Current local CLI flow:

@@ -3826,6 +3826,33 @@ async function main() {
         }
         return;
       }
+      if (subcommand === "bundle") {
+        const parsed = parseLifecycleArgs(args);
+        if (!sessionId) {
+          console.error("Usage: agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]");
+          process.exitCode = 1;
+          return;
+        }
+        const bundle = await buildSessionEvidenceBundle(store, sessionId, {
+          limit: parsed.options.limit,
+          requireChange: parsed.options.requireChange,
+          requirePatch: parsed.options.requirePatch,
+          requireRecovery: parsed.options.requireRecovery,
+          requireTimeout: parsed.options.requireTimeout,
+          requireDiffStat: parsed.options.requireDiffStat,
+          requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
+          requiredApprovalActions: parsed.options.requiredApprovalActions,
+          requireCommand: parsed.options.allowNoCommand !== true,
+        });
+        const output = parsed.options.output ? await writeJsonOutputInsideWorkspace(process.cwd(), parsed.options.output, bundle) : undefined;
+        const printable = output ? { ...bundle, output } : bundle;
+        if (parsed.options.json) {
+          console.log(JSON.stringify(printable, null, 2));
+        } else {
+          printSessionEvidenceBundle(printable);
+        }
+        return;
+      }
       if (subcommand === "result") {
         const parsed = parseLifecycleArgs(args);
         if (!sessionId) {
@@ -4755,6 +4782,10 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewTimelineItems: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
+    sessionBundleVerificationStatus?: string;
+    sessionBundleSections: string[];
+    sessionBundleOutputBytes: number;
+    sessionBundleTimelineItems: number;
     policyBoundaryApprovalActions: string[];
     policyBoundaryApprovalCount: number;
     timeoutCommandTimedOut: boolean;
@@ -4816,6 +4847,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReview?: string;
     sessionResult?: string;
     sessionVerify?: string;
+    sessionBundle?: string;
     runJson?: string;
     agentRepairResult?: string;
     agentRepairVerify?: string;
@@ -5139,6 +5171,37 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary: `verification=${sessionVerification.status}, checks=${sessionVerification.checks.length}`,
     });
 
+    const sessionBundle = await buildSessionEvidenceBundle(platform.store, session.id, {
+      limit: 20,
+      requireChange: true,
+      requirePatch: true,
+      requireRecovery: true,
+      requireTimeout: true,
+      requireDiffStat: true,
+      requiredExecutionProfiles,
+      requiredApprovalActions: requiredPolicyBoundaryActions,
+    });
+    const sessionBundleOutput = await writeJsonOutputInsideWorkspace(sampleWorkspace, ".agent/tmp/session-bundle.json", sessionBundle);
+    const sessionBundleSections = Object.keys(sessionBundle.sections).sort();
+    checks.push({
+      id: "session-bundle-evidence",
+      label: "session bundle evidence",
+      status:
+        sessionBundle.summary.outcome === "succeeded" &&
+        sessionBundle.summary.verificationStatus === "pass" &&
+        sessionBundleSections.includes("diff") &&
+        sessionBundleSections.includes("report") &&
+        sessionBundleSections.includes("review") &&
+        sessionBundleSections.includes("result") &&
+        sessionBundleSections.includes("verification") &&
+        sessionBundleOutput.bytes > 100
+          ? "pass"
+          : "fail",
+      summary:
+        `bundleVerification=${sessionBundle.summary.verificationStatus}, sections=${sessionBundleSections.join(",")}, ` +
+        `outputBytes=${sessionBundleOutput.bytes}`,
+    });
+
     const runSmoke = await platform.agent.runWithSession("inspect this workspace through the engineering run path");
     const runSessionResult = runSmoke.session ? await buildSessionResult(platform.store, runSmoke.session.id) : undefined;
     const runSessionVerification = runSmoke.session
@@ -5294,6 +5357,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
+        sessionBundleVerificationStatus: sessionBundle.summary.verificationStatus,
+        sessionBundleSections,
+        sessionBundleOutputBytes: sessionBundleOutput.bytes,
+        sessionBundleTimelineItems: sessionBundle.summary.timelineItems,
         policyBoundaryApprovalActions: [...policyBoundaryActionSet],
         policyBoundaryApprovalCount: policyBoundaryApprovals.length,
         timeoutCommandTimedOut: timeoutObserved,
@@ -5357,6 +5424,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
           `--require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+        sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --verify-session "inspect this workspace"`,
         agentRepairResult: agentRepair.sessionId ? `cd ${agentRepair.workspace} && agent session result ${agentRepair.sessionId}` : undefined,
         agentRepairVerify: agentRepair.sessionId
@@ -5422,6 +5490,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
+  console.log(`- sessionBundleVerificationStatus=${result.evidence.sessionBundleVerificationStatus ?? "-"}`);
+  console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
+  console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
   console.log(`- timeoutCommandTimedOut=${result.evidence.timeoutCommandTimedOut}`);
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
   console.log(`- runSessionOutcome=${result.evidence.runSessionOutcome ?? "-"}`);
@@ -5466,6 +5537,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.sessionReview}`);
     console.log(`- ${result.commands.sessionResult}`);
     console.log(`- ${result.commands.sessionVerify}`);
+    console.log(`- ${result.commands.sessionBundle}`);
     console.log(`- ${result.commands.runJson}`);
     if (result.commands.agentRepairResult) {
       console.log(`- ${result.commands.agentRepairResult}`);
@@ -6106,6 +6178,115 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       verify: `agent session verify ${sessionId}`,
     },
   };
+}
+
+async function buildSessionEvidenceBundle(
+  store: AgentStore,
+  sessionId: string,
+  options: SessionVerificationOptions & { limit?: number } = {},
+) {
+  const diff = await buildSessionDiff(store, sessionId);
+  const report = await buildSessionReport(store, sessionId);
+  const result = await buildSessionResult(store, sessionId);
+  const timeline = await buildSessionTimeline(store, sessionId, { limit: options.limit ?? 25 });
+  const status = await buildSessionStatus(store, sessionId, { limit: options.limit ?? 8 });
+  const review = await buildSessionReview(store, sessionId, { limit: options.limit ?? 12 });
+  const verification = await buildSessionVerification(store, sessionId, options);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    session: result.session,
+    summary: {
+      outcome: result.summary.outcome,
+      status: result.summary.status,
+      targetMode: result.summary.targetMode,
+      reviewState: review.summary.reviewState,
+      verificationStatus: verification.status,
+      changedPaths: result.summary.changedPaths,
+      fileChanges: result.summary.fileChanges,
+      patches: result.summary.patches,
+      diffStats: result.summary.diffStats,
+      commandsFinished: result.summary.commandsFinished,
+      failedCommands: result.summary.failedCommands,
+      timedOutCommands: result.summary.timedOutCommands,
+      executionProfiles: result.summary.executionProfiles,
+      approvals: result.summary.approvals,
+      pendingApprovals: result.summary.pendingApprovals,
+      toolResults: result.summary.toolResults,
+      failedToolResults: result.summary.failedToolResults,
+      timelineItems: timeline.summary.totalItems,
+      returnedTimelineItems: timeline.summary.returnedItems,
+    },
+    sections: {
+      diff,
+      report,
+      status,
+      timeline,
+      review,
+      result,
+      verification,
+    },
+    reviewCommands: {
+      bundle: `agent session bundle ${sessionId} --json`,
+      diff: `agent session diff ${sessionId}`,
+      report: `agent session report ${sessionId} --json`,
+      status: `agent session status ${sessionId}`,
+      timeline: `agent session timeline ${sessionId}`,
+      review: `agent session review ${sessionId}`,
+      result: `agent session result ${sessionId}`,
+      verify: `agent session verify ${sessionId}`,
+      audit: `agent audit list --session ${sessionId}`,
+    },
+  };
+}
+
+async function writeJsonOutputInsideWorkspace(cwd: string, outputPath: string, value: unknown): Promise<{ path: string; bytes: number }> {
+  const resolved = path.resolve(cwd, outputPath);
+  const relative = path.relative(cwd, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("--output must stay inside the current workspace.");
+  }
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  await fs.writeFile(resolved, content, "utf8");
+  return { path: resolved, bytes: Buffer.byteLength(content, "utf8") };
+}
+
+function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessionEvidenceBundle>> & { output?: { path: string; bytes: number } }): void {
+  console.log(`Session bundle: ${bundle.session.id}`);
+  console.log(
+    `outcome=${bundle.summary.outcome}\tverification=${bundle.summary.verificationStatus}\t` +
+    `reviewState=${bundle.summary.reviewState}\tstatus=${bundle.summary.status}`,
+  );
+  console.log(`objective: ${bundle.session.objective}`);
+  console.log("");
+  console.log("Summary:");
+  console.log(`- changedPaths=${bundle.summary.changedPaths.join(",") || "-"}`);
+  console.log(`- fileChanges=${bundle.summary.fileChanges} patches=${bundle.summary.patches} diffStats=${formatDiffStats(bundle.summary.diffStats)}`);
+  console.log(`- commandsFinished=${bundle.summary.commandsFinished} failed=${bundle.summary.failedCommands} timedOut=${bundle.summary.timedOutCommands}`);
+  console.log(`- executionProfiles=${formatRecordCounts(bundle.summary.executionProfiles)}`);
+  console.log(`- approvals=${bundle.summary.approvals} pending=${bundle.summary.pendingApprovals}`);
+  console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
+  console.log(`- verificationChecks=${bundle.sections.verification.checks.length}`);
+  if (bundle.output) {
+    console.log(`- output=${bundle.output.path} bytes=${bundle.output.bytes}`);
+  }
+  console.log("");
+  console.log("Sections:");
+  console.log("- diff");
+  console.log("- report");
+  console.log("- status");
+  console.log("- timeline");
+  console.log("- review");
+  console.log("- result");
+  console.log("- verification");
+  console.log("");
+  console.log("Review:");
+  console.log(`- ${bundle.reviewCommands.bundle}`);
+  console.log(`- ${bundle.reviewCommands.review}`);
+  console.log(`- ${bundle.reviewCommands.diff}`);
+  console.log(`- ${bundle.reviewCommands.result}`);
+  console.log(`- ${bundle.reviewCommands.verify}`);
 }
 
 function printSessionTimeline(timeline: Awaited<ReturnType<typeof buildSessionTimeline>>): void {
@@ -8448,6 +8629,7 @@ Usage:
   agent session status <session-id> [--json] [--limit n]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
+  agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
   agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
@@ -8588,6 +8770,7 @@ Usage:
   agent session status <session-id> [--json] [--limit n]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
+  agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
   agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id]
@@ -8631,6 +8814,7 @@ Examples:
   agent session status sess_xxxxxxxx
   agent session timeline sess_xxxxxxxx --limit 20
   agent session review sess_xxxxxxxx
+  agent session bundle sess_xxxxxxxx --json --output .agent/tmp/session-bundle.json
   agent session result sess_xxxxxxxx
   agent session verify sess_xxxxxxxx --require-change --require-patch
   agent resume sess_xxxxxxxx --verify-session --allow-no-command
@@ -10346,6 +10530,7 @@ type LifecycleCliOptions = {
   summary?: string;
   force?: boolean;
   json?: boolean;
+  output?: string;
   limit?: number;
   requireChange?: boolean;
   requirePatch?: boolean;
@@ -10374,6 +10559,11 @@ function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; pos
     }
     if (arg === "--json") {
       options.json = true;
+      continue;
+    }
+    if (arg === "--output" && next) {
+      options.output = next;
+      index += 1;
       continue;
     }
     if (arg === "--limit" && next) {
