@@ -5043,6 +5043,16 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentDaemonActiveLeases: number;
     localAgentDaemonWorkerPollCommand?: string;
     localAgentDaemonNextStep?: string;
+    localAgentLifecycleMode?: LocalAgentLifecyclePlanMode;
+    localAgentLifecycleReady: boolean;
+    localAgentLifecycleBlocked: boolean;
+    localAgentLifecycleNextCommand?: string;
+    localAgentLifecycleSchedulerCommand?: string;
+    localAgentLifecycleWorkerCommand?: string;
+    localAgentLifecycleAttentionReasons: string[];
+    localAgentLifecycleRequiredSteps: string[];
+    localAgentLifecycleRecommendedSteps: string[];
+    localAgentLifecycleBlockedSteps: string[];
     localAgentRunbookReady: boolean;
     localAgentRunbookSteps: number;
     localAgentRunbookRequiredCommand?: string;
@@ -5602,6 +5612,26 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `daemon=${localAgentStatus.daemon.state}, workerReady=${localAgentStatus.daemon.worker.ready}, ` +
         `runbookReady=${localAgentStatus.runbook.ready}, required=${localAgentRunbookRequiredStep?.id ?? "-"}`,
     });
+    const localAgentLifecyclePlanPass =
+      localAgentStatus.lifecyclePlan.mode === "resolve_attention" &&
+      localAgentStatus.lifecyclePlan.ready === false &&
+      localAgentStatus.lifecyclePlan.blocked &&
+      localAgentStatus.lifecyclePlan.nextCommand === "agent approvals pending" &&
+      localAgentStatus.lifecyclePlan.schedulerCommand.includes("agent scheduler run") &&
+      (localAgentStatus.lifecyclePlan.workerCommand?.includes(`agent workers poll ${localStatusWorker.id}`) ?? false) &&
+      localAgentStatus.lifecyclePlan.attentionReasons.includes("pending_approvals") &&
+      localAgentStatus.lifecyclePlan.requiredSteps.includes("resolve-attention") &&
+      localAgentStatus.lifecyclePlan.blockedSteps.includes("run-scheduler") &&
+      localAgentStatus.lifecyclePlan.blockedSteps.includes("poll-worker");
+    checks.push({
+      id: "local-daemon-lifecycle-plan-evidence",
+      label: "local daemon lifecycle plan evidence",
+      status: localAgentLifecyclePlanPass ? "pass" : "fail",
+      summary:
+        `mode=${localAgentStatus.lifecyclePlan.mode}, ready=${localAgentStatus.lifecyclePlan.ready}, ` +
+        `blocked=${localAgentStatus.lifecyclePlan.blocked}, next=${localAgentStatus.lifecyclePlan.nextCommand ?? "-"}, ` +
+        `attention=${localAgentStatus.lifecyclePlan.attentionReasons.join(",") || "-"}`,
+    });
 
     const localAgentLogs = await buildLocalAgentLogs(platform.store, sampleWorkspace, { limit: 20 });
     const localAgentLogsPass =
@@ -6012,6 +6042,16 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentDaemonActiveLeases: localAgentStatus.daemon.queue.activeLeases,
         localAgentDaemonWorkerPollCommand: localAgentStatus.daemon.worker.command,
         localAgentDaemonNextStep: localAgentStatus.daemon.nextStep,
+        localAgentLifecycleMode: localAgentStatus.lifecyclePlan.mode,
+        localAgentLifecycleReady: localAgentStatus.lifecyclePlan.ready,
+        localAgentLifecycleBlocked: localAgentStatus.lifecyclePlan.blocked,
+        localAgentLifecycleNextCommand: localAgentStatus.lifecyclePlan.nextCommand,
+        localAgentLifecycleSchedulerCommand: localAgentStatus.lifecyclePlan.schedulerCommand,
+        localAgentLifecycleWorkerCommand: localAgentStatus.lifecyclePlan.workerCommand,
+        localAgentLifecycleAttentionReasons: localAgentStatus.lifecyclePlan.attentionReasons,
+        localAgentLifecycleRequiredSteps: localAgentStatus.lifecyclePlan.requiredSteps,
+        localAgentLifecycleRecommendedSteps: localAgentStatus.lifecyclePlan.recommendedSteps,
+        localAgentLifecycleBlockedSteps: localAgentStatus.lifecyclePlan.blockedSteps,
         localAgentRunbookReady: localAgentStatus.runbook.ready,
         localAgentRunbookSteps: localAgentStatus.runbook.steps.length,
         localAgentRunbookRequiredCommand: localAgentRunbookRequiredStep?.command,
@@ -6262,6 +6302,12 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(
     `- localAgentRunbook=ready:${result.evidence.localAgentRunbookReady},steps:${result.evidence.localAgentRunbookSteps},` +
     `blocked:${result.evidence.localAgentRunbookBlockedSteps},requiredCommand:${result.evidence.localAgentRunbookRequiredCommand ?? "-"}`,
+  );
+  console.log(
+    `- localAgentLifecycle=mode:${result.evidence.localAgentLifecycleMode ?? "-"},ready:${result.evidence.localAgentLifecycleReady},` +
+    `blocked:${result.evidence.localAgentLifecycleBlocked},next:${result.evidence.localAgentLifecycleNextCommand ?? "-"},` +
+    `attention:${result.evidence.localAgentLifecycleAttentionReasons.join(",") || "-"},` +
+    `blockedSteps:${result.evidence.localAgentLifecycleBlockedSteps.join(",") || "-"}`,
   );
   console.log(`- localAgentLogItems=${result.evidence.localAgentLogItems}`);
   console.log(`- localAgentLogKinds=${formatRecordCounts(result.evidence.localAgentLogKinds)}`);
@@ -7356,6 +7402,7 @@ type LocalAgentCliOptions = {
 
 type LocalAgentState = "idle" | "active" | "needs_attention";
 type LocalAgentDaemonState = "idle" | "ready_to_run" | "running" | "needs_worker" | "needs_attention";
+type LocalAgentLifecyclePlanMode = "resolve_attention" | "register_worker" | "run_scheduler_worker" | "worker_standby" | "idle";
 type LocalAgentRunbookStepStatus = "required" | "recommended" | "optional" | "blocked";
 
 type LocalAgentRunbookStep = {
@@ -7505,6 +7552,11 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     commands,
     pendingApprovals: pendingApprovals.length,
   });
+  const lifecyclePlan = buildLocalAgentLifecyclePlan({
+    daemon,
+    runbook,
+    commands,
+  });
 
   return {
     generatedAt: now,
@@ -7530,6 +7582,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     },
     daemon,
     runbook,
+    lifecyclePlan,
     sessions: sessions.sessions,
     workers: workers.slice(0, limit).map((worker) => ({
       id: worker.id,
@@ -7832,6 +7885,53 @@ function buildLocalAgentRunbook(input: {
   };
 }
 
+function buildLocalAgentLifecyclePlan(input: {
+  daemon: ReturnType<typeof buildLocalAgentDaemonSummary>;
+  runbook: ReturnType<typeof buildLocalAgentRunbook>;
+  commands: {
+    logs: string;
+    approvals: string;
+    schedulerRun: string;
+    workerPoll?: string;
+  };
+}) {
+  const requiredSteps = input.runbook.steps.filter((step) => step.status === "required").map((step) => step.id);
+  const recommendedSteps = input.runbook.steps.filter((step) => step.status === "recommended").map((step) => step.id);
+  const blockedSteps = input.runbook.steps.filter((step) => step.status === "blocked").map((step) => step.id);
+  const attentionRequired = input.daemon.attention.required;
+  const blocked = attentionRequired || input.daemon.state === "needs_worker";
+  let mode: LocalAgentLifecyclePlanMode = "idle";
+  if (attentionRequired) {
+    mode = "resolve_attention";
+  } else if (input.daemon.state === "needs_worker") {
+    mode = "register_worker";
+  } else if (input.daemon.queue.queueDepth > 0 || input.daemon.queue.dueRetries > 0 || input.daemon.queue.activeLeases > 0) {
+    mode = "run_scheduler_worker";
+  } else if (input.daemon.worker.ready) {
+    mode = "worker_standby";
+  }
+  const nextStep =
+    input.runbook.steps.find((step) => step.status === "required" && step.command) ??
+    (mode === "register_worker"
+      ? input.runbook.steps.find((step) => step.id === "inspect-logs")
+      : input.runbook.steps.find((step) => step.status === "recommended" && step.command)) ??
+    input.runbook.steps.find((step) => step.id === "inspect-logs");
+
+  return {
+    state: input.daemon.state,
+    mode,
+    ready: input.runbook.ready && !blocked,
+    blocked,
+    nextCommand: nextStep?.command,
+    schedulerCommand: input.commands.schedulerRun,
+    workerCommand: input.commands.workerPoll,
+    attentionReasons: input.daemon.attention.reasons,
+    requiredSteps,
+    recommendedSteps,
+    blockedSteps,
+  };
+}
+
 function withLocalLogSession(
   item: Omit<SessionTimelineItem, "ordinal">,
   sessions: Map<string, Session>,
@@ -7876,6 +7976,22 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
     `schedulableWorkers=${status.daemon.worker.schedulableWorkers}`,
   );
   console.log(`- next=${status.daemon.nextStep}`);
+  console.log("");
+  console.log("Daemon lifecycle plan:");
+  console.log(
+    `- mode=${status.lifecyclePlan.mode}\tready=${status.lifecyclePlan.ready}\tblocked=${status.lifecyclePlan.blocked}\t` +
+    `next=${status.lifecyclePlan.nextCommand ?? "-"}`,
+  );
+  console.log(`- scheduler=${status.lifecyclePlan.schedulerCommand}`);
+  if (status.lifecyclePlan.workerCommand) {
+    console.log(`- worker=${status.lifecyclePlan.workerCommand}`);
+  }
+  console.log(`- attention=${status.lifecyclePlan.attentionReasons.join(",") || "-"}`);
+  console.log(
+    `- steps required=${status.lifecyclePlan.requiredSteps.join(",") || "-"}\t` +
+    `recommended=${status.lifecyclePlan.recommendedSteps.join(",") || "-"}\t` +
+    `blocked=${status.lifecyclePlan.blockedSteps.join(",") || "-"}`,
+  );
   console.log("");
   console.log("Daemon runbook:");
   console.log(`- ready=${status.runbook.ready}\tstate=${status.runbook.state}`);
