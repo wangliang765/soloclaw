@@ -10088,7 +10088,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session inspect <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -10119,6 +10119,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /agent               Show local agent execution status");
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
         console.log("  /agent logs          Show merged local execution logs");
+        console.log("  /session inspect <session-id> Show focused session inspection");
         console.log("  /check               Run the local readiness check");
         console.log("  /doctor              Run the local readiness check");
         console.log("  /inspect             Print the current workspace snapshot");
@@ -10194,6 +10195,29 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
             console.log(JSON.stringify(logs, null, 2));
           } else {
             printLocalAgentLogs(logs);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session inspect" || line.startsWith("/session inspect ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session inspect".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session inspect <session-id> [--json]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const inspection = await buildSessionInspect(platform.store, sessionId);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(inspection, null, 2));
+          } else {
+            printSessionInspect(inspection);
           }
         } finally {
           platform.locks.close?.();

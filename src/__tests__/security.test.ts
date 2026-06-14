@@ -1758,6 +1758,82 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.match(result.stdout, /bye/);
 });
 
+test("soloclaw TUI exposes focused session inspection", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-session-inspect-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Session Inspect Workspace\n", "utf8");
+  const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
+  const platform = await createLocalPlatform(dir, { provider: "mock" });
+  const session = await platform.store.createSession({
+    objective: "Inspect a focused session from the TUI.",
+    targetMode: "build",
+    status: "completed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  const patch = [
+    "diff --git a/src/math.js b/src/math.js",
+    "--- a/src/math.js",
+    "+++ b/src/math.js",
+    "@@ -1,3 +1,3 @@",
+    " export function add(a, b) {",
+    "-  return a - b;",
+    "+  return a + b;",
+    " }",
+    "",
+  ].join("\n");
+  await platform.store.recordAuditEvent({
+    id: "audit_tui_session_inspect_command",
+    type: "command.finished",
+    actor,
+    sessionId: session.id,
+    summary: "Workspace command finished",
+    metadata: { command: "npm test", exitCode: 0, durationMs: 25, executionProfile: "local-safe" },
+    createdAt: "2026-06-13T00:03:00.000Z",
+  });
+  await platform.store.recordAuditEvent({
+    id: "audit_tui_session_inspect_patch",
+    type: "tool.completed",
+    actor,
+    sessionId: session.id,
+    summary: "apply_patch completed",
+    metadata: { tool: "apply_patch", action: "workspace.write", input: { patch }, ok: true },
+    createdAt: "2026-06-13T00:03:01.000Z",
+  });
+  await platform.store.createApprovalRequest({
+    id: "appr_tui_session_inspect",
+    status: "pending",
+    requestedBy: actor,
+    action: "workspace.write",
+    reason: "TUI session inspection should surface pending approvals.",
+    sessionId: session.id,
+    toolName: "apply_patch",
+    createdAt: "2026-06-13T00:03:02.000Z",
+  });
+  platform.locks.close?.();
+  platform.store.close();
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/help\n/session inspect ${session.id}\n/session inspect ${session.id} --json\n/session inspect\n/exit\n`,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /\/session inspect <session-id>\s+Show focused session inspection/);
+  assert.match(result.stdout, new RegExp(`Session inspect: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /state=blocked/);
+  assert.match(result.stdout, /Pending approvals remain/);
+  assert.match(result.stdout, /focusPaths=src\/math\.js/);
+  assert.match(result.stdout, /"inspectionState": "blocked"/);
+  assert.match(result.stdout, /"inspectionFocusPaths": \[\s+"src\/math\.js"/);
+  assert.match(result.stdout, /Usage: \/session inspect <session-id> \[--json\]/);
+  assert.match(result.stdout, /bye/);
+});
+
 test("soloclaw TUI init prepares workspace and model config", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-init-"));
   t.after(async () => {
