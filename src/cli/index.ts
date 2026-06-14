@@ -5059,6 +5059,9 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewInspectionIssues: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
+    sessionNoPendingVerificationStatus?: string;
+    sessionNoPendingVerificationChecks: number;
+    sessionNoPendingVerificationPendingApprovals: number;
     sessionBundleVerificationStatus?: string;
     sessionBundleSections: string[];
     sessionBundleOutputBytes: number;
@@ -5171,6 +5174,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResult?: string;
     sessionInspect?: string;
     sessionVerify?: string;
+    sessionNoPendingVerify?: string;
     sessionBundle?: string;
     localAgentStatus?: string;
     localAgentLogs?: string;
@@ -5678,6 +5682,25 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       status: sessionVerification.status,
       summary: `verification=${sessionVerification.status}, checks=${sessionVerification.checks.length}`,
     });
+    const sessionNoPendingVerification = await buildSessionVerification(platform.store, session.id, {
+      requireCommand: false,
+      requireNoPendingApprovals: true,
+    });
+    const sessionNoPendingApprovalCheck = sessionNoPendingVerification.checks.find((check) => check.id === "no-pending-approvals");
+    checks.push({
+      id: "pending-approval-verification-gate",
+      label: "pending approval verification gate",
+      status:
+        sessionNoPendingVerification.status === "fail" &&
+        sessionNoPendingApprovalCheck?.status === "fail" &&
+        sessionReport.summary.pendingApprovals >= requiredPolicyBoundaryActions.length
+          ? "pass"
+          : "fail",
+      summary:
+        `verification=${sessionNoPendingVerification.status}, ` +
+        `pendingApprovals=${sessionReport.summary.pendingApprovals}, ` +
+        `noPendingCheck=${sessionNoPendingApprovalCheck?.status ?? "-"}`,
+    });
 
     const sessionBundle = await buildSessionEvidenceBundle(platform.store, session.id, {
       workspace: sampleWorkspace,
@@ -5979,6 +6002,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewInspectionIssues: sessionReview.inspection.issues.length,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
+        sessionNoPendingVerificationStatus: sessionNoPendingVerification.status,
+        sessionNoPendingVerificationChecks: sessionNoPendingVerification.checks.length,
+        sessionNoPendingVerificationPendingApprovals: sessionReport.summary.pendingApprovals,
         sessionBundleVerificationStatus: sessionBundle.summary.verificationStatus,
         sessionBundleSections,
         sessionBundleOutputBytes: sessionBundleOutput.bytes,
@@ -6093,6 +6119,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
           `--require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
+        sessionNoPendingVerify: `cd ${sampleWorkspace} && agent session verify ${session.id} --require-no-pending-approvals --allow-no-command`,
         sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         localAgentStatus: `cd ${sampleWorkspace} && agent local status --json --limit 5`,
         localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
@@ -6207,6 +6234,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
+  console.log(
+    `- sessionNoPendingVerification=status:${result.evidence.sessionNoPendingVerificationStatus ?? "-"},` +
+    `checks:${result.evidence.sessionNoPendingVerificationChecks},` +
+    `pendingApprovals:${result.evidence.sessionNoPendingVerificationPendingApprovals}`,
+  );
   console.log(`- sessionBundleVerificationStatus=${result.evidence.sessionBundleVerificationStatus ?? "-"}`);
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
@@ -6286,6 +6318,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.sessionReview}`);
     console.log(`- ${result.commands.sessionResult}`);
     console.log(`- ${result.commands.sessionVerify}`);
+    if (result.commands.sessionNoPendingVerify) {
+      console.log(`- ${result.commands.sessionNoPendingVerify}`);
+    }
     console.log(`- ${result.commands.sessionBundle}`);
     console.log(`- ${result.commands.localAgentStatus}`);
     console.log(`- ${result.commands.localAgentLogs}`);

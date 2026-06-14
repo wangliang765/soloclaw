@@ -7984,6 +7984,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReviewInspectionIssues?: number;
       sessionVerificationStatus?: string;
       sessionVerificationChecks?: number;
+      sessionNoPendingVerificationStatus?: string;
+      sessionNoPendingVerificationChecks?: number;
+      sessionNoPendingVerificationPendingApprovals?: number;
       sessionBundleVerificationStatus?: string;
       sessionBundleSections?: string[];
       sessionBundleOutputBytes?: number;
@@ -8089,6 +8092,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionInspect?: string;
       sessionTimeline?: string;
       sessionReview?: string;
+      sessionNoPendingVerify?: string;
       localAgentStatus?: string;
       localAgentLogs?: string;
       runJson?: string;
@@ -8225,6 +8229,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionReviewNextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionVerificationStatus, "pass");
   assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 7, true);
+  assert.equal(parsed.evidence?.sessionNoPendingVerificationStatus, "fail");
+  assert.equal((parsed.evidence?.sessionNoPendingVerificationChecks ?? 0) >= 3, true);
+  assert.equal((parsed.evidence?.sessionNoPendingVerificationPendingApprovals ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.sessionBundleVerificationStatus, "pass");
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("diff"), true);
   assert.equal(parsed.evidence?.sessionBundleSections?.includes("report"), true);
@@ -8348,6 +8355,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "local-agent-logs-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "pending-approval-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "operator-next-actions-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "model-readiness-gate"), true);
@@ -8367,6 +8375,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionInspect?.includes("agent session inspect"), true);
   assert.equal(parsed.commands?.sessionTimeline?.includes("agent session timeline"), true);
   assert.equal(parsed.commands?.sessionReview?.includes("agent session review"), true);
+  assert.equal(parsed.commands?.sessionNoPendingVerify?.includes("--require-no-pending-approvals"), true);
+  assert.equal(parsed.commands?.sessionNoPendingVerify?.includes("--allow-no-command"), true);
   assert.equal(parsed.commands?.localAgentStatus?.includes("agent local status"), true);
   assert.equal(parsed.commands?.localAgentLogs?.includes("agent local logs"), true);
   assert.equal(parsed.commands?.modelReadinessGate?.includes("--require-model-ready"), true);
