@@ -1728,6 +1728,14 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
     metadata: { command: "npm test", exitCode: 0, durationMs: 25, executionProfile: "local-safe" },
     createdAt: "2026-06-13T00:02:00.000Z",
   });
+  await platform.organizations.grantCapability({
+    subjectType: "user",
+    subjectId: actor.id,
+    scopeType: "session",
+    scopeId: session.id,
+    capability: "tool.approve",
+    grantedBy: actor,
+  });
   await platform.store.createApprovalRequest({
     id: "appr_tui_agent_status",
     status: "pending",
@@ -1738,15 +1746,46 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
     toolName: "apply_patch",
     createdAt: "2026-06-13T00:02:01.000Z",
   });
+  await platform.store.createApprovalRequest({
+    id: "appr_tui_agent_status_deny",
+    status: "pending",
+    requestedBy: actor,
+    action: "dependency.install",
+    reason: "TUI approval denial should persist decisions.",
+    sessionId: session.id,
+    toolName: "run_command",
+    createdAt: "2026-06-13T00:02:02.000Z",
+  });
   platform.locks.close?.();
   platform.store.close();
 
   const cli = path.join(process.cwd(), "dist", "cli", "index.js");
-  const result = await runWithInput(process.execPath, [cli], dir, "/help\n/agent\n/agent status --limit 5\n/agent logs --limit 20\n/exit\n");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    [
+      "/help",
+      "/agent",
+      "/agent status --limit 5",
+      "/agent logs --limit 20",
+      "/approvals pending",
+      "/approve appr_tui_agent_status approved from TUI",
+      "/deny appr_tui_agent_status_deny denied from TUI",
+      "/approvals approved",
+      "/approvals denied",
+      "/approve",
+      "/exit",
+      "",
+    ].join("\n"),
+  );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.match(result.stdout, /\/agent\s+Show local agent execution status/);
   assert.match(result.stdout, /\/agent status\s+Show sessions, approvals, workers, and assignments/);
   assert.match(result.stdout, /\/agent logs\s+Show merged local execution logs/);
+  assert.match(result.stdout, /\/approvals \[status\]\s+List approval requests/);
+  assert.match(result.stdout, /\/approve <approval-id> \[reason\]\s+Approve an approval request/);
+  assert.match(result.stdout, /\/deny <approval-id> \[reason\]\s+Deny an approval request/);
   assert.match(result.stdout, /Local agent status:/);
   assert.match(result.stdout, /state=needs_attention/);
   assert.match(result.stdout, new RegExp(session.id));
@@ -1755,7 +1794,24 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.match(result.stdout, /Local agent logs:/);
   assert.match(result.stdout, /command\.finished/);
   assert.match(result.stdout, /approval requested workspace\.write/);
+  assert.match(result.stdout, /appr_tui_agent_status\tpending\tworkspace\.write/);
+  assert.match(result.stdout, /appr_tui_agent_status_deny\tpending\tdependency\.install/);
+  assert.match(result.stdout, /appr_tui_agent_status\tapproved\tworkspace\.write\tapproved from TUI/);
+  assert.match(result.stdout, /appr_tui_agent_status_deny\tdenied\tdependency\.install\tdenied from TUI/);
+  assert.match(result.stdout, /Usage: \/approve <approval-id> \[reason\]/);
   assert.match(result.stdout, /bye/);
+
+  const platformAfter = await createLocalPlatform(dir, { provider: "mock" });
+  try {
+    const approvals = await platformAfter.store.listApprovalRequests();
+    assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status")?.status, "approved");
+    assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status")?.decisionReason, "approved from TUI");
+    assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status_deny")?.status, "denied");
+    assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status_deny")?.decisionReason, "denied from TUI");
+  } finally {
+    platformAfter.locks.close?.();
+    platformAfter.store.close();
+  }
 });
 
 test("soloclaw TUI exposes focused session inspection", async (t) => {

@@ -2572,12 +2572,7 @@ async function main() {
   if (command === "approvals") {
     const status = rest[0] as "pending" | "approved" | "denied" | "expired" | "cancelled" | undefined;
     const { store } = await createLocalPlatform(process.cwd());
-    const approvals = await store.listApprovalRequests(status);
-    for (const approval of approvals) {
-      console.log(
-        `${approval.id}\t${approval.status}\t${approval.action}\t${approval.createdAt}\t${approval.toolName ?? "-"}\t${approval.reason}`,
-      );
-    }
+    printApprovalRequests(await store.listApprovalRequests(status));
     store.close();
     return;
   }
@@ -2596,33 +2591,27 @@ async function main() {
       if (parsedApproval.options.autoResume && parsedApproval.options.queueResumeWorkerId) {
         throw new Error("--auto-resume and --queue-resume are mutually exclusive.");
       }
-      const decidedBy = parsedApproval.options.localAgent
-        ? agentActor(localAgent)
-        : await resolveActor(store, parseActorRef(parsedApproval.options.actor));
       const existingApproval = (await store.listApprovalRequests()).find((candidate) => candidate.id === approvalId);
-      if (existingApproval) {
+      if (existingApproval && parsedApproval.options.queueResumeWorkerId) {
         if (parsedApproval.options.queueResumeWorkerId && isMcpApprovalAction(existingApproval.action)) {
           throw new Error("--queue-resume is only supported for session-scoped workspace/plugin tool approvals.");
         }
-        await ensureApprovalDecisionAllowed({
-          approval: existingApproval,
-          decidedBy,
-          rooms,
-          organizations,
-        });
       }
-      const approval = await store.decideApproval({
+      const { approval, decidedBy } = await decideApprovalWithPolicy({
+        store,
+        rooms,
+        organizations,
+        localAgent,
         approvalId,
         status: command === "approve" ? "approved" : "denied",
-        decidedBy,
-        decisionReason: reason,
+        options: parsedApproval.options,
+        reason,
       });
       if (!approval) {
         console.error(`Approval not found: ${approvalId}`);
         process.exitCode = 1;
         return;
       }
-      await appendApprovalDecisionRoomMessage(store, approval, decidedBy);
       console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`);
       if (command === "approve" && (parsedApproval.options.autoReplay || parsedApproval.options.autoResume || parsedApproval.options.queueResumeWorkerId)) {
         if (isMcpApprovalAction(approval.action)) {
@@ -10088,7 +10077,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -10119,6 +10108,9 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /agent               Show local agent execution status");
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
         console.log("  /agent logs          Show merged local execution logs");
+        console.log("  /approvals [status]  List approval requests");
+        console.log("  /approve <approval-id> [reason] Approve an approval request");
+        console.log("  /deny <approval-id> [reason] Deny an approval request");
         console.log("  /session diff <session-id> Show persisted patch diff");
         console.log("  /session status <session-id> Show session status snapshot");
         console.log("  /session inspect <session-id> Show focused session inspection");
@@ -10202,6 +10194,60 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
           } else {
             printLocalAgentLogs(logs);
           }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/approvals" || line.startsWith("/approvals ")) {
+        const args = splitCliWords(line.slice("/approvals".length).trim());
+        const status = args[0] as "pending" | "approved" | "denied" | "expired" | "cancelled" | undefined;
+        const platform = await createLocalPlatform(workspace);
+        try {
+          printApprovalRequests(await platform.store.listApprovalRequests(status));
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/approve" || line.startsWith("/approve ") || line === "/deny" || line.startsWith("/deny ")) {
+        const commandPrefix = line.startsWith("/deny") ? "/deny" : "/approve";
+        const parsed = parseApprovalArgs(splitCliWords(line.slice(commandPrefix.length).trim()));
+        const approvalId = parsed.positionals[0];
+        const reason = parsed.positionals.slice(1).join(" ").trim() || undefined;
+        if (!approvalId) {
+          console.log(`Usage: ${commandPrefix} <approval-id> [reason]`);
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        if (parsed.options.autoReplay || parsed.options.autoResume || parsed.options.queueResumeWorkerId) {
+          console.log("TUI approval decisions do not run auto replay or resume. Use agent approve for replay/resume options.");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const { approval } = await decideApprovalWithPolicy({
+            store: platform.store,
+            rooms: platform.rooms,
+            organizations: platform.organizations,
+            localAgent: platform.localAgent,
+            approvalId,
+            status: commandPrefix === "/approve" ? "approved" : "denied",
+            options: parsed.options,
+            reason,
+          });
+          if (!approval) {
+            console.log(`Approval not found: ${approvalId}`);
+          } else {
+            console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`);
+          }
+        } catch (error) {
+          console.log(error instanceof Error ? error.message : String(error));
         } finally {
           platform.locks.close?.();
           platform.store.close();
@@ -11458,6 +11504,48 @@ async function appendApprovalDecisionRoomMessage(
     createdAt: new Date().toISOString(),
     artifactRefs: [],
   });
+}
+
+function printApprovalRequests(approvals: ApprovalRequest[]): void {
+  for (const approval of approvals) {
+    console.log(
+      `${approval.id}\t${approval.status}\t${approval.action}\t${approval.createdAt}\t${approval.toolName ?? "-"}\t${approval.reason}`,
+    );
+  }
+}
+
+async function decideApprovalWithPolicy(input: {
+  store: Awaited<ReturnType<typeof createLocalPlatform>>["store"];
+  rooms: Awaited<ReturnType<typeof createLocalPlatform>>["rooms"];
+  organizations: Awaited<ReturnType<typeof createLocalPlatform>>["organizations"];
+  localAgent: Awaited<ReturnType<typeof createLocalPlatform>>["localAgent"];
+  approvalId: string;
+  status: "approved" | "denied";
+  options: Pick<ApprovalCliOptions, "actor" | "localAgent">;
+  reason?: string;
+}): Promise<{ approval?: ApprovalRequest; decidedBy: ActorRef }> {
+  const decidedBy = input.options.localAgent
+    ? agentActor(input.localAgent)
+    : await resolveActor(input.store, parseActorRef(input.options.actor));
+  const existingApproval = (await input.store.listApprovalRequests()).find((candidate) => candidate.id === input.approvalId);
+  if (existingApproval) {
+    await ensureApprovalDecisionAllowed({
+      approval: existingApproval,
+      decidedBy,
+      rooms: input.rooms,
+      organizations: input.organizations,
+    });
+  }
+  const approval = await input.store.decideApproval({
+    approvalId: input.approvalId,
+    status: input.status,
+    decidedBy,
+    decisionReason: input.reason,
+  });
+  if (approval) {
+    await appendApprovalDecisionRoomMessage(input.store, approval, decidedBy);
+  }
+  return { approval: approval ?? undefined, decidedBy };
 }
 
 async function ensureApprovalDecisionAllowed(input: {
