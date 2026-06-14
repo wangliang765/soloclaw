@@ -1808,6 +1808,9 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
     assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status")?.decisionReason, "approved from TUI");
     assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status_deny")?.status, "denied");
     assert.equal(approvals.find((approval) => approval.id === "appr_tui_agent_status_deny")?.decisionReason, "denied from TUI");
+    const auditEvents = await platformAfter.store.listAuditEvents({ sessionId: session.id, limit: 100 });
+    assert.equal(auditEvents.some((event) => event.type === "tool.approved" && event.metadata?.approvalId === "appr_tui_agent_status"), true);
+    assert.equal(auditEvents.some((event) => event.type === "tool.denied" && event.metadata?.approvalId === "appr_tui_agent_status_deny"), true);
   } finally {
     platformAfter.locks.close?.();
     platformAfter.store.close();
@@ -8042,6 +8045,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       queuedApprovalFileChanges?: number;
       queuedApprovalToolResults?: number;
       queuedApprovalAuditEvents?: number;
+      tuiApprovalSessionId?: string;
+      tuiApprovalApprovedStatus?: string;
+      tuiApprovalDeniedStatus?: string;
+      tuiApprovalApprovedReason?: string;
+      tuiApprovalDeniedReason?: string;
+      tuiApprovalDecisionAuditEvents?: number;
+      tuiApprovalOutputLines?: number;
+      tuiApprovalUsageShown?: boolean;
       targetModeWorkspace?: string;
       targetModeSessions?: Array<{
         mode?: string;
@@ -8082,6 +8093,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       modelReadinessGate?: string;
       resumeModelReadinessGate?: string;
       agentRepairVerify?: string;
+      tuiApprovals?: string;
+      tuiApprove?: string;
+      tuiDeny?: string;
       localDaemonRun?: string;
     };
   };
@@ -8275,6 +8289,14 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.queuedApprovalFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.queuedApprovalToolResults ?? 0) >= 2, true);
   assert.equal((parsed.evidence?.queuedApprovalAuditEvents ?? 0) >= 1, true);
+  assert.match(parsed.evidence?.tuiApprovalSessionId ?? "", /^sess_/);
+  assert.equal(parsed.evidence?.tuiApprovalApprovedStatus, "approved");
+  assert.equal(parsed.evidence?.tuiApprovalDeniedStatus, "denied");
+  assert.equal(parsed.evidence?.tuiApprovalApprovedReason, "phase2 TUI approved");
+  assert.equal(parsed.evidence?.tuiApprovalDeniedReason, "phase2 TUI denied");
+  assert.equal((parsed.evidence?.tuiApprovalDecisionAuditEvents ?? 0) >= 2, true);
+  assert.equal((parsed.evidence?.tuiApprovalOutputLines ?? 0) >= 6, true);
+  assert.equal(parsed.evidence?.tuiApprovalUsageShown, true);
   assert.match(parsed.evidence?.targetModeWorkspace ?? "", /phase2-target-modes-/);
   assert.deepEqual(parsed.evidence?.targetModeSessions?.map((entry) => entry.mode), ["plan", "build", "goal"]);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => /^sess_/.test(entry.sessionId ?? "")), true);
@@ -8347,12 +8369,16 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-model-call"), true);
   assert.equal(parsed.commands?.agentRepairVerify?.includes("--require-review-profile"), true);
+  assert.equal(parsed.commands?.tuiApprovals?.includes("/approvals pending"), true);
+  assert.equal(parsed.commands?.tuiApprove?.includes("/approve <approval-id>"), true);
+  assert.equal(parsed.commands?.tuiDeny?.includes("/deny <approval-id>"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("agent scheduler run"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("--stop-when-idle"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "queued-approval-continuation-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "tui-approval-decision-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "target-mode-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "lifecycle-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "local-daemon-run-lifecycle-evidence"), true);

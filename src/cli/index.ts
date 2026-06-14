@@ -7,6 +7,7 @@ import type {
   ActorRef,
   AgentHeartbeatStatus,
   ApprovalRequest,
+  ApprovalStatus,
   ArtifactKind,
   AuditEvent,
   AuditExportBundle,
@@ -5119,6 +5120,14 @@ type PhaseTwoEngineeringSmokeResult = {
     queuedApprovalFileChanges: number;
     queuedApprovalToolResults: number;
     queuedApprovalAuditEvents: number;
+    tuiApprovalSessionId?: string;
+    tuiApprovalApprovedStatus?: ApprovalStatus;
+    tuiApprovalDeniedStatus?: ApprovalStatus;
+    tuiApprovalApprovedReason?: string;
+    tuiApprovalDeniedReason?: string;
+    tuiApprovalDecisionAuditEvents: number;
+    tuiApprovalOutputLines: number;
+    tuiApprovalUsageShown: boolean;
     targetModeWorkspace?: string;
     targetModeSessions: Array<{
       mode: string;
@@ -5170,6 +5179,9 @@ type PhaseTwoEngineeringSmokeResult = {
     agentRepairVerify?: string;
     resumeResult?: string;
     targetModeResult?: string;
+    tuiApprovals?: string;
+    tuiApprove?: string;
+    tuiDeny?: string;
     localDaemonRun?: string;
   };
 };
@@ -5814,6 +5826,17 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `assignment=${queuedApproval.assignmentId ?? "-"}, outcome=${queuedApproval.outcome ?? "-"}, completed=${queuedApproval.completed}`,
     });
 
+    const tuiApproval = await runPhaseTwoTuiApprovalSmoke(platform, actor);
+    checks.push({
+      id: "tui-approval-decision-evidence",
+      label: "TUI approval decision evidence",
+      status: tuiApproval.ok ? "pass" : "fail",
+      summary:
+        `session=${tuiApproval.sessionId}, approved=${tuiApproval.approvedStatus ?? "-"}, ` +
+        `denied=${tuiApproval.deniedStatus ?? "-"}, audits=${tuiApproval.decisionAuditEvents}, ` +
+        `outputLines=${tuiApproval.outputLines}, usage=${tuiApproval.usageShown}`,
+    });
+
     const targetModes = await runPhaseTwoTargetModeSmoke(cwd, { cleanup: options.cleanup });
     const targetModePass = targetModes.sessions.every((entry) =>
       entry.sessionId &&
@@ -6013,6 +6036,14 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         queuedApprovalFileChanges: queuedApproval.fileChanges,
         queuedApprovalToolResults: queuedApproval.toolResults,
         queuedApprovalAuditEvents: queuedApproval.auditEvents,
+        tuiApprovalSessionId: tuiApproval.sessionId,
+        tuiApprovalApprovedStatus: tuiApproval.approvedStatus,
+        tuiApprovalDeniedStatus: tuiApproval.deniedStatus,
+        tuiApprovalApprovedReason: tuiApproval.approvedReason,
+        tuiApprovalDeniedReason: tuiApproval.deniedReason,
+        tuiApprovalDecisionAuditEvents: tuiApproval.decisionAuditEvents,
+        tuiApprovalOutputLines: tuiApproval.outputLines,
+        tuiApprovalUsageShown: tuiApproval.usageShown,
         targetModeWorkspace: targetModes.workspace,
         targetModeSessions: targetModes.sessions.map((entry) => ({
           mode: entry.mode,
@@ -6068,6 +6099,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
           : undefined,
         resumeResult: resumeSmoke.sessionId ? `cd ${sampleWorkspace} && agent session result ${resumeSmoke.sessionId}` : undefined,
         targetModeResult: targetModes.sessions[0]?.sessionId ? `cd ${targetModes.workspace} && agent session result ${targetModes.sessions[0].sessionId}` : undefined,
+        tuiApprovals: `cd ${sampleWorkspace} && soloclaw # /approvals pending`,
+        tuiApprove: `cd ${sampleWorkspace} && soloclaw # /approve <approval-id> [reason]`,
+        tuiDeny: `cd ${sampleWorkspace} && soloclaw # /deny <approval-id> [reason]`,
         localDaemonRun: `cd ${sampleWorkspace} && agent scheduler run --worker ${localStatusWorker.id} --interval-ms 0 --max-ticks 3 --stop-when-idle --idle-ticks 1 --runs-per-worker 1 --idle-limit 1`,
       },
     };
@@ -6214,6 +6248,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- queuedApprovalFileChanges=${result.evidence.queuedApprovalFileChanges}`);
   console.log(`- queuedApprovalToolResults=${result.evidence.queuedApprovalToolResults}`);
   console.log(`- queuedApprovalAuditEvents=${result.evidence.queuedApprovalAuditEvents}`);
+  console.log(
+    `- tuiApproval=session:${result.evidence.tuiApprovalSessionId ?? "-"},approved:${result.evidence.tuiApprovalApprovedStatus ?? "-"},` +
+    `denied:${result.evidence.tuiApprovalDeniedStatus ?? "-"},audits:${result.evidence.tuiApprovalDecisionAuditEvents},` +
+    `outputLines:${result.evidence.tuiApprovalOutputLines},usage:${result.evidence.tuiApprovalUsageShown}`,
+  );
   console.log(`- targetModeWorkspace=${result.evidence.targetModeWorkspace ?? "-"}`);
   console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`).join(",") || "-"}`);
   console.log(`- lifecycleAuditEvents=${result.evidence.lifecycleAuditEvents}`);
@@ -6259,6 +6298,15 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     }
     if (result.commands.targetModeResult) {
       console.log(`- ${result.commands.targetModeResult}`);
+    }
+    if (result.commands.tuiApprovals) {
+      console.log(`- ${result.commands.tuiApprovals}`);
+    }
+    if (result.commands.tuiApprove) {
+      console.log(`- ${result.commands.tuiApprove}`);
+    }
+    if (result.commands.tuiDeny) {
+      console.log(`- ${result.commands.tuiDeny}`);
     }
     if (result.commands.localDaemonRun) {
       console.log(`- ${result.commands.localDaemonRun}`);
@@ -6588,6 +6636,98 @@ async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<Retu
     fileChanges: fileChanges.length,
     toolResults: result.summary.toolResults,
     auditEvents: auditEvents.filter((event) => event.type === "task.assigned" || event.type === "task.completed" || event.type === "tool.completed").length,
+  };
+}
+
+async function runPhaseTwoTuiApprovalSmoke(platform: LocalPlatform, actor: ReturnType<typeof localUserActor>) {
+  const session = await platform.store.createSession({
+    objective: "Phase 2 TUI approval smoke: list and decide approval requests through the interactive command path.",
+    targetMode: "build",
+    status: "paused",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await platform.organizations.grantCapability({
+    subjectType: "user",
+    subjectId: actor.id,
+    scopeType: "session",
+    scopeId: session.id,
+    capability: "tool.approve",
+    grantedBy: actor,
+  });
+
+  const approveId = makeId<"ArtifactId">("appr");
+  const denyId = makeId<"ArtifactId">("appr");
+  const now = new Date().toISOString();
+  await platform.store.createApprovalRequest({
+    id: approveId,
+    status: "pending",
+    requestedBy: actor,
+    action: "workspace.write",
+    reason: "Phase 2 TUI approval approve smoke",
+    sessionId: session.id,
+    toolName: "apply_patch",
+    createdAt: now,
+  });
+  await platform.store.createApprovalRequest({
+    id: denyId,
+    status: "pending",
+    requestedBy: actor,
+    action: "dependency.install",
+    reason: "Phase 2 TUI approval deny smoke",
+    sessionId: session.id,
+    toolName: "run_command",
+    createdAt: now,
+  });
+
+  const commandLines = [
+    "/approvals pending",
+    `/approve ${approveId} phase2 TUI approved`,
+    `/deny ${denyId} phase2 TUI denied`,
+    "/approvals approved",
+    "/approvals denied",
+    "/approve",
+  ];
+  const output: string[] = [];
+  for (const line of commandLines) {
+    const result = await runTuiApprovalCommandWithPlatform(platform, line);
+    output.push(...result.output);
+  }
+
+  const approvals = await platform.store.listApprovalRequests();
+  const approved = approvals.find((approval) => approval.id === approveId);
+  const denied = approvals.find((approval) => approval.id === denyId);
+  const auditEvents = await platform.store.listAuditEvents({ sessionId: session.id, limit: 100 });
+  const decisionAuditEvents = auditEvents.filter((event) => event.type === "tool.approved" || event.type === "tool.denied").length;
+  const pendingListed = output.some((line) => line.startsWith(`${approveId}\tpending\tworkspace.write`)) &&
+    output.some((line) => line.startsWith(`${denyId}\tpending\tdependency.install`));
+  const approvedDecisionPrinted = output.some((line) => line === `${approveId}\tapproved\tworkspace.write\tphase2 TUI approved`);
+  const deniedDecisionPrinted = output.some((line) => line === `${denyId}\tdenied\tdependency.install\tphase2 TUI denied`);
+  const approvedListed = output.some((line) => line.startsWith(`${approveId}\tapproved\tworkspace.write`));
+  const deniedListed = output.some((line) => line.startsWith(`${denyId}\tdenied\tdependency.install`));
+  const usageShown = output.includes("Usage: /approve <approval-id> [reason]");
+
+  return {
+    sessionId: session.id,
+    ok:
+      pendingListed &&
+      approvedDecisionPrinted &&
+      deniedDecisionPrinted &&
+      approvedListed &&
+      deniedListed &&
+      usageShown &&
+      approved?.status === "approved" &&
+      denied?.status === "denied" &&
+      approved.decisionReason === "phase2 TUI approved" &&
+      denied.decisionReason === "phase2 TUI denied" &&
+      decisionAuditEvents >= 2,
+    approvedStatus: approved?.status,
+    deniedStatus: denied?.status,
+    approvedReason: approved?.decisionReason,
+    deniedReason: denied?.decisionReason,
+    decisionAuditEvents,
+    outputLines: output.length,
+    usageShown,
   };
 }
 
@@ -10201,56 +10341,10 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
-      if (line === "/approvals" || line.startsWith("/approvals ")) {
-        const args = splitCliWords(line.slice("/approvals".length).trim());
-        const status = args[0] as "pending" | "approved" | "denied" | "expired" | "cancelled" | undefined;
-        const platform = await createLocalPlatform(workspace);
-        try {
-          printApprovalRequests(await platform.store.listApprovalRequests(status));
-        } finally {
-          platform.locks.close?.();
-          platform.store.close();
-        }
-        stdout.write("soloclaw> ");
-        continue;
-      }
-      if (line === "/approve" || line.startsWith("/approve ") || line === "/deny" || line.startsWith("/deny ")) {
-        const commandPrefix = line.startsWith("/deny") ? "/deny" : "/approve";
-        const parsed = parseApprovalArgs(splitCliWords(line.slice(commandPrefix.length).trim()));
-        const approvalId = parsed.positionals[0];
-        const reason = parsed.positionals.slice(1).join(" ").trim() || undefined;
-        if (!approvalId) {
-          console.log(`Usage: ${commandPrefix} <approval-id> [reason]`);
-          stdout.write("soloclaw> ");
-          continue;
-        }
-        if (parsed.options.autoReplay || parsed.options.autoResume || parsed.options.queueResumeWorkerId) {
-          console.log("TUI approval decisions do not run auto replay or resume. Use agent approve for replay/resume options.");
-          stdout.write("soloclaw> ");
-          continue;
-        }
-        const platform = await createLocalPlatform(workspace);
-        try {
-          const { approval } = await decideApprovalWithPolicy({
-            store: platform.store,
-            rooms: platform.rooms,
-            organizations: platform.organizations,
-            localAgent: platform.localAgent,
-            approvalId,
-            status: commandPrefix === "/approve" ? "approved" : "denied",
-            options: parsed.options,
-            reason,
-          });
-          if (!approval) {
-            console.log(`Approval not found: ${approvalId}`);
-          } else {
-            console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`);
-          }
-        } catch (error) {
-          console.log(error instanceof Error ? error.message : String(error));
-        } finally {
-          platform.locks.close?.();
-          platform.store.close();
+      const tuiApprovalCommand = await runTuiApprovalCommand(workspace, line);
+      if (tuiApprovalCommand.handled) {
+        for (const outputLine of tuiApprovalCommand.output) {
+          console.log(outputLine);
         }
         stdout.write("soloclaw> ");
         continue;
@@ -11506,19 +11600,101 @@ async function appendApprovalDecisionRoomMessage(
   });
 }
 
-function printApprovalRequests(approvals: ApprovalRequest[]): void {
-  for (const approval of approvals) {
-    console.log(
-      `${approval.id}\t${approval.status}\t${approval.action}\t${approval.createdAt}\t${approval.toolName ?? "-"}\t${approval.reason}`,
-    );
+type LocalPlatform = Awaited<ReturnType<typeof createLocalPlatform>>;
+
+type TuiApprovalCommandResult = {
+  handled: boolean;
+  output: string[];
+};
+
+async function runTuiApprovalCommand(workspace: string, line: string): Promise<TuiApprovalCommandResult> {
+  if (!isTuiApprovalCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  const platform = await createLocalPlatform(workspace);
+  try {
+    return await runTuiApprovalCommandWithPlatform(platform, line);
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
   }
 }
 
+async function runTuiApprovalCommandWithPlatform(platform: LocalPlatform, line: string): Promise<TuiApprovalCommandResult> {
+  if (line === "/approvals" || line.startsWith("/approvals ")) {
+    const args = splitCliWords(line.slice("/approvals".length).trim());
+    const status = args[0] as ApprovalStatus | undefined;
+    return {
+      handled: true,
+      output: (await platform.store.listApprovalRequests(status)).map(formatApprovalRequest),
+    };
+  }
+
+  if (line === "/approve" || line.startsWith("/approve ") || line === "/deny" || line.startsWith("/deny ")) {
+    const commandPrefix = line.startsWith("/deny") ? "/deny" : "/approve";
+    const parsed = parseApprovalArgs(splitCliWords(line.slice(commandPrefix.length).trim()));
+    const approvalId = parsed.positionals[0];
+    const reason = parsed.positionals.slice(1).join(" ").trim() || undefined;
+    if (!approvalId) {
+      return { handled: true, output: [`Usage: ${commandPrefix} <approval-id> [reason]`] };
+    }
+    if (parsed.options.autoReplay || parsed.options.autoResume || parsed.options.queueResumeWorkerId) {
+      return {
+        handled: true,
+        output: ["TUI approval decisions do not run auto replay or resume. Use agent approve for replay/resume options."],
+      };
+    }
+    try {
+      const { approval } = await decideApprovalWithPolicy({
+        store: platform.store,
+        rooms: platform.rooms,
+        organizations: platform.organizations,
+        localAgent: platform.localAgent,
+        approvalId,
+        status: commandPrefix === "/approve" ? "approved" : "denied",
+        options: parsed.options,
+        reason,
+      });
+      return {
+        handled: true,
+        output: [approval ? formatApprovalDecision(approval) : `Approval not found: ${approvalId}`],
+      };
+    } catch (error) {
+      return { handled: true, output: [error instanceof Error ? error.message : String(error)] };
+    }
+  }
+
+  return { handled: false, output: [] };
+}
+
+function isTuiApprovalCommand(line: string): boolean {
+  return line === "/approvals" ||
+    line.startsWith("/approvals ") ||
+    line === "/approve" ||
+    line.startsWith("/approve ") ||
+    line === "/deny" ||
+    line.startsWith("/deny ");
+}
+
+function printApprovalRequests(approvals: ApprovalRequest[]): void {
+  for (const approval of approvals) {
+    console.log(formatApprovalRequest(approval));
+  }
+}
+
+function formatApprovalRequest(approval: ApprovalRequest): string {
+  return `${approval.id}\t${approval.status}\t${approval.action}\t${approval.createdAt}\t${approval.toolName ?? "-"}\t${approval.reason}`;
+}
+
+function formatApprovalDecision(approval: ApprovalRequest): string {
+  return `${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`;
+}
+
 async function decideApprovalWithPolicy(input: {
-  store: Awaited<ReturnType<typeof createLocalPlatform>>["store"];
-  rooms: Awaited<ReturnType<typeof createLocalPlatform>>["rooms"];
-  organizations: Awaited<ReturnType<typeof createLocalPlatform>>["organizations"];
-  localAgent: Awaited<ReturnType<typeof createLocalPlatform>>["localAgent"];
+  store: LocalPlatform["store"];
+  rooms: LocalPlatform["rooms"];
+  organizations: LocalPlatform["organizations"];
+  localAgent: LocalPlatform["localAgent"];
   approvalId: string;
   status: "approved" | "denied";
   options: Pick<ApprovalCliOptions, "actor" | "localAgent">;
@@ -11543,16 +11719,43 @@ async function decideApprovalWithPolicy(input: {
     decisionReason: input.reason,
   });
   if (approval) {
+    await recordApprovalDecisionAuditEvent(input.store, approval, decidedBy);
     await appendApprovalDecisionRoomMessage(input.store, approval, decidedBy);
   }
   return { approval: approval ?? undefined, decidedBy };
 }
 
+async function recordApprovalDecisionAuditEvent(
+  store: LocalPlatform["store"],
+  approval: ApprovalRequest,
+  decidedBy: ActorRef,
+): Promise<void> {
+  await store.recordAuditEvent({
+    id: makeId<"ArtifactId">("audit"),
+    type: approval.status === "approved" ? "tool.approved" : "tool.denied",
+    actor: decidedBy,
+    orgId: approval.orgId,
+    projectId: approval.projectId,
+    roomId: approval.roomId,
+    sessionId: approval.sessionId,
+    summary: `${approval.action} ${approval.status}: ${approval.id}`,
+    metadata: {
+      approvalId: approval.id,
+      approvalStatus: approval.status,
+      action: approval.action,
+      toolName: approval.toolName,
+      hasDecisionReason: Boolean(approval.decisionReason),
+    },
+    artifactRefs: [],
+    createdAt: approval.decidedAt ?? new Date().toISOString(),
+  });
+}
+
 async function ensureApprovalDecisionAllowed(input: {
   approval: ApprovalRequest;
   decidedBy: ActorRef;
-  rooms: Awaited<ReturnType<typeof createLocalPlatform>>["rooms"];
-  organizations: Awaited<ReturnType<typeof createLocalPlatform>>["organizations"];
+  rooms: LocalPlatform["rooms"];
+  organizations: LocalPlatform["organizations"];
 }): Promise<void> {
   const hasScopedApproval = Boolean(input.approval.orgId || input.approval.projectId || input.approval.roomId || input.approval.sessionId);
   if (!hasScopedApproval) {
