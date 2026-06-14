@@ -16510,6 +16510,11 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(html, /renderArtifacts/);
   assert.match(html, /renderRetention/);
   assert.match(html, /renderAudit/);
+  assert.match(html, /id="session-inspection"/);
+  assert.match(html, /loadSessionInspection/);
+  assert.match(html, /renderSessionInspection/);
+  assert.match(html, /sessionInspectionItem/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/inspect/);
   assert.match(html, /operator\.queue/);
   assert.match(html, /operator\?\.workers/);
   assert.match(html, /operator\?\.assignments/);

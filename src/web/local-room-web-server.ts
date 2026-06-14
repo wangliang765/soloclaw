@@ -983,6 +983,11 @@ function renderAppHtml(): string {
     .operator-stat { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px; min-width: 0; }
     .operator-stat strong { display: block; font-size: 16px; line-height: 1.2; }
     .approval, .session { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: grid; gap: 7px; }
+    .session-inspection { display: grid; gap: 8px; }
+    .session-inspection-head { display: grid; gap: 4px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+    .session-inspection-section { display: grid; gap: 5px; }
+    .session-inspection-list { display: grid; gap: 6px; }
+    .session-inspection-item { border-left: 3px solid var(--line); padding: 4px 0 4px 8px; display: grid; gap: 3px; min-width: 0; }
     .health-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
     .health-stat { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px; min-width: 0; }
     .health-stat strong { display: block; font-size: 16px; line-height: 1.2; }
@@ -1098,6 +1103,10 @@ function renderAppHtml(): string {
         <h2>Sessions</h2>
         <div class="queue" id="sessions"></div>
       </section>
+      <section class="section">
+        <h2>Session Inspect</h2>
+        <div id="session-inspection"></div>
+      </section>
     </aside>
   </div>
   <script>
@@ -1105,6 +1114,8 @@ function renderAppHtml(): string {
     let selectedRoomId = null;
     let selectedOperatorDetail = null;
     let selectedOperatorItemId = null;
+    let selectedSessionInspection = null;
+    let selectedSessionInspectionId = null;
     const controlToken = new URLSearchParams(window.location.search).get('token') || '';
 
     function apiFetch(path, options = {}) {
@@ -1135,6 +1146,7 @@ function renderAppHtml(): string {
       renderAudit();
       renderApprovals();
       renderSessions();
+      renderSessionInspection();
     }
 
     function renderRooms() {
@@ -1669,6 +1681,11 @@ function renderAppHtml(): string {
       const root = document.getElementById('sessions');
       root.textContent = '';
       const operatorSessions = state.operator?.sessions || [];
+      const visibleSessionIds = new Set(state.sessions.map((session) => session.id));
+      if (selectedSessionInspectionId && !visibleSessionIds.has(selectedSessionInspectionId)) {
+        selectedSessionInspection = null;
+        selectedSessionInspectionId = null;
+      }
       if (state.sessions.length === 0) {
         root.append(empty('No sessions'));
         return;
@@ -1694,6 +1711,11 @@ function renderAppHtml(): string {
     function sessionActions(session) {
       const controls = document.createElement('div');
       controls.className = 'actions';
+      const inspect = document.createElement('button');
+      inspect.type = 'button';
+      inspect.textContent = 'Inspect';
+      inspect.onclick = () => loadSessionInspection(session.id);
+      controls.append(inspect);
       if (session.status === 'created' || session.status === 'running' || session.status === 'failed') {
         controls.append(sessionActionButton(session.id, 'pause', 'Pause'));
       }
@@ -1713,6 +1735,84 @@ function renderAppHtml(): string {
       button.textContent = label;
       button.onclick = () => changeSessionState(sessionId, action);
       return button;
+    }
+
+    async function loadSessionInspection(sessionId) {
+      const response = await apiFetch('/api/sessions/' + encodeURIComponent(sessionId) + '/inspect');
+      if (!response.ok) {
+        alert((await response.json()).error || 'Request failed');
+        return;
+      }
+      selectedSessionInspection = await response.json();
+      selectedSessionInspectionId = sessionId;
+      renderSessionInspection();
+    }
+
+    function renderSessionInspection() {
+      const root = document.getElementById('session-inspection');
+      root.textContent = '';
+      if (!selectedSessionInspection) {
+        root.append(empty('No session inspected'));
+        return;
+      }
+      const view = selectedSessionInspection;
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.summary?.inspectionState || 'unknown', 'status ' + (view.summary?.inspectionState || 'unknown')));
+      head.append(text('div', (view.summary?.outcome || '-') + ' | ' + (view.summary?.status || '-') + ' | target=' + (view.summary?.targetMode || '-'), 'meta'));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text('div', view.summary?.inspectionSummary || view.inspection?.summary || '-', 'meta'));
+      const focusPaths = view.summary?.inspectionFocusPaths || view.inspection?.focusPaths || [];
+      panel.append(text('div', 'focus=' + (focusPaths.length > 0 ? focusPaths.join(', ') : '-'), 'meta'));
+
+      const issues = view.inspection?.issues || [];
+      const issuesSection = document.createElement('div');
+      issuesSection.className = 'session-inspection-section';
+      issuesSection.append(text('strong', 'Issues'));
+      const issueList = document.createElement('div');
+      issueList.className = 'session-inspection-list';
+      if (issues.length === 0) {
+        issueList.append(empty('No inspection issues'));
+      } else {
+        for (const issue of issues) {
+          issueList.append(sessionInspectionItem(issue.label || issue.id || 'issue', issue.severity || 'info', issue.summary || '-', issue.command));
+        }
+      }
+      issuesSection.append(issueList);
+      panel.append(issuesSection);
+
+      const actions = view.nextActions || [];
+      const actionsSection = document.createElement('div');
+      actionsSection.className = 'session-inspection-section';
+      actionsSection.append(text('strong', 'Next actions'));
+      const actionList = document.createElement('div');
+      actionList.className = 'session-inspection-list';
+      if (actions.length === 0) {
+        actionList.append(empty('No next actions'));
+      } else {
+        for (const action of actions) {
+          actionList.append(sessionInspectionItem(action.label || action.id || 'action', action.status || 'optional', action.reason || '-', action.command));
+        }
+      }
+      actionsSection.append(actionList);
+      panel.append(actionsSection);
+      root.append(panel);
+    }
+
+    function sessionInspectionItem(label, status, summary, command) {
+      const item = document.createElement('div');
+      item.className = 'session-inspection-item';
+      item.append(row(label, status, 'status ' + status));
+      item.append(text('div', summary, 'meta'));
+      if (command) {
+        item.append(text('div', command, 'meta'));
+      }
+      return item;
     }
 
     async function changeSessionState(sessionId, action) {
