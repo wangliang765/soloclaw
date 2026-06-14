@@ -10088,7 +10088,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session status <id>, /session inspect <id>, /session timeline <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -10119,10 +10119,13 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /agent               Show local agent execution status");
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
         console.log("  /agent logs          Show merged local execution logs");
+        console.log("  /session diff <session-id> Show persisted patch diff");
         console.log("  /session status <session-id> Show session status snapshot");
         console.log("  /session inspect <session-id> Show focused session inspection");
         console.log("  /session timeline <session-id> Show safe session timeline");
         console.log("  /session logs <session-id> Show safe session timeline");
+        console.log("  /session review <session-id> Show operator review package");
+        console.log("  /session result <session-id> Show session result summary");
         console.log("  /check               Run the local readiness check");
         console.log("  /doctor              Run the local readiness check");
         console.log("  /inspect             Print the current workspace snapshot");
@@ -10206,6 +10209,29 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
+      if (line === "/session diff" || line.startsWith("/session diff ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session diff".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session diff <session-id> [--json]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const diff = await buildSessionDiff(platform.store, sessionId);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(diff, null, 2));
+          } else {
+            printSessionDiff(diff);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
       if (line === "/session status" || line.startsWith("/session status ")) {
         const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session status".length).trim()));
         const sessionId = parsed.positionals[0];
@@ -10268,6 +10294,52 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
             console.log(JSON.stringify(timeline, null, 2));
           } else {
             printSessionTimeline(timeline);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session review" || line.startsWith("/session review ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session review".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session review <session-id> [--json] [--limit n]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const review = await buildSessionReview(platform.store, sessionId, { limit: parsed.options.limit });
+          if (parsed.options.json) {
+            console.log(JSON.stringify(review, null, 2));
+          } else {
+            printSessionReview(review);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session result" || line.startsWith("/session result ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session result".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session result <session-id> [--json]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const result = await buildSessionResult(platform.store, sessionId);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(result, null, 2));
+          } else {
+            printSessionResult(result);
           }
         } finally {
           platform.locks.close?.();

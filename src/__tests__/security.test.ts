@@ -1833,24 +1833,40 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
     dir,
     [
       "/help",
+      `/session diff ${session.id}`,
+      `/session diff ${session.id} --json`,
       `/session status ${session.id} --limit 10`,
       `/session status ${session.id} --json --limit 2`,
       `/session inspect ${session.id}`,
       `/session inspect ${session.id} --json`,
       `/session timeline ${session.id} --limit 10`,
       `/session logs ${session.id} --json --limit 10`,
+      `/session review ${session.id} --limit 10`,
+      `/session review ${session.id} --json --limit 2`,
+      `/session result ${session.id}`,
+      `/session result ${session.id} --json`,
+      "/session diff",
       "/session status",
       "/session timeline",
       "/session inspect",
+      "/session review",
+      "/session result",
       "/exit",
       "",
     ].join("\n"),
   );
   assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /\/session diff <session-id>\s+Show persisted patch diff/);
   assert.match(result.stdout, /\/session status <session-id>\s+Show session status snapshot/);
   assert.match(result.stdout, /\/session inspect <session-id>\s+Show focused session inspection/);
   assert.match(result.stdout, /\/session timeline <session-id>\s+Show safe session timeline/);
   assert.match(result.stdout, /\/session logs <session-id>\s+Show safe session timeline/);
+  assert.match(result.stdout, /\/session review <session-id>\s+Show operator review package/);
+  assert.match(result.stdout, /\/session result <session-id>\s+Show session result summary/);
+  assert.match(result.stdout, new RegExp(`Session diff: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /diffStats=files:1,\+1,-1/);
+  assert.match(result.stdout, /diff --git a\/src\/math\.js b\/src\/math\.js/);
+  assert.match(result.stdout, /"patches": 1/);
   assert.match(result.stdout, new RegExp(`Session status: ${escapeRegExp(session.id)}`));
   assert.match(result.stdout, /inspection=blocked/);
   assert.match(result.stdout, /Latest timeline:/);
@@ -1866,9 +1882,20 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
   assert.match(result.stdout, /path=src\/math\.js/);
   assert.match(result.stdout, /approval requested workspace\.write/);
   assert.match(result.stdout, /"file_change": 1/);
+  assert.match(result.stdout, new RegExp(`Session review: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /state=waiting_for_approval/);
+  assert.match(result.stdout, /Checklist:/);
+  assert.match(result.stdout, /"reviewState": "waiting_for_approval"/);
+  assert.match(result.stdout, new RegExp(`Session result: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /outcome=succeeded/);
+  assert.match(result.stdout, /Changed files:/);
+  assert.match(result.stdout, /"outcome": "succeeded"/);
+  assert.match(result.stdout, /Usage: \/session diff <session-id> \[--json\]/);
   assert.match(result.stdout, /Usage: \/session status <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session timeline <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session inspect <session-id> \[--json\]/);
+  assert.match(result.stdout, /Usage: \/session review <session-id> \[--json\] \[--limit n\]/);
+  assert.match(result.stdout, /Usage: \/session result <session-id> \[--json\]/);
   assert.match(result.stdout, /bye/);
 });
 
