@@ -4982,6 +4982,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionDiffStats: UnifiedDiffStats;
     sessionDiffFileSummaries: UnifiedDiffFileSummary[];
     sessionDiffReviewProfile: UnifiedDiffReviewProfile;
+    sessionDiffInspectionPlan: UnifiedDiffInspectionPlan;
     sessionReportFileChanges: number;
     sessionReportToolResults: number;
     sessionReportCommandsFinished: number;
@@ -4990,6 +4991,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReportDiffStats: UnifiedDiffStats;
     sessionReportFileSummaries: UnifiedDiffFileSummary[];
     sessionReportReviewProfile: UnifiedDiffReviewProfile;
+    sessionReportInspectionPlan: UnifiedDiffInspectionPlan;
     sessionReportPendingApprovals: number;
     sessionResultOutcome?: string;
     sessionResultRecovered: boolean;
@@ -4999,6 +5001,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultDiffStats: UnifiedDiffStats;
     sessionResultFileSummaries: UnifiedDiffFileSummary[];
     sessionResultReviewProfile: UnifiedDiffReviewProfile;
+    sessionResultInspectionPlan: UnifiedDiffInspectionPlan;
     sessionResultPendingApprovals: number;
     sessionResultChangedPaths: string[];
     sessionResultNextActions: number;
@@ -5066,6 +5069,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewDiffStats: UnifiedDiffStats;
     sessionReviewFileSummaries: UnifiedDiffFileSummary[];
     sessionReviewReviewProfile: UnifiedDiffReviewProfile;
+    sessionReviewInspectionPlan: UnifiedDiffInspectionPlan;
     sessionReviewTimelineItems: number;
     sessionReviewNextActions: number;
     sessionReviewNextActionStatuses: Record<string, number>;
@@ -5092,6 +5096,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionBundleHandoffRequiredActions: number;
     sessionBundleHandoffNextCommand?: string;
     sessionBundleReviewProfile: UnifiedDiffReviewProfile;
+    sessionBundleInspectionPlan: UnifiedDiffInspectionPlan;
     sessionBundleLocalAgentState?: string;
     sessionBundleLocalAgentDaemonState?: string;
     sessionBundleLocalAgentLogItems: number;
@@ -5421,6 +5426,20 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       label: "session diff review profile evidence",
       status: sessionReviewProfilePass ? "pass" : "fail",
       summary: sessionDiff.summary.reviewProfile.reviewHint,
+    });
+    const sessionDiffInspectionPlanPass =
+      sessionDiff.summary.inspectionPlan.state === "ready" &&
+      sessionDiff.summary.inspectionPlan.items.length === 1 &&
+      sessionDiff.summary.inspectionPlan.items[0]?.path === "src/math.js" &&
+      sessionDiff.summary.inspectionPlan.items[0]?.priority === 1 &&
+      sessionDiff.summary.inspectionPlan.items[0]?.changedLines === 2 &&
+      sessionDiff.summary.inspectionPlan.items[0]?.command.includes(`agent session diff ${session.id}`) &&
+      sessionDiff.summary.inspectionPlan.focusPaths.includes("src/math.js");
+    checks.push({
+      id: "session-diff-inspection-plan-evidence",
+      label: "session diff inspection plan evidence",
+      status: sessionDiffInspectionPlanPass ? "pass" : "fail",
+      summary: sessionDiff.summary.inspectionPlan.summary,
     });
 
     const sessionReport = await buildSessionReport(platform.store, session.id);
@@ -5981,6 +6000,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionDiffStats: sessionDiff.summary.diffStats,
         sessionDiffFileSummaries: sessionDiff.summary.fileSummaries,
         sessionDiffReviewProfile: sessionDiff.summary.reviewProfile,
+        sessionDiffInspectionPlan: sessionDiff.summary.inspectionPlan,
         sessionReportFileChanges: sessionReport.summary.fileChanges,
         sessionReportToolResults: sessionReport.summary.toolResults,
         sessionReportCommandsFinished: sessionReport.summary.commandsFinished,
@@ -5989,6 +6009,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReportDiffStats: sessionReport.summary.diffStats,
         sessionReportFileSummaries: sessionReport.summary.fileSummaries,
         sessionReportReviewProfile: sessionReport.summary.reviewProfile,
+        sessionReportInspectionPlan: sessionReport.summary.inspectionPlan,
         sessionReportPendingApprovals: sessionReport.summary.pendingApprovals,
         sessionResultOutcome: sessionResult.summary.outcome,
         sessionResultRecovered: sessionResult.summary.recovered,
@@ -5998,6 +6019,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultDiffStats: sessionResult.summary.diffStats,
         sessionResultFileSummaries: sessionResult.summary.fileSummaries,
         sessionResultReviewProfile: sessionResult.summary.reviewProfile,
+        sessionResultInspectionPlan: sessionResult.summary.inspectionPlan,
         sessionResultPendingApprovals: sessionResult.summary.pendingApprovals,
         sessionResultChangedPaths: sessionResult.summary.changedPaths,
         sessionResultNextActions: sessionResult.summary.nextActions,
@@ -6065,6 +6087,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewDiffStats: sessionReview.changes.diffStats,
         sessionReviewFileSummaries: sessionReview.changes.fileSummaries,
         sessionReviewReviewProfile: sessionReview.changes.reviewProfile,
+        sessionReviewInspectionPlan: sessionReview.changes.inspectionPlan,
         sessionReviewTimelineItems: sessionReview.summary.timelineItems,
         sessionReviewNextActions: sessionReview.summary.nextActions,
         sessionReviewNextActionStatuses: sessionReview.summary.nextActionStatuses,
@@ -6091,6 +6114,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleHandoffRequiredActions: sessionBundle.summary.handoffRequiredActions,
         sessionBundleHandoffNextCommand: sessionBundle.summary.handoffNextCommand,
         sessionBundleReviewProfile: sessionBundle.summary.reviewProfile,
+        sessionBundleInspectionPlan: sessionBundle.summary.inspectionPlan,
         sessionBundleLocalAgentState: sessionBundle.summary.localAgentState,
         sessionBundleLocalAgentDaemonState: sessionBundle.summary.localAgentDaemonState,
         sessionBundleLocalAgentLogItems: sessionBundle.summary.localAgentLogItems,
@@ -6249,6 +6273,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionDiffStats=${formatDiffStats(result.evidence.sessionDiffStats)}`);
   console.log(`- sessionDiffFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionDiffFileSummaries)}`);
   console.log(`- sessionDiffReviewProfile=${formatDiffReviewProfile(result.evidence.sessionDiffReviewProfile)}`);
+  console.log(`- sessionDiffInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionDiffInspectionPlan)}`);
   console.log(`- sessionReportFileChanges=${result.evidence.sessionReportFileChanges}`);
   console.log(`- sessionReportToolResults=${result.evidence.sessionReportToolResults}`);
   console.log(`- sessionReportCommandsFinished=${result.evidence.sessionReportCommandsFinished}`);
@@ -6257,6 +6282,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReportDiffStats=${formatDiffStats(result.evidence.sessionReportDiffStats)}`);
   console.log(`- sessionReportFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReportFileSummaries)}`);
   console.log(`- sessionReportReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReportReviewProfile)}`);
+  console.log(`- sessionReportInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionReportInspectionPlan)}`);
   console.log(`- sessionResultOutcome=${result.evidence.sessionResultOutcome ?? "-"}`);
   console.log(`- sessionResultRecovered=${result.evidence.sessionResultRecovered}`);
   console.log(`- sessionResultCommandsFinished=${result.evidence.sessionResultCommandsFinished}`);
@@ -6265,6 +6291,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionResultDiffStats=${formatDiffStats(result.evidence.sessionResultDiffStats)}`);
   console.log(`- sessionResultFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionResultFileSummaries)}`);
   console.log(`- sessionResultReviewProfile=${formatDiffReviewProfile(result.evidence.sessionResultReviewProfile)}`);
+  console.log(`- sessionResultInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionResultInspectionPlan)}`);
   console.log(`- sessionResultChangedPaths=${result.evidence.sessionResultChangedPaths.join(",") || "-"}`);
   console.log(
     `- sessionResultInspection=${result.evidence.sessionResultInspectionState ?? "-"} issues=${result.evidence.sessionResultInspectionIssues} ` +
@@ -6318,6 +6345,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewDiffStats=${formatDiffStats(result.evidence.sessionReviewDiffStats)}`);
   console.log(`- sessionReviewFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReviewFileSummaries)}`);
   console.log(`- sessionReviewReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReviewReviewProfile)}`);
+  console.log(`- sessionReviewInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionReviewInspectionPlan)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
   console.log(`- sessionReviewInspection=${result.evidence.sessionReviewInspectionState ?? "-"} issues=${result.evidence.sessionReviewInspectionIssues}`);
   console.log(
@@ -6345,6 +6373,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   );
   console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
   console.log(`- sessionBundleReviewProfile=${formatDiffReviewProfile(result.evidence.sessionBundleReviewProfile)}`);
+  console.log(`- sessionBundleInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionBundleInspectionPlan)}`);
   console.log(`- sessionBundleLocalAgent=${result.evidence.sessionBundleLocalAgentState ?? "-"}/${result.evidence.sessionBundleLocalAgentDaemonState ?? "-"} logs=${result.evidence.sessionBundleLocalAgentLogItems}`);
   console.log(`- timeoutCommandTimedOut=${result.evidence.timeoutCommandTimedOut}`);
   console.log(`- runSessionId=${result.evidence.runSessionId ?? "-"}`);
@@ -7107,6 +7136,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
   const diffStats = mergeDiffStats(patchDiffs.map((patch) => patch.stats));
   const fileSummaries = summarizeDiffFileSummaries(patchDiffs);
   const reviewProfile = buildDiffReviewProfile({ patches: patchDiffs.length, diffStats, fileSummaries });
+  const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const approvedApprovals = approvals.filter((approval) => approval.status === "approved");
   const deniedApprovals = approvals.filter((approval) => approval.status === "denied");
@@ -7128,6 +7158,7 @@ async function buildSessionReport(store: AgentStore, sessionId: string) {
       diffStats,
       fileSummaries,
       reviewProfile,
+      inspectionPlan,
       approvals: approvals.length,
       pendingApprovals: pendingApprovals.length,
       approvedApprovals: approvedApprovals.length,
@@ -7196,6 +7227,7 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
   console.log(`- diffStats=${formatDiffStats(report.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(report.summary.fileSummaries)}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(report.summary.reviewProfile)}`);
+  console.log(`- inspectionPlan=${formatDiffInspectionPlan(report.summary.inspectionPlan)}`);
   console.log(`- approvals=${report.summary.approvals} pending=${report.summary.pendingApprovals}`);
   console.log(
     `- modelCalls=${report.summary.modelCalls} ok=${report.summary.modelSuccessfulCalls} ` +
@@ -7208,6 +7240,10 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
     for (const entry of report.modelUsage.entries) {
       console.log(`- ${formatModelUsageEntry(entry)}`);
     }
+  }
+  if (report.summary.inspectionPlan.items.length > 0) {
+    console.log("");
+    printDiffInspectionPlan(report.summary.inspectionPlan);
   }
   if (report.fileChanges.length > 0) {
     console.log("");
@@ -7343,6 +7379,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
       reviewProfile: result.summary.reviewProfile,
+      inspectionPlan: result.summary.inspectionPlan,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -8101,6 +8138,7 @@ async function buildSessionEvidenceBundle(
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
       reviewProfile: result.summary.reviewProfile,
+      inspectionPlan: result.summary.inspectionPlan,
       commandsFinished: result.summary.commandsFinished,
       failedCommands: result.summary.failedCommands,
       timedOutCommands: result.summary.timedOutCommands,
@@ -8191,6 +8229,7 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- fileChanges=${bundle.summary.fileChanges} patches=${bundle.summary.patches} diffStats=${formatDiffStats(bundle.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(bundle.summary.fileSummaries)}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(bundle.summary.reviewProfile)}`);
+  console.log(`- inspectionPlan=${formatDiffInspectionPlan(bundle.summary.inspectionPlan)}`);
   console.log(`- commandsFinished=${bundle.summary.commandsFinished} failed=${bundle.summary.failedCommands} timedOut=${bundle.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(bundle.summary.executionProfiles)}`);
   console.log(`- approvals=${bundle.summary.approvals} pending=${bundle.summary.pendingApprovals}`);
@@ -8215,6 +8254,10 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(`- verificationChecks=${bundle.sections.verification.checks.length}`);
   if (bundle.output) {
     console.log(`- output=${bundle.output.path} bytes=${bundle.output.bytes}`);
+  }
+  if (bundle.summary.inspectionPlan.items.length > 0) {
+    console.log("");
+    printDiffInspectionPlan(bundle.summary.inspectionPlan);
   }
   console.log("");
   console.log("Sections:");
@@ -8285,6 +8328,7 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- diffStats=${formatDiffStats(status.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(status.summary.fileSummaries)}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(status.summary.reviewProfile)}`);
+  console.log(`- inspectionPlan=${formatDiffInspectionPlan(status.summary.inspectionPlan)}`);
   console.log(`- pendingApprovals=${status.summary.pendingApprovals}`);
   console.log(`- toolResults=${status.summary.toolResults} failed=${status.summary.failedToolResults}`);
   console.log(
@@ -8301,6 +8345,10 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   );
   console.log(`- nextActions=${status.summary.nextActions} statuses=${formatRecordCounts(status.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
+  if (status.summary.inspectionPlan.items.length > 0) {
+    console.log("");
+    printDiffInspectionPlan(status.summary.inspectionPlan);
+  }
   if (status.latestTimeline.length > 0) {
     console.log("");
     console.log("Latest timeline:");
@@ -8393,6 +8441,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       diffStats: result.summary.diffStats,
       fileSummaries: result.summary.fileSummaries,
       reviewProfile: result.summary.reviewProfile,
+      inspectionPlan: result.summary.inspectionPlan,
       pendingApprovals: result.summary.pendingApprovals,
       toolResults: result.summary.toolResults,
       failedToolResults: result.summary.failedToolResults,
@@ -8425,6 +8474,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       fileChanges: result.fileChanges,
       fileSummaries: diff.summary.fileSummaries,
       reviewProfile: diff.summary.reviewProfile,
+      inspectionPlan: diff.summary.inspectionPlan,
       patches: diff.patches.map((patch) => ({
         ordinal: patch.ordinal,
         createdAt: patch.createdAt,
@@ -8544,6 +8594,7 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(`- diffStats=${formatDiffStats(review.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(review.summary.fileSummaries)}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(review.summary.reviewProfile)}`);
+  console.log(`- inspectionPlan=${formatDiffInspectionPlan(review.summary.inspectionPlan)}`);
   console.log(`- commandsFinished=${review.summary.commandsFinished} failed=${review.summary.failedCommands} timedOut=${review.summary.timedOutCommands}`);
   console.log(`- pendingApprovals=${review.summary.pendingApprovals}`);
   console.log(
@@ -8578,6 +8629,10 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
     for (const summary of review.changes.fileSummaries) {
       console.log(`- ${formatDiffFileSummary(summary)}\t${summary.reviewHint}`);
     }
+  }
+  if (review.changes.inspectionPlan.items.length > 0) {
+    console.log("");
+    printDiffInspectionPlan(review.changes.inspectionPlan);
   }
   if (review.commands.length > 0) {
     console.log("");
@@ -9138,6 +9193,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       diffStats: diff.summary.diffStats,
       fileSummaries: diff.summary.fileSummaries,
       reviewProfile: diff.summary.reviewProfile,
+      inspectionPlan: diff.summary.inspectionPlan,
       approvals: report.summary.approvals,
       pendingApprovals: report.summary.pendingApprovals,
       approvedApprovals: report.summary.approvedApprovals,
@@ -9272,6 +9328,7 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- diffStats=${formatDiffStats(result.summary.diffStats)}`);
   console.log(`- fileSummaries=${formatDiffFileSummaryList(result.summary.fileSummaries)}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(result.summary.reviewProfile)}`);
+  console.log(`- inspectionPlan=${formatDiffInspectionPlan(result.summary.inspectionPlan)}`);
   console.log(`- commandsFinished=${result.summary.commandsFinished} failed=${result.summary.failedCommands} timedOut=${result.summary.timedOutCommands}`);
   console.log(`- executionProfiles=${formatRecordCounts(result.summary.executionProfiles)}`);
   console.log(`- approvals=${result.summary.approvals} pending=${result.summary.pendingApprovals}`);
@@ -9295,6 +9352,10 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
     for (const entry of result.modelUsage.entries) {
       console.log(`- ${formatModelUsageEntry(entry)}`);
     }
+  }
+  if (result.summary.inspectionPlan.items.length > 0) {
+    console.log("");
+    printDiffInspectionPlan(result.summary.inspectionPlan);
   }
   if (result.recovery.observedFailure) {
     const failed = result.recovery.firstFailedCommand;
@@ -9597,6 +9658,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
   const diffStats = mergeDiffStats(patches.map((patch) => patch.stats));
   const fileSummaries = summarizeDiffFileSummaries(patches);
   const reviewProfile = buildDiffReviewProfile({ patches: patches.length, diffStats, fileSummaries });
+  const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
   return {
     generatedAt: new Date().toISOString(),
     session,
@@ -9607,6 +9669,7 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
       diffStats,
       fileSummaries,
       reviewProfile,
+      inspectionPlan,
     },
     patches,
     fileChanges,
@@ -9618,6 +9681,7 @@ function printSessionDiff(diff: Awaited<ReturnType<typeof buildSessionDiff>>): v
   console.log(`status=${diff.session.status}\tpatches=${diff.summary.patches}\tfileChanges=${diff.summary.fileChanges}`);
   console.log(`diffStats=${formatDiffStats(diff.summary.diffStats)}`);
   console.log(`reviewProfile=${formatDiffReviewProfile(diff.summary.reviewProfile)}`);
+  console.log(`inspectionPlan=${formatDiffInspectionPlan(diff.summary.inspectionPlan)}`);
   if (diff.summary.changedPaths.length > 0) {
     console.log(`changedPaths=${diff.summary.changedPaths.join(",")}`);
   }
@@ -9626,6 +9690,9 @@ function printSessionDiff(diff: Awaited<ReturnType<typeof buildSessionDiff>>): v
     for (const summary of diff.summary.fileSummaries) {
       console.log(`- ${formatDiffFileSummary(summary)}\t${summary.reviewHint}`);
     }
+  }
+  if (diff.summary.inspectionPlan.items.length > 0) {
+    printDiffInspectionPlan(diff.summary.inspectionPlan);
   }
   if (diff.patches.length === 0) {
     console.log("No apply_patch audit events found for this session.");
@@ -9694,6 +9761,30 @@ type UnifiedDiffReviewProfile = {
     changeType: UnifiedDiffChangeType;
     reviewSize: UnifiedDiffReviewSize;
   };
+};
+
+type UnifiedDiffInspectionPlanState = "none" | "ready";
+
+type UnifiedDiffInspectionPlanItem = UnifiedDiffPathStats & {
+  priority: number;
+  changedLines: number;
+  changeType: UnifiedDiffChangeType;
+  patches: number;
+  reviewSize: UnifiedDiffReviewSize;
+  reason: string;
+  command: string;
+};
+
+type UnifiedDiffInspectionPlan = {
+  state: UnifiedDiffInspectionPlanState;
+  summary: string;
+  focusPaths: string[];
+  commands: {
+    diff: string;
+    review: string;
+    result: string;
+  };
+  items: UnifiedDiffInspectionPlanItem[];
 };
 
 type UnifiedDiffStats = {
@@ -9841,6 +9932,95 @@ function buildDiffReviewProfile(input: {
     changeTypeCounts,
     largestFile,
   };
+}
+
+function buildDiffInspectionPlan(sessionId: string, input: {
+  reviewProfile: UnifiedDiffReviewProfile;
+  fileSummaries: UnifiedDiffFileSummary[];
+}): UnifiedDiffInspectionPlan {
+  const ordered = input.fileSummaries
+    .slice()
+    .sort(compareDiffInspectionFileSummaries);
+  const items = ordered.map((summary, index) => ({
+    priority: index + 1,
+    path: summary.path,
+    additions: summary.additions,
+    deletions: summary.deletions,
+    changedLines: summary.additions + summary.deletions,
+    changeType: summary.changeType,
+    patches: summary.patches,
+    reviewSize: summary.reviewSize,
+    reason: diffInspectionReason(summary),
+    command: `agent session diff ${sessionId}`,
+  }));
+  const focusPaths = items.slice(0, 5).map((item) => item.path);
+  const state: UnifiedDiffInspectionPlanState = items.length > 0 ? "ready" : "none";
+  return {
+    state,
+    summary: state === "ready"
+      ? `Review ${items.length} changed file(s) in priority order; ${input.reviewProfile.reviewHint}; focus=${focusPaths.join(",") || "-"}`
+      : "No persisted patch changes need diff inspection.",
+    focusPaths,
+    commands: {
+      diff: `agent session diff ${sessionId}`,
+      review: `agent session review ${sessionId}`,
+      result: `agent session result ${sessionId}`,
+    },
+    items,
+  };
+}
+
+function compareDiffInspectionFileSummaries(left: UnifiedDiffFileSummary, right: UnifiedDiffFileSummary): number {
+  return diffReviewSizeRank(right.reviewSize) - diffReviewSizeRank(left.reviewSize) ||
+    (right.additions + right.deletions) - (left.additions + left.deletions) ||
+    diffChangeTypeRank(right.changeType) - diffChangeTypeRank(left.changeType) ||
+    left.path.localeCompare(right.path);
+}
+
+function diffReviewSizeRank(size: UnifiedDiffReviewSize): number {
+  return size === "large" ? 3 : size === "medium" ? 2 : 1;
+}
+
+function diffChangeTypeRank(changeType: UnifiedDiffChangeType): number {
+  switch (changeType) {
+    case "deleted":
+      return 4;
+    case "renamed":
+      return 3;
+    case "added":
+      return 2;
+    case "modified":
+      return 1;
+  }
+}
+
+function diffInspectionReason(summary: UnifiedDiffFileSummary): string {
+  const size = `${summary.reviewSize} ${summary.changeType} change (+${summary.additions}/-${summary.deletions})`;
+  if (summary.changeType === "deleted") {
+    return `${size}; confirm the removal and any callers.`;
+  }
+  if (summary.changeType === "added") {
+    return `${size}; confirm integration points and test coverage.`;
+  }
+  if (summary.changeType === "renamed") {
+    return `${size}; confirm references and import paths.`;
+  }
+  return `${size}; confirm intent, tests, and nearby behavior.`;
+}
+
+function formatDiffInspectionPlan(plan: UnifiedDiffInspectionPlan): string {
+  return `${plan.state}:items=${plan.items.length},focus=${plan.focusPaths.join("|") || "-"}`;
+}
+
+function printDiffInspectionPlan(plan: UnifiedDiffInspectionPlan): void {
+  console.log("Inspection plan:");
+  console.log(`- ${plan.summary}`);
+  for (const item of plan.items) {
+    console.log(
+      `- ${item.priority}. ${item.path}\t${item.reviewSize}\t${item.changeType}\t` +
+      `+${item.additions}/-${item.deletions}\t${item.reason}`,
+    );
+  }
 }
 
 function formatDiffReviewProfile(profile: UnifiedDiffReviewProfile): string {
