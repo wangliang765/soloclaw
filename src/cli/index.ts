@@ -10088,7 +10088,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session inspect <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /session status <id>, /session inspect <id>, /session timeline <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -10119,7 +10119,10 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /agent               Show local agent execution status");
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
         console.log("  /agent logs          Show merged local execution logs");
+        console.log("  /session status <session-id> Show session status snapshot");
         console.log("  /session inspect <session-id> Show focused session inspection");
+        console.log("  /session timeline <session-id> Show safe session timeline");
+        console.log("  /session logs <session-id> Show safe session timeline");
         console.log("  /check               Run the local readiness check");
         console.log("  /doctor              Run the local readiness check");
         console.log("  /inspect             Print the current workspace snapshot");
@@ -10203,6 +10206,29 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
+      if (line === "/session status" || line.startsWith("/session status ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session status".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session status <session-id> [--json] [--limit n]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const status = await buildSessionStatus(platform.store, sessionId, { limit: parsed.options.limit });
+          if (parsed.options.json) {
+            console.log(JSON.stringify(status, null, 2));
+          } else {
+            printSessionStatus(status);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
       if (line === "/session inspect" || line.startsWith("/session inspect ")) {
         const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session inspect".length).trim()));
         const sessionId = parsed.positionals[0];
@@ -10218,6 +10244,30 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
             console.log(JSON.stringify(inspection, null, 2));
           } else {
             printSessionInspect(inspection);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session timeline" || line.startsWith("/session timeline ") || line === "/session logs" || line.startsWith("/session logs ")) {
+        const commandPrefix = line.startsWith("/session logs") ? "/session logs" : "/session timeline";
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice(commandPrefix.length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session timeline <session-id> [--json] [--limit n]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const timeline = await buildSessionTimeline(platform.store, sessionId, { limit: parsed.options.limit });
+          if (parsed.options.json) {
+            console.log(JSON.stringify(timeline, null, 2));
+          } else {
+            printSessionTimeline(timeline);
           }
         } finally {
           platform.locks.close?.();

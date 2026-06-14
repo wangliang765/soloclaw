@@ -1802,6 +1802,17 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
     metadata: { tool: "apply_patch", action: "workspace.write", input: { patch }, ok: true },
     createdAt: "2026-06-13T00:03:01.000Z",
   });
+  await platform.store.recordFileChange({
+    id: "change_tui_session_inspect_patch",
+    sessionId: session.id,
+    actor,
+    kind: "patch",
+    path: "src/math.js",
+    beforeHash: "before_hash",
+    afterHash: "after_hash",
+    summary: "modify via 1 patch hunk(s)",
+    createdAt: "2026-06-13T00:03:01.500Z",
+  });
   await platform.store.createApprovalRequest({
     id: "appr_tui_session_inspect",
     status: "pending",
@@ -1820,16 +1831,43 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
     process.execPath,
     [cli],
     dir,
-    `/help\n/session inspect ${session.id}\n/session inspect ${session.id} --json\n/session inspect\n/exit\n`,
+    [
+      "/help",
+      `/session status ${session.id} --limit 10`,
+      `/session status ${session.id} --json --limit 2`,
+      `/session inspect ${session.id}`,
+      `/session inspect ${session.id} --json`,
+      `/session timeline ${session.id} --limit 10`,
+      `/session logs ${session.id} --json --limit 10`,
+      "/session status",
+      "/session timeline",
+      "/session inspect",
+      "/exit",
+      "",
+    ].join("\n"),
   );
   assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /\/session status <session-id>\s+Show session status snapshot/);
   assert.match(result.stdout, /\/session inspect <session-id>\s+Show focused session inspection/);
+  assert.match(result.stdout, /\/session timeline <session-id>\s+Show safe session timeline/);
+  assert.match(result.stdout, /\/session logs <session-id>\s+Show safe session timeline/);
+  assert.match(result.stdout, new RegExp(`Session status: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /inspection=blocked/);
+  assert.match(result.stdout, /Latest timeline:/);
+  assert.match(result.stdout, /"timelineItems": 4/);
   assert.match(result.stdout, new RegExp(`Session inspect: ${escapeRegExp(session.id)}`));
   assert.match(result.stdout, /state=blocked/);
   assert.match(result.stdout, /Pending approvals remain/);
   assert.match(result.stdout, /focusPaths=src\/math\.js/);
   assert.match(result.stdout, /"inspectionState": "blocked"/);
   assert.match(result.stdout, /"inspectionFocusPaths": \[\s+"src\/math\.js"/);
+  assert.match(result.stdout, new RegExp(`Session timeline: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /profile=local-safe/);
+  assert.match(result.stdout, /path=src\/math\.js/);
+  assert.match(result.stdout, /approval requested workspace\.write/);
+  assert.match(result.stdout, /"file_change": 1/);
+  assert.match(result.stdout, /Usage: \/session status <session-id> \[--json\] \[--limit n\]/);
+  assert.match(result.stdout, /Usage: \/session timeline <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session inspect <session-id> \[--json\]/);
   assert.match(result.stdout, /bye/);
 });

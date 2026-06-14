@@ -65,7 +65,9 @@ soloclaw agent status --json
 soloclaw agent logs --limit 20
 agent run --require-model-ready --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env LOCAL_LLM_API_KEY "inspect this workspace"
 agent resume <session-id> --require-model-ready --provider openai_compatible --base-url http://localhost:8000/v1 --api-key-env LOCAL_LLM_API_KEY
+agent session status <session-id> --json --limit 10
 agent session inspect <session-id> --json
+agent session timeline <session-id> --limit 20
 agent session bundle <session-id> --json --output .agent/tmp/session-bundle.json
 agent session bundle <session-id> --json --require-change --require-patch --require-recovery --require-diff-stat --require-execution-profile local-safe
 ```
@@ -76,11 +78,11 @@ agent session bundle <session-id> --json --require-change --require-patch --requ
 
 `agent local logs` is the merged local execution log. It combines safe audit events, file changes, approval requests, and approval decisions across recent sessions, attaching session ids/statuses when available. It is intended for foreground supervision, TUI reuse, and future daemon log panels; it does not imply an installed OS service.
 
-The interactive `soloclaw` shell exposes the same views as `/agent status`, `/agent logs`, and `/session inspect <session-id> [--json]`, with `/agent` defaulting to status. These commands use the currently selected workspace, so operators can switch with `/workspace ...` and inspect the matching local agent state or a focused session drilldown without leaving the TUI.
+The interactive `soloclaw` shell exposes the same views as `/agent status`, `/agent logs`, `/session status <session-id> [--json] [--limit n]`, `/session inspect <session-id> [--json]`, and `/session timeline|logs <session-id> [--json] [--limit n]`, with `/agent` defaulting to status. These commands use the currently selected workspace, so operators can switch with `/workspace ...` and inspect the matching local agent state, focused session status, inspection, or timeline drilldown without leaving the TUI.
 
 For supervised real-model tasks, add `--require-model-ready` to `agent run`, `agent ask`, `agent plan`, `agent build`, `agent goal`, or `agent resume`. The command checks the selected provider, model, base URL, API-key environment names, and configured secret-ref state before the local platform/session is opened or a paused session is continued; failures return `status=blocked` in JSON mode or a `Model readiness gate failed.` text block with the same fields as `soloclaw model check`.
 
-`agent session inspect` is the focused inspection view for a persisted session. It reuses the same safe session evidence as result/review/bundle, but narrows the output to inspection state, required/warning/info issues, focus paths, safe signals, next actions, and review commands for handoff or UI drilldown. TUI `/session inspect <session-id> [--json]` uses the same view for the current workspace, and the local control plane exposes the same JSON shape at token-gated `GET /api/sessions/:sessionId/inspect`.
+`agent session status`, `agent session inspect`, and `agent session timeline|logs` are focused views for a persisted session. They reuse the same safe session evidence as result/review/bundle, but narrow output respectively to the status snapshot, inspection state/issues/focus paths/next actions, and ordered safe timeline. TUI `/session status`, `/session inspect`, and `/session timeline|logs` use the same views for the current workspace, and the local control plane exposes the inspection JSON shape at token-gated `GET /api/sessions/:sessionId/inspect`.
 
 The bundle combines the same diff, report, status, timeline, review, result, and verification views used by the narrower `agent session ...` commands. Diff/report/review/result/status summaries include per-file additions/deletions, change type, patch count, review size, a short review hint when the session contains completed `apply_patch` evidence, an inspection state with required/warning/info issues and focus paths, and operator next actions such as resolving pending approvals, reviewing diffs, running evidence gates, inspecting a session, or exporting the bundle. `--output` writes the JSON bundle inside the current workspace so operators can archive or attach one file while still preserving the underlying SQLite audit/session records.
 
