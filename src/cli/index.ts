@@ -5007,6 +5007,10 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultInspectionIssues: number;
     sessionResultInspectionIssueSeverities: Record<string, number>;
     sessionResultInspectionFocusPaths: string[];
+    sessionResultHandoffState?: string;
+    sessionResultHandoffRequiredIssues: number;
+    sessionResultHandoffRequiredActions: number;
+    sessionResultHandoffNextCommand?: string;
     sessionInspectState?: string;
     sessionInspectIssues: number;
     sessionInspectIssueSeverities: Record<string, number>;
@@ -5057,6 +5061,9 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewNextActionStatuses: Record<string, number>;
     sessionReviewInspectionState?: string;
     sessionReviewInspectionIssues: number;
+    sessionReviewHandoffState?: string;
+    sessionReviewHandoffRequiredIssues: number;
+    sessionReviewHandoffRequiredActions: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
     sessionNoPendingVerificationStatus?: string;
@@ -5070,6 +5077,10 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionBundleNextActionStatuses: Record<string, number>;
     sessionBundleInspectionState?: string;
     sessionBundleInspectionIssues: number;
+    sessionBundleHandoffState?: string;
+    sessionBundleHandoffRequiredIssues: number;
+    sessionBundleHandoffRequiredActions: number;
+    sessionBundleHandoffNextCommand?: string;
     sessionBundleReviewProfile: UnifiedDiffReviewProfile;
     sessionBundleLocalAgentState?: string;
     sessionBundleLocalAgentDaemonState?: string;
@@ -5740,6 +5751,21 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `localAgent=${sessionBundle.summary.localAgentState}/${sessionBundle.summary.localAgentDaemonState}, ` +
         `localLogs=${sessionBundle.summary.localAgentLogItems}, outputBytes=${sessionBundleOutput.bytes}`,
     });
+    const sessionHandoffPass =
+      sessionResult.handoff.state === "blocked" &&
+      sessionReview.handoff.state === sessionResult.handoff.state &&
+      sessionBundle.summary.handoffState === sessionResult.handoff.state &&
+      sessionResult.handoff.requiredIssues >= 1 &&
+      sessionResult.handoff.requiredActions >= 1 &&
+      (sessionResult.handoff.nextCommand?.includes("agent approve") ?? false);
+    checks.push({
+      id: "session-handoff-evidence",
+      label: "session handoff evidence",
+      status: sessionHandoffPass ? "pass" : "fail",
+      summary:
+        `result=${sessionResult.handoff.state}, review=${sessionReview.handoff.state}, ` +
+        `bundle=${sessionBundle.summary.handoffState ?? "-"}, next=${sessionResult.handoff.nextCommand ?? "-"}`,
+    });
 
     const nextActionEvidencePass =
       sessionResult.nextActions.some((action) => action.id === "resolve-pending-approvals" && action.status === "required" && action.command.includes("agent approve")) &&
@@ -5950,6 +5976,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultInspectionIssues: sessionResult.inspection.issues.length,
         sessionResultInspectionIssueSeverities: sessionResult.summary.inspectionIssueSeverities,
         sessionResultInspectionFocusPaths: sessionResult.inspection.focusPaths,
+        sessionResultHandoffState: sessionResult.handoff.state,
+        sessionResultHandoffRequiredIssues: sessionResult.handoff.requiredIssues,
+        sessionResultHandoffRequiredActions: sessionResult.handoff.requiredActions,
+        sessionResultHandoffNextCommand: sessionResult.handoff.nextCommand,
         sessionInspectState: sessionInspect.inspection.state,
         sessionInspectIssues: sessionInspect.inspection.issues.length,
         sessionInspectIssueSeverities: sessionInspect.summary.inspectionIssueSeverities,
@@ -6000,6 +6030,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReviewNextActionStatuses: sessionReview.summary.nextActionStatuses,
         sessionReviewInspectionState: sessionReview.inspection.state,
         sessionReviewInspectionIssues: sessionReview.inspection.issues.length,
+        sessionReviewHandoffState: sessionReview.handoff.state,
+        sessionReviewHandoffRequiredIssues: sessionReview.handoff.requiredIssues,
+        sessionReviewHandoffRequiredActions: sessionReview.handoff.requiredActions,
         sessionVerificationStatus: sessionVerification.status,
         sessionVerificationChecks: sessionVerification.checks.length,
         sessionNoPendingVerificationStatus: sessionNoPendingVerification.status,
@@ -6013,6 +6046,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionBundleNextActionStatuses: sessionBundle.summary.nextActionStatuses,
         sessionBundleInspectionState: sessionBundle.summary.inspectionState,
         sessionBundleInspectionIssues: sessionBundle.summary.inspectionIssues,
+        sessionBundleHandoffState: sessionBundle.summary.handoffState,
+        sessionBundleHandoffRequiredIssues: sessionBundle.summary.handoffRequiredIssues,
+        sessionBundleHandoffRequiredActions: sessionBundle.summary.handoffRequiredActions,
+        sessionBundleHandoffNextCommand: sessionBundle.summary.handoffNextCommand,
         sessionBundleReviewProfile: sessionBundle.summary.reviewProfile,
         sessionBundleLocalAgentState: sessionBundle.summary.localAgentState,
         sessionBundleLocalAgentDaemonState: sessionBundle.summary.localAgentDaemonState,
@@ -6194,6 +6231,12 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     `severities=${formatRecordCounts(result.evidence.sessionResultInspectionIssueSeverities)} focus=${result.evidence.sessionResultInspectionFocusPaths.join(",") || "-"}`,
   );
   console.log(
+    `- sessionResultHandoff=${result.evidence.sessionResultHandoffState ?? "-"} ` +
+    `requiredIssues=${result.evidence.sessionResultHandoffRequiredIssues} ` +
+    `requiredActions=${result.evidence.sessionResultHandoffRequiredActions} ` +
+    `next=${result.evidence.sessionResultHandoffNextCommand ?? "-"}`,
+  );
+  console.log(
     `- sessionInspect=${result.evidence.sessionInspectState ?? "-"} issues=${result.evidence.sessionInspectIssues} ` +
     `severities=${formatRecordCounts(result.evidence.sessionInspectIssueSeverities)} ` +
     `focus=${result.evidence.sessionInspectFocusPaths.join(",") || "-"} nextActions=${result.evidence.sessionInspectNextActions}`,
@@ -6231,6 +6274,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReviewReviewProfile)}`);
   console.log(`- sessionReviewTimelineItems=${result.evidence.sessionReviewTimelineItems}`);
   console.log(`- sessionReviewInspection=${result.evidence.sessionReviewInspectionState ?? "-"} issues=${result.evidence.sessionReviewInspectionIssues}`);
+  console.log(
+    `- sessionReviewHandoff=${result.evidence.sessionReviewHandoffState ?? "-"} ` +
+    `requiredIssues=${result.evidence.sessionReviewHandoffRequiredIssues} ` +
+    `requiredActions=${result.evidence.sessionReviewHandoffRequiredActions}`,
+  );
   console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
@@ -6243,6 +6291,12 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionBundleSections=${result.evidence.sessionBundleSections.join(",") || "-"}`);
   console.log(`- sessionBundleOutputBytes=${result.evidence.sessionBundleOutputBytes}`);
   console.log(`- sessionBundleInspection=${result.evidence.sessionBundleInspectionState ?? "-"} issues=${result.evidence.sessionBundleInspectionIssues}`);
+  console.log(
+    `- sessionBundleHandoff=${result.evidence.sessionBundleHandoffState ?? "-"} ` +
+    `requiredIssues=${result.evidence.sessionBundleHandoffRequiredIssues} ` +
+    `requiredActions=${result.evidence.sessionBundleHandoffRequiredActions} ` +
+    `next=${result.evidence.sessionBundleHandoffNextCommand ?? "-"}`,
+  );
   console.log(`- sessionBundleNextActions=${result.evidence.sessionBundleNextActions} statuses=${formatRecordCounts(result.evidence.sessionBundleNextActionStatuses)}`);
   console.log(`- sessionBundleReviewProfile=${formatDiffReviewProfile(result.evidence.sessionBundleReviewProfile)}`);
   console.log(`- sessionBundleLocalAgent=${result.evidence.sessionBundleLocalAgentState ?? "-"}/${result.evidence.sessionBundleLocalAgentDaemonState ?? "-"} logs=${result.evidence.sessionBundleLocalAgentLogItems}`);
@@ -7261,6 +7315,12 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       inspectionIssues: result.inspection.issues.length,
       inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
       inspectionFocusPaths: result.inspection.focusPaths,
+      handoffState: result.handoff.state,
+      handoffRequiredIssues: result.handoff.requiredIssues,
+      handoffWarningIssues: result.handoff.warningIssues,
+      handoffRequiredActions: result.handoff.requiredActions,
+      handoffRecommendedActions: result.handoff.recommendedActions,
+      handoffNextCommand: result.handoff.nextCommand,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
@@ -7947,6 +8007,12 @@ async function buildSessionEvidenceBundle(
       inspectionIssues: result.inspection.issues.length,
       inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
       inspectionFocusPaths: result.inspection.focusPaths,
+      handoffState: result.handoff.state,
+      handoffRequiredIssues: result.handoff.requiredIssues,
+      handoffWarningIssues: result.handoff.warningIssues,
+      handoffRequiredActions: result.handoff.requiredActions,
+      handoffRecommendedActions: result.handoff.recommendedActions,
+      handoffNextCommand: result.handoff.nextCommand,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
       localAgentState: localStatus.summary.state,
@@ -8019,6 +8085,10 @@ function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessi
   console.log(
     `- inspection=${bundle.summary.inspectionState} issues=${bundle.summary.inspectionIssues} ` +
     `severities=${formatRecordCounts(bundle.summary.inspectionIssueSeverities)} focus=${bundle.summary.inspectionFocusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- handoff=${bundle.summary.handoffState} requiredIssues=${bundle.summary.handoffRequiredIssues} ` +
+    `requiredActions=${bundle.summary.handoffRequiredActions} next=${bundle.summary.handoffNextCommand ?? "-"}`,
   );
   console.log(`- nextActions=${bundle.summary.nextActions} statuses=${formatRecordCounts(bundle.summary.nextActionStatuses)}`);
   console.log(`- timeline=${bundle.summary.returnedTimelineItems}/${bundle.summary.timelineItems}`);
@@ -8108,6 +8178,10 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(
     `- inspection=${status.summary.inspectionState} issues=${status.summary.inspectionIssues} ` +
     `severities=${formatRecordCounts(status.summary.inspectionIssueSeverities)} focus=${status.summary.inspectionFocusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- handoff=${status.summary.handoffState} requiredIssues=${status.summary.handoffRequiredIssues} ` +
+    `requiredActions=${status.summary.handoffRequiredActions} next=${status.summary.handoffNextCommand ?? "-"}`,
   );
   console.log(`- nextActions=${status.summary.nextActions} statuses=${formatRecordCounts(status.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${status.summary.timelineItems} latestAt=${status.summary.latestAt ?? "-"}`);
@@ -8219,6 +8293,12 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
       inspectionIssues: result.inspection.issues.length,
       inspectionIssueSeverities: result.summary.inspectionIssueSeverities,
       inspectionFocusPaths: result.inspection.focusPaths,
+      handoffState: result.handoff.state,
+      handoffRequiredIssues: result.handoff.requiredIssues,
+      handoffWarningIssues: result.handoff.warningIssues,
+      handoffRequiredActions: result.handoff.requiredActions,
+      handoffRecommendedActions: result.handoff.recommendedActions,
+      handoffNextCommand: result.handoff.nextCommand,
       nextActions: result.nextActions.length,
       nextActionStatuses: countNextActionStatuses(result.nextActions),
     },
@@ -8243,6 +8323,7 @@ async function buildSessionReview(store: AgentStore, sessionId: string, options:
     recovery: result.recovery,
     approvals: result.approvals,
     inspection: result.inspection,
+    handoff: result.handoff,
     nextActions: result.nextActions,
     modelUsage: result.modelUsage,
     latestTimeline: timeline.items,
@@ -8356,6 +8437,10 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(
     `- inspection=${review.inspection.state} issues=${review.inspection.issues.length} ` +
     `severities=${formatRecordCounts(review.summary.inspectionIssueSeverities)} focus=${review.inspection.focusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- handoff=${review.handoff.state} requiredIssues=${review.handoff.requiredIssues} ` +
+    `requiredActions=${review.handoff.requiredActions} next=${review.handoff.nextCommand ?? "-"}`,
   );
   console.log(`- nextActions=${review.summary.nextActions} statuses=${formatRecordCounts(review.summary.nextActionStatuses)}`);
   console.log(`- timelineItems=${review.summary.timelineItems}`);
@@ -8545,6 +8630,22 @@ type SessionOperatorNextAction = {
   reason: string;
 };
 
+type SessionHandoffState = "ready" | "blocked" | "needs_attention" | "in_progress";
+
+type SessionHandoffSummary = {
+  state: SessionHandoffState;
+  summary: string;
+  requiredIssues: number;
+  warningIssues: number;
+  requiredActions: number;
+  recommendedActions: number;
+  nextCommand?: string;
+  reviewCommand: string;
+  verificationCommand: string;
+  bundleCommand: string;
+  focusPaths: string[];
+};
+
 function buildSessionNextActions(sessionId: string, input: {
   outcome: string;
   sessionStatus: Session["status"];
@@ -8654,6 +8755,58 @@ function countNextActionStatuses(actions: SessionOperatorNextAction[]): Record<s
     counts[action.status] = (counts[action.status] ?? 0) + 1;
   }
   return counts;
+}
+
+function buildSessionHandoffSummary(
+  sessionId: string,
+  input: {
+    outcome: string;
+    sessionStatus: Session["status"];
+    inspection: SessionInspectionSummary;
+    nextActions: SessionOperatorNextAction[];
+  },
+): SessionHandoffSummary {
+  const requiredIssues = input.inspection.issues.filter((issue) => issue.severity === "required").length;
+  const warningIssues = input.inspection.issues.filter((issue) => issue.severity === "warning").length;
+  const requiredActions = input.nextActions.filter((action) => action.status === "required").length;
+  const recommendedActions = input.nextActions.filter((action) => action.status === "recommended").length;
+  const nextAction =
+    input.nextActions.find((action) => action.status === "required") ??
+    input.nextActions.find((action) => action.status === "recommended") ??
+    input.nextActions.find((action) => action.status === "optional");
+  const verificationCommand =
+    input.nextActions.find((action) => action.id === "verify-session")?.command ??
+    `agent session verify ${sessionId}`;
+  const bundleCommand =
+    input.nextActions.find((action) => action.id === "export-bundle")?.command ??
+    `agent session bundle ${sessionId} --json --output .agent/tmp/session-bundle.json`;
+  const inProgress = input.sessionStatus === "created" || input.sessionStatus === "running" || input.outcome === "in_progress";
+  const state: SessionHandoffState = inProgress
+    ? "in_progress"
+    : input.inspection.state === "blocked" || requiredActions > 0
+      ? "blocked"
+      : input.inspection.state === "needs_attention"
+        ? "needs_attention"
+        : "ready";
+  return {
+    state,
+    summary: state === "ready"
+      ? "Session evidence is ready for handoff."
+      : state === "in_progress"
+        ? "Session is still in progress; finish or pause it before handoff."
+        : state === "blocked"
+          ? `${requiredIssues} required issue(s) and ${requiredActions} required action(s) block handoff.`
+          : `${warningIssues} warning issue(s) should be reviewed before handoff.`,
+    requiredIssues,
+    warningIssues,
+    requiredActions,
+    recommendedActions,
+    nextCommand: nextAction?.command,
+    reviewCommand: `agent session review ${sessionId}`,
+    verificationCommand,
+    bundleCommand,
+    focusPaths: input.inspection.focusPaths,
+  };
 }
 
 function countInspectionSeverities(issues: SessionInspectionIssue[]): Record<string, number> {
@@ -8844,6 +8997,12 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
     reviewProfile: diff.summary.reviewProfile,
     fileSummaries: diff.summary.fileSummaries,
   });
+  const handoff = buildSessionHandoffSummary(sessionId, {
+    outcome,
+    sessionStatus: report.session.status,
+    inspection,
+    nextActions,
+  });
 
   return {
     generatedAt: new Date().toISOString(),
@@ -8881,6 +9040,12 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
       inspectionIssues: inspection.issues.length,
       inspectionIssueSeverities: countInspectionSeverities(inspection.issues),
       inspectionFocusPaths: inspection.focusPaths,
+      handoffState: handoff.state,
+      handoffRequiredIssues: handoff.requiredIssues,
+      handoffWarningIssues: handoff.warningIssues,
+      handoffRequiredActions: handoff.requiredActions,
+      handoffRecommendedActions: handoff.recommendedActions,
+      handoffNextCommand: handoff.nextCommand,
       nextActions: nextActions.length,
       nextActionStatuses: countNextActionStatuses(nextActions),
       lastCommand: lastCommand
@@ -8932,6 +9097,7 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
     })),
     approvals: report.approvals,
     inspection,
+    handoff,
     nextActions,
     modelUsage: report.modelUsage,
     fileChanges: report.fileChanges,
@@ -9001,6 +9167,10 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(
     `- inspection=${result.inspection.state} issues=${result.inspection.issues.length} ` +
     `severities=${formatRecordCounts(result.summary.inspectionIssueSeverities)} focus=${result.inspection.focusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- handoff=${result.handoff.state} requiredIssues=${result.handoff.requiredIssues} ` +
+    `requiredActions=${result.handoff.requiredActions} next=${result.handoff.nextCommand ?? "-"}`,
   );
   console.log(`- nextActions=${result.summary.nextActions} statuses=${formatRecordCounts(result.summary.nextActionStatuses)}`);
   if (result.modelUsage.entries.length > 0) {
