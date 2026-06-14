@@ -8053,6 +8053,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       tuiApprovalDecisionAuditEvents?: number;
       tuiApprovalOutputLines?: number;
       tuiApprovalUsageShown?: boolean;
+      tuiApprovalNoPendingVerificationStatus?: string;
+      tuiApprovalNoPendingVerificationChecks?: number;
       targetModeWorkspace?: string;
       targetModeSessions?: Array<{
         mode?: string;
@@ -8096,6 +8098,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       tuiApprovals?: string;
       tuiApprove?: string;
       tuiDeny?: string;
+      tuiApprovalVerify?: string;
       localDaemonRun?: string;
     };
   };
@@ -8297,6 +8300,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.tuiApprovalDecisionAuditEvents ?? 0) >= 2, true);
   assert.equal((parsed.evidence?.tuiApprovalOutputLines ?? 0) >= 6, true);
   assert.equal(parsed.evidence?.tuiApprovalUsageShown, true);
+  assert.equal(parsed.evidence?.tuiApprovalNoPendingVerificationStatus, "pass");
+  assert.equal((parsed.evidence?.tuiApprovalNoPendingVerificationChecks ?? 0) >= 3, true);
   assert.match(parsed.evidence?.targetModeWorkspace ?? "", /phase2-target-modes-/);
   assert.deepEqual(parsed.evidence?.targetModeSessions?.map((entry) => entry.mode), ["plan", "build", "goal"]);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => /^sess_/.test(entry.sessionId ?? "")), true);
@@ -8372,6 +8377,8 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.tuiApprovals?.includes("/approvals pending"), true);
   assert.equal(parsed.commands?.tuiApprove?.includes("/approve <approval-id>"), true);
   assert.equal(parsed.commands?.tuiDeny?.includes("/deny <approval-id>"), true);
+  assert.equal(parsed.commands?.tuiApprovalVerify?.includes("--require-no-pending-approvals"), true);
+  assert.equal(parsed.commands?.tuiApprovalVerify?.includes("--allow-no-command"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("agent scheduler run"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("--stop-when-idle"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);

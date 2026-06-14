@@ -5128,6 +5128,8 @@ type PhaseTwoEngineeringSmokeResult = {
     tuiApprovalDecisionAuditEvents: number;
     tuiApprovalOutputLines: number;
     tuiApprovalUsageShown: boolean;
+    tuiApprovalNoPendingVerificationStatus?: string;
+    tuiApprovalNoPendingVerificationChecks: number;
     targetModeWorkspace?: string;
     targetModeSessions: Array<{
       mode: string;
@@ -5182,6 +5184,7 @@ type PhaseTwoEngineeringSmokeResult = {
     tuiApprovals?: string;
     tuiApprove?: string;
     tuiDeny?: string;
+    tuiApprovalVerify?: string;
     localDaemonRun?: string;
   };
 };
@@ -5834,7 +5837,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary:
         `session=${tuiApproval.sessionId}, approved=${tuiApproval.approvedStatus ?? "-"}, ` +
         `denied=${tuiApproval.deniedStatus ?? "-"}, audits=${tuiApproval.decisionAuditEvents}, ` +
-        `outputLines=${tuiApproval.outputLines}, usage=${tuiApproval.usageShown}`,
+        `outputLines=${tuiApproval.outputLines}, usage=${tuiApproval.usageShown}, ` +
+        `noPendingGate=${tuiApproval.noPendingVerificationStatus ?? "-"}`,
     });
 
     const targetModes = await runPhaseTwoTargetModeSmoke(cwd, { cleanup: options.cleanup });
@@ -6044,6 +6048,8 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         tuiApprovalDecisionAuditEvents: tuiApproval.decisionAuditEvents,
         tuiApprovalOutputLines: tuiApproval.outputLines,
         tuiApprovalUsageShown: tuiApproval.usageShown,
+        tuiApprovalNoPendingVerificationStatus: tuiApproval.noPendingVerificationStatus,
+        tuiApprovalNoPendingVerificationChecks: tuiApproval.noPendingVerificationChecks,
         targetModeWorkspace: targetModes.workspace,
         targetModeSessions: targetModes.sessions.map((entry) => ({
           mode: entry.mode,
@@ -6102,6 +6108,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         tuiApprovals: `cd ${sampleWorkspace} && soloclaw # /approvals pending`,
         tuiApprove: `cd ${sampleWorkspace} && soloclaw # /approve <approval-id> [reason]`,
         tuiDeny: `cd ${sampleWorkspace} && soloclaw # /deny <approval-id> [reason]`,
+        tuiApprovalVerify: `cd ${sampleWorkspace} && agent session verify ${tuiApproval.sessionId} --require-no-pending-approvals --allow-no-command`,
         localDaemonRun: `cd ${sampleWorkspace} && agent scheduler run --worker ${localStatusWorker.id} --interval-ms 0 --max-ticks 3 --stop-when-idle --idle-ticks 1 --runs-per-worker 1 --idle-limit 1`,
       },
     };
@@ -6251,7 +6258,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(
     `- tuiApproval=session:${result.evidence.tuiApprovalSessionId ?? "-"},approved:${result.evidence.tuiApprovalApprovedStatus ?? "-"},` +
     `denied:${result.evidence.tuiApprovalDeniedStatus ?? "-"},audits:${result.evidence.tuiApprovalDecisionAuditEvents},` +
-    `outputLines:${result.evidence.tuiApprovalOutputLines},usage:${result.evidence.tuiApprovalUsageShown}`,
+    `outputLines:${result.evidence.tuiApprovalOutputLines},usage:${result.evidence.tuiApprovalUsageShown},` +
+    `noPendingGate:${result.evidence.tuiApprovalNoPendingVerificationStatus ?? "-"},` +
+    `checks:${result.evidence.tuiApprovalNoPendingVerificationChecks}`,
   );
   console.log(`- targetModeWorkspace=${result.evidence.targetModeWorkspace ?? "-"}`);
   console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`).join(",") || "-"}`);
@@ -6307,6 +6316,9 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     }
     if (result.commands.tuiDeny) {
       console.log(`- ${result.commands.tuiDeny}`);
+    }
+    if (result.commands.tuiApprovalVerify) {
+      console.log(`- ${result.commands.tuiApprovalVerify}`);
     }
     if (result.commands.localDaemonRun) {
       console.log(`- ${result.commands.localDaemonRun}`);
@@ -6706,6 +6718,14 @@ async function runPhaseTwoTuiApprovalSmoke(platform: LocalPlatform, actor: Retur
   const approvedListed = output.some((line) => line.startsWith(`${approveId}\tapproved\tworkspace.write`));
   const deniedListed = output.some((line) => line.startsWith(`${denyId}\tdenied\tdependency.install`));
   const usageShown = output.includes("Usage: /approve <approval-id> [reason]");
+  await platform.store.updateSessionStatus(session.id, "completed");
+  const noPendingVerification = await buildSessionVerification(platform.store, session.id, {
+    requireCommand: false,
+    requireNoPendingApprovals: true,
+  });
+  const noPendingVerificationPassed =
+    noPendingVerification.status === "pass" &&
+    noPendingVerification.checks.some((check) => check.id === "no-pending-approvals" && check.status === "pass");
 
   return {
     sessionId: session.id,
@@ -6720,7 +6740,8 @@ async function runPhaseTwoTuiApprovalSmoke(platform: LocalPlatform, actor: Retur
       denied?.status === "denied" &&
       approved.decisionReason === "phase2 TUI approved" &&
       denied.decisionReason === "phase2 TUI denied" &&
-      decisionAuditEvents >= 2,
+      decisionAuditEvents >= 2 &&
+      noPendingVerificationPassed,
     approvedStatus: approved?.status,
     deniedStatus: denied?.status,
     approvedReason: approved?.decisionReason,
@@ -6728,6 +6749,8 @@ async function runPhaseTwoTuiApprovalSmoke(platform: LocalPlatform, actor: Retur
     decisionAuditEvents,
     outputLines: output.length,
     usageShown,
+    noPendingVerificationStatus: noPendingVerification.status,
+    noPendingVerificationChecks: noPendingVerification.checks.length,
   };
 }
 
