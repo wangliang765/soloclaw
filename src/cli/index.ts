@@ -171,6 +171,15 @@ async function main() {
         }
         return;
       }
+      if (subcommand === "service" || subcommand === "daemon") {
+        const status = await buildLocalAgentStatus(store, workspace, parsed.options);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(status.servicePlan, null, 2));
+        } else {
+          printLocalAgentServicePlan(status.servicePlan);
+        }
+        return;
+      }
       if (subcommand === "logs" || subcommand === "timeline") {
         const logs = await buildLocalAgentLogs(store, workspace, parsed.options);
         if (parsed.options.json) {
@@ -5056,6 +5065,13 @@ type PhaseTwoEngineeringSmokeResult = {
     localAgentLifecycleRequiredSteps: string[];
     localAgentLifecycleRecommendedSteps: string[];
     localAgentLifecycleBlockedSteps: string[];
+    localAgentServiceManager?: LocalAgentServiceManager;
+    localAgentServiceReady: boolean;
+    localAgentServiceBlocked: boolean;
+    localAgentServiceEntrypoint?: string;
+    localAgentServiceHealthCommand?: string;
+    localAgentServiceRequiredSteps: string[];
+    localAgentServiceBlockedSteps: string[];
     localAgentRunbookReady: boolean;
     localAgentRunbookSteps: number;
     localAgentRunbookRequiredCommand?: string;
@@ -5203,6 +5219,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionNoPendingVerify?: string;
     sessionBundle?: string;
     localAgentStatus?: string;
+    localAgentServicePlan?: string;
     localAgentLogs?: string;
     runJson?: string;
     modelReadinessGate?: string;
@@ -5651,6 +5668,28 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `blocked=${localAgentStatus.lifecyclePlan.blocked}, next=${localAgentStatus.lifecyclePlan.nextCommand ?? "-"}, ` +
         `attention=${localAgentStatus.lifecyclePlan.attentionReasons.join(",") || "-"}`,
     });
+    const localAgentServiceRequiredSteps = localAgentStatus.servicePlan.steps.filter((step) => step.status === "required").map((step) => step.id);
+    const localAgentServiceBlockedSteps = localAgentStatus.servicePlan.steps.filter((step) => step.status === "blocked").map((step) => step.id);
+    const localAgentServicePlanPass =
+      localAgentStatus.servicePlan.serviceName === "soloclaw-local-agent" &&
+      localAgentStatus.servicePlan.supervision.installState === "plan_only" &&
+      localAgentStatus.servicePlan.entrypoint.schedulerCommand.includes("agent scheduler run") &&
+      (localAgentStatus.servicePlan.entrypoint.workerCommand?.includes(`agent workers poll ${localStatusWorker.id}`) ?? false) &&
+      localAgentStatus.servicePlan.health.statusCommand === "agent local status --json" &&
+      localAgentStatus.servicePlan.health.logsCommand.includes("agent local logs") &&
+      localAgentServiceRequiredSteps.includes("check-status") &&
+      localAgentServiceRequiredSteps.includes("resolve-attention") &&
+      localAgentServiceBlockedSteps.includes("run-foreground-loop") &&
+      localAgentServiceBlockedSteps.includes("poll-ready-worker") &&
+      localAgentStatus.commands.servicePlan === "agent local service --json";
+    checks.push({
+      id: "local-daemon-service-plan-evidence",
+      label: "local daemon service plan evidence",
+      status: localAgentServicePlanPass ? "pass" : "fail",
+      summary:
+        `manager=${localAgentStatus.servicePlan.manager.kind}, ready=${localAgentStatus.servicePlan.ready}, ` +
+        `blocked=${localAgentStatus.servicePlan.blocked}, entrypoint=${localAgentStatus.servicePlan.entrypoint.schedulerCommand}`,
+    });
 
     const localAgentLogs = await buildLocalAgentLogs(platform.store, sampleWorkspace, { limit: 20 });
     const localAgentLogsPass =
@@ -6074,6 +6113,13 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         localAgentLifecycleRequiredSteps: localAgentStatus.lifecyclePlan.requiredSteps,
         localAgentLifecycleRecommendedSteps: localAgentStatus.lifecyclePlan.recommendedSteps,
         localAgentLifecycleBlockedSteps: localAgentStatus.lifecyclePlan.blockedSteps,
+        localAgentServiceManager: localAgentStatus.servicePlan.manager.kind,
+        localAgentServiceReady: localAgentStatus.servicePlan.ready,
+        localAgentServiceBlocked: localAgentStatus.servicePlan.blocked,
+        localAgentServiceEntrypoint: localAgentStatus.servicePlan.entrypoint.schedulerCommand,
+        localAgentServiceHealthCommand: localAgentStatus.servicePlan.health.statusCommand,
+        localAgentServiceRequiredSteps,
+        localAgentServiceBlockedSteps,
         localAgentRunbookReady: localAgentStatus.runbook.ready,
         localAgentRunbookSteps: localAgentStatus.runbook.steps.length,
         localAgentRunbookRequiredCommand: localAgentRunbookRequiredStep?.command,
@@ -6223,6 +6269,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionNoPendingVerify: `cd ${sampleWorkspace} && agent session verify ${session.id} --require-no-pending-approvals --allow-no-command`,
         sessionBundle: `cd ${sampleWorkspace} && agent session bundle ${session.id} --json --output .agent/tmp/session-bundle.json --require-change --require-patch --require-recovery --require-timeout --require-diff-stat --require-review-profile --require-execution-profile ${requiredExecutionProfiles.join(",")} --require-approval-actions ${requiredPolicyBoundaryActions.join(",")}`,
         localAgentStatus: `cd ${sampleWorkspace} && agent local status --json --limit 5`,
+        localAgentServicePlan: `cd ${sampleWorkspace} && agent local service --json --limit 5`,
         localAgentLogs: `cd ${sampleWorkspace} && agent local logs --limit 20`,
         runJson: `cd ${sampleWorkspace} && agent run --json --allow-no-command --require-model-call "inspect this workspace"`,
         modelReadinessGate: modelReadinessGate.command,
@@ -6335,6 +6382,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     `blocked:${result.evidence.localAgentLifecycleBlocked},next:${result.evidence.localAgentLifecycleNextCommand ?? "-"},` +
     `attention:${result.evidence.localAgentLifecycleAttentionReasons.join(",") || "-"},` +
     `blockedSteps:${result.evidence.localAgentLifecycleBlockedSteps.join(",") || "-"}`,
+  );
+  console.log(
+    `- localAgentService=manager:${result.evidence.localAgentServiceManager ?? "-"},ready:${result.evidence.localAgentServiceReady},` +
+    `blocked:${result.evidence.localAgentServiceBlocked},entrypoint:${result.evidence.localAgentServiceEntrypoint ?? "-"},` +
+    `health:${result.evidence.localAgentServiceHealthCommand ?? "-"},blockedSteps:${result.evidence.localAgentServiceBlockedSteps.join(",") || "-"}`,
   );
   console.log(`- localAgentLogItems=${result.evidence.localAgentLogItems}`);
   console.log(`- localAgentLogKinds=${formatRecordCounts(result.evidence.localAgentLogKinds)}`);
@@ -7440,6 +7492,7 @@ type LocalAgentCliOptions = {
 type LocalAgentState = "idle" | "active" | "needs_attention";
 type LocalAgentDaemonState = "idle" | "ready_to_run" | "running" | "needs_worker" | "needs_attention";
 type LocalAgentLifecyclePlanMode = "resolve_attention" | "register_worker" | "run_scheduler_worker" | "worker_standby" | "idle";
+type LocalAgentServiceManager = "windows_task" | "systemd_user" | "launchd_user" | "termux_service" | "foreground";
 type LocalAgentRunbookStepStatus = "required" | "recommended" | "optional" | "blocked";
 
 type LocalAgentRunbookStep = {
@@ -7569,6 +7622,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
   const commands = {
     status: "agent local status --json",
     logs: "agent local logs --limit 20",
+    servicePlan: "agent local service --json",
     sessions: `agent sessions --limit ${limit}`,
     approvals: "agent approvals pending",
     schedulerRun: "agent scheduler run --interval-ms 1000 --max-ticks 10 --stop-when-idle",
@@ -7592,6 +7646,13 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
   const lifecyclePlan = buildLocalAgentLifecyclePlan({
     daemon,
     runbook,
+    commands,
+  });
+  const servicePlan = buildLocalAgentServicePlan({
+    workspace,
+    daemon,
+    runbook,
+    lifecyclePlan,
     commands,
   });
 
@@ -7620,6 +7681,7 @@ async function buildLocalAgentStatus(store: AgentStore, workspace: string, optio
     daemon,
     runbook,
     lifecyclePlan,
+    servicePlan,
     sessions: sessions.sessions,
     workers: workers.slice(0, limit).map((worker) => ({
       id: worker.id,
@@ -7969,6 +8031,142 @@ function buildLocalAgentLifecyclePlan(input: {
   };
 }
 
+function buildLocalAgentServicePlan(input: {
+  workspace: string;
+  daemon: ReturnType<typeof buildLocalAgentDaemonSummary>;
+  runbook: ReturnType<typeof buildLocalAgentRunbook>;
+  lifecyclePlan: ReturnType<typeof buildLocalAgentLifecyclePlan>;
+  commands: {
+    status: string;
+    logs: string;
+    servicePlan: string;
+    sessions: string;
+    approvals: string;
+    schedulerRun: string;
+    workerPoll?: string;
+  };
+}) {
+  const manager = localAgentServiceManager(process.platform);
+  const blocked = input.lifecyclePlan.blocked;
+  const ready = input.lifecyclePlan.ready && input.daemon.scheduler.ready;
+  const attentionStep = input.runbook.steps.find((step) => step.id === "resolve-attention");
+  const steps: LocalAgentRunbookStep[] = [
+    {
+      id: "check-status",
+      label: "Check daemon status",
+      status: "required",
+      command: input.commands.status,
+      reason: "Read the latest persisted sessions, approvals, worker capacity, and daemon readiness before supervising loops.",
+    },
+    {
+      id: "service-plan",
+      label: "Inspect service plan",
+      status: "optional",
+      command: input.commands.servicePlan,
+      reason: "Review the derived service plan without registering or mutating an operating-system service.",
+    },
+    {
+      id: "resolve-attention",
+      label: "Resolve attention items",
+      status: attentionStep?.status === "required" ? "required" : "optional",
+      command: attentionStep?.command,
+      reason: attentionStep?.reason ?? "No attention items are currently blocking daemon loops.",
+    },
+    {
+      id: "run-foreground-loop",
+      label: "Run foreground scheduler loop",
+      status: blocked ? "blocked" : "recommended",
+      command: input.commands.schedulerRun,
+      reason: blocked
+        ? "Resolve blocking daemon lifecycle items before supervising the scheduler loop."
+        : "Use the foreground scheduler loop as the service entrypoint until an OS supervisor owns the process.",
+    },
+    {
+      id: "poll-ready-worker",
+      label: "Poll ready worker",
+      status: !input.commands.workerPoll ? "blocked" : blocked ? "blocked" : "recommended",
+      command: input.commands.workerPoll,
+      reason: !input.commands.workerPoll
+        ? "No online worker with available capacity is ready for a supervised worker loop."
+        : blocked
+          ? "Resolve blocking daemon lifecycle items before polling a worker loop."
+          : "Use this worker poll command when supervising a dedicated worker process.",
+    },
+    {
+      id: "wrap-os-supervisor",
+      label: "Wrap with OS supervisor",
+      status: ready ? "optional" : "blocked",
+      reason: ready
+        ? `${localAgentServiceManagerLabel(manager)} can wrap the foreground scheduler command and reuse the status/log commands for health checks.`
+        : "The derived service plan is blocked until local daemon readiness is clean.",
+    },
+  ];
+
+  return {
+    workspace: input.workspace,
+    state: input.lifecyclePlan.state,
+    mode: input.lifecyclePlan.mode,
+    ready,
+    blocked,
+    platform: process.platform,
+    serviceName: "soloclaw-local-agent",
+    manager: {
+      kind: manager,
+      label: localAgentServiceManagerLabel(manager),
+      supported: manager !== "foreground",
+    },
+    entrypoint: {
+      schedulerCommand: input.commands.schedulerRun,
+      workerCommand: input.commands.workerPoll,
+    },
+    health: {
+      statusCommand: input.commands.status,
+      logsCommand: input.commands.logs,
+      sessionsCommand: input.commands.sessions,
+      approvalsCommand: input.commands.approvals,
+    },
+    supervision: {
+      installState: "plan_only",
+      restartPolicy: "supervisor_managed",
+      stopPolicy: "stop the supervisor, then inspect agent local status and logs",
+      note: "This plan is metadata-only; it does not register, start, stop, or mutate an OS service.",
+    },
+    nextCommand: input.lifecyclePlan.nextCommand ?? input.commands.status,
+    steps,
+  };
+}
+
+function localAgentServiceManager(platform: NodeJS.Platform): LocalAgentServiceManager {
+  if (platform === "win32") {
+    return "windows_task";
+  }
+  if (platform === "linux") {
+    return "systemd_user";
+  }
+  if (platform === "darwin") {
+    return "launchd_user";
+  }
+  if (platform === "android") {
+    return "termux_service";
+  }
+  return "foreground";
+}
+
+function localAgentServiceManagerLabel(manager: LocalAgentServiceManager): string {
+  switch (manager) {
+    case "windows_task":
+      return "Windows Task Scheduler";
+    case "systemd_user":
+      return "systemd user service";
+    case "launchd_user":
+      return "launchd user agent";
+    case "termux_service":
+      return "Termux service";
+    case "foreground":
+      return "foreground supervisor";
+  }
+}
+
 function withLocalLogSession(
   item: Omit<SessionTimelineItem, "ordinal">,
   sessions: Map<string, Session>,
@@ -8030,6 +8228,8 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
     `blocked=${status.lifecyclePlan.blockedSteps.join(",") || "-"}`,
   );
   console.log("");
+  printLocalAgentServicePlan(status.servicePlan, "Daemon service plan:");
+  console.log("");
   console.log("Daemon runbook:");
   console.log(`- ready=${status.runbook.ready}\tstate=${status.runbook.state}`);
   for (const step of status.runbook.steps) {
@@ -8070,6 +8270,7 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
   console.log("");
   console.log("Next:");
   console.log(`- ${status.commands.logs}`);
+  console.log(`- ${status.commands.servicePlan}`);
   console.log(`- ${status.commands.sessions}`);
   console.log(`- ${status.commands.schedulerRun}`);
   if (status.commands.workerPoll) {
@@ -8077,6 +8278,28 @@ function printLocalAgentStatus(status: Awaited<ReturnType<typeof buildLocalAgent
   }
   if (status.commands.latestSession) {
     console.log(`- ${status.commands.latestSession}`);
+  }
+}
+
+function printLocalAgentServicePlan(plan: ReturnType<typeof buildLocalAgentServicePlan>, heading = "Local daemon service plan:"): void {
+  console.log(heading);
+  console.log(`workspace=${plan.workspace}`);
+  console.log(
+    `service=${plan.serviceName}\tmanager=${plan.manager.kind}\tplatform=${plan.platform}\t` +
+    `ready=${plan.ready}\tblocked=${plan.blocked}`,
+  );
+  console.log(`state=${plan.state}\tmode=${plan.mode}\tnext=${plan.nextCommand ?? "-"}`);
+  console.log(`entrypoint=${plan.entrypoint.schedulerCommand}`);
+  if (plan.entrypoint.workerCommand) {
+    console.log(`worker=${plan.entrypoint.workerCommand}`);
+  }
+  console.log(`health=${plan.health.statusCommand}\tlogs=${plan.health.logsCommand}`);
+  console.log(`supervision=${plan.supervision.installState}\trestart=${plan.supervision.restartPolicy}`);
+  console.log(plan.supervision.note);
+  console.log("Steps:");
+  for (const step of plan.steps) {
+    console.log(`- [${step.status}] ${step.label}${step.command ? `: ${step.command}` : ""}`);
+    console.log(`  ${step.reason}`);
   }
 }
 
@@ -10741,7 +10964,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent logs, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent service, /agent logs, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
     stdout.write("soloclaw> ");
     for await (const rawLine of rl) {
@@ -10771,6 +10994,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /status              Show workspace model and readiness status");
         console.log("  /agent               Show local agent execution status");
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
+        console.log("  /agent service       Show daemon service supervision plan");
         console.log("  /agent logs          Show merged local execution logs");
         console.log("  /approvals [status]  List approval requests");
         console.log("  /approve <approval-id> [reason] Approve an approval request");
@@ -10857,6 +11081,24 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
             console.log(JSON.stringify(logs, null, 2));
           } else {
             printLocalAgentLogs(logs);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/agent service" || line === "/agent daemon" || line.startsWith("/agent service ") || line.startsWith("/agent daemon ")) {
+        const commandPrefix = line.startsWith("/agent daemon") ? "/agent daemon" : "/agent service";
+        const parsed = parseLocalAgentArgs(splitCliWords(line.slice(commandPrefix.length).trim()));
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const status = await buildLocalAgentStatus(platform.store, workspace, parsed.options);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(status.servicePlan, null, 2));
+          } else {
+            printLocalAgentServicePlan(status.servicePlan);
           }
         } finally {
           platform.locks.close?.();
@@ -11793,6 +12035,7 @@ Usage:
   soloclaw config path [--workspace path]
   soloclaw config show [--workspace path] [--json]
   soloclaw agent status [--workspace path] [--json] [--limit n]
+  soloclaw agent service [--workspace path] [--json] [--limit n]
   soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
   soloclaw run [same options as agent run] "your task"
@@ -11804,6 +12047,7 @@ Usage:
   agent phase1 verify [--json]
   agent phase2 verify [--workspace path] [--json] [--cleanup]
   agent local status [--workspace path] [--json] [--limit n]
+  agent local service [--workspace path] [--json] [--limit n]
   agent local logs [--workspace path] [--json] [--limit n]
   agent sessions [--json] [--limit n] [--status created|running|paused|cancelled|failed|completed] [--target-mode plan|build|goal]
   agent show-session <session-id>

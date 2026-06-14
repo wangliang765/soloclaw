@@ -1768,6 +1768,7 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
       "/help",
       "/agent",
       "/agent status --limit 5",
+      "/agent service --limit 5",
       "/agent logs --limit 20",
       "/approvals pending",
       "/approve appr_tui_agent_status approved from TUI",
@@ -1782,6 +1783,7 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.equal(result.exitCode, 0, result.stderr);
   assert.match(result.stdout, /\/agent\s+Show local agent execution status/);
   assert.match(result.stdout, /\/agent status\s+Show sessions, approvals, workers, and assignments/);
+  assert.match(result.stdout, /\/agent service\s+Show daemon service supervision plan/);
   assert.match(result.stdout, /\/agent logs\s+Show merged local execution logs/);
   assert.match(result.stdout, /\/approvals \[status\]\s+List approval requests/);
   assert.match(result.stdout, /\/approve <approval-id> \[reason\]\s+Approve an approval request/);
@@ -1791,6 +1793,9 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.match(result.stdout, new RegExp(session.id));
   assert.match(result.stdout, /Pending approvals:/);
   assert.match(result.stdout, /workspace\.write/);
+  assert.match(result.stdout, /Local daemon service plan:/);
+  assert.match(result.stdout, /service=soloclaw-local-agent/);
+  assert.match(result.stdout, /supervision=plan_only/);
   assert.match(result.stdout, /Local agent logs:/);
   assert.match(result.stdout, /command\.finished/);
   assert.match(result.stdout, /approval requested workspace\.write/);
@@ -7999,6 +8004,13 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       localAgentLifecycleRequiredSteps?: string[];
       localAgentLifecycleRecommendedSteps?: string[];
       localAgentLifecycleBlockedSteps?: string[];
+      localAgentServiceManager?: string;
+      localAgentServiceReady?: boolean;
+      localAgentServiceBlocked?: boolean;
+      localAgentServiceEntrypoint?: string;
+      localAgentServiceHealthCommand?: string;
+      localAgentServiceRequiredSteps?: string[];
+      localAgentServiceBlockedSteps?: string[];
       localAgentRunbookReady?: boolean;
       localAgentRunbookSteps?: number;
       localAgentRunbookRequiredCommand?: string;
@@ -8137,8 +8149,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionTimeline?: string;
       sessionReview?: string;
       sessionNoPendingVerify?: string;
-      localAgentStatus?: string;
-      localAgentLogs?: string;
+    localAgentStatus?: string;
+    localAgentServicePlan?: string;
+    localAgentLogs?: string;
       runJson?: string;
       modelReadinessGate?: string;
       resumeModelReadinessGate?: string;
@@ -8271,6 +8284,15 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.localAgentLifecycleRequiredSteps?.includes("resolve-attention"), true);
   assert.equal(parsed.evidence?.localAgentLifecycleBlockedSteps?.includes("run-scheduler"), true);
   assert.equal(parsed.evidence?.localAgentLifecycleBlockedSteps?.includes("poll-worker"), true);
+  assert.equal(typeof parsed.evidence?.localAgentServiceManager, "string");
+  assert.equal(parsed.evidence?.localAgentServiceReady, false);
+  assert.equal(parsed.evidence?.localAgentServiceBlocked, true);
+  assert.match(parsed.evidence?.localAgentServiceEntrypoint ?? "", /agent scheduler run/);
+  assert.equal(parsed.evidence?.localAgentServiceHealthCommand, "agent local status --json");
+  assert.equal(parsed.evidence?.localAgentServiceRequiredSteps?.includes("check-status"), true);
+  assert.equal(parsed.evidence?.localAgentServiceRequiredSteps?.includes("resolve-attention"), true);
+  assert.equal(parsed.evidence?.localAgentServiceBlockedSteps?.includes("run-foreground-loop"), true);
+  assert.equal(parsed.evidence?.localAgentServiceBlockedSteps?.includes("poll-ready-worker"), true);
   assert.equal(parsed.evidence?.localAgentRunbookReady, false);
   assert.equal((parsed.evidence?.localAgentRunbookSteps ?? 0) >= 4, true);
   assert.equal(parsed.evidence?.localAgentRunbookRequiredCommand, "agent approvals pending");
@@ -8432,6 +8454,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-list-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "local-agent-status-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "local-daemon-lifecycle-plan-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "local-daemon-service-plan-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "local-agent-logs-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
@@ -8459,6 +8482,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionNoPendingVerify?.includes("--require-no-pending-approvals"), true);
   assert.equal(parsed.commands?.sessionNoPendingVerify?.includes("--allow-no-command"), true);
   assert.equal(parsed.commands?.localAgentStatus?.includes("agent local status"), true);
+  assert.equal(parsed.commands?.localAgentServicePlan?.includes("agent local service"), true);
   assert.equal(parsed.commands?.localAgentLogs?.includes("agent local logs"), true);
   assert.equal(parsed.commands?.modelReadinessGate?.includes("--require-model-ready"), true);
   assert.equal(parsed.commands?.resumeModelReadinessGate?.includes("agent resume"), true);
@@ -9356,7 +9380,22 @@ test("agent session report summarizes engineering execution evidence", async (t)
       recommendedSteps?: string[];
       blockedSteps?: string[];
     };
-    commands?: { logs?: string; approvals?: string; workerPoll?: string; latestSession?: string };
+    servicePlan?: {
+      workspace?: string;
+      state?: string;
+      mode?: string;
+      ready?: boolean;
+      blocked?: boolean;
+      platform?: string;
+      serviceName?: string;
+      manager?: { kind?: string; label?: string; supported?: boolean };
+      entrypoint?: { schedulerCommand?: string; workerCommand?: string };
+      health?: { statusCommand?: string; logsCommand?: string; sessionsCommand?: string; approvalsCommand?: string };
+      supervision?: { installState?: string; restartPolicy?: string; stopPolicy?: string; note?: string };
+      nextCommand?: string;
+      steps?: Array<{ id?: string; label?: string; status?: string; command?: string; reason?: string }>;
+    };
+    commands?: { logs?: string; servicePlan?: string; approvals?: string; workerPoll?: string; latestSession?: string };
   };
   assert.equal(localStatus.workspace, dir);
   assert.equal(localStatus.summary?.state, "needs_attention");
@@ -9401,7 +9440,22 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(localStatus.lifecyclePlan?.requiredSteps?.includes("resolve-attention"), true);
   assert.equal(localStatus.lifecyclePlan?.blockedSteps?.includes("run-scheduler"), true);
   assert.equal(localStatus.lifecyclePlan?.blockedSteps?.includes("poll-worker"), true);
+  assert.equal(localStatus.servicePlan?.serviceName, "soloclaw-local-agent");
+  assert.equal(localStatus.servicePlan?.workspace, dir);
+  assert.equal(localStatus.servicePlan?.mode, "resolve_attention");
+  assert.equal(localStatus.servicePlan?.ready, false);
+  assert.equal(localStatus.servicePlan?.blocked, true);
+  assert.equal(typeof localStatus.servicePlan?.manager?.kind, "string");
+  assert.match(localStatus.servicePlan?.entrypoint?.schedulerCommand ?? "", /agent scheduler run/);
+  assert.match(localStatus.servicePlan?.entrypoint?.workerCommand ?? "", new RegExp(`agent workers poll ${worker.id}`));
+  assert.equal(localStatus.servicePlan?.health?.statusCommand, "agent local status --json");
+  assert.match(localStatus.servicePlan?.health?.logsCommand ?? "", /agent local logs/);
+  assert.equal(localStatus.servicePlan?.supervision?.installState, "plan_only");
+  assert.equal(localStatus.servicePlan?.steps?.some((step) => step.id === "check-status" && step.status === "required"), true);
+  assert.equal(localStatus.servicePlan?.steps?.some((step) => step.id === "run-foreground-loop" && step.status === "blocked"), true);
+  assert.equal(localStatus.servicePlan?.steps?.some((step) => step.id === "wrap-os-supervisor" && step.status === "blocked"), true);
   assert.match(localStatus.commands?.logs ?? "", /agent local logs/);
+  assert.match(localStatus.commands?.servicePlan ?? "", /agent local service/);
   assert.match(localStatus.commands?.approvals ?? "", /agent approvals pending/);
   assert.match(localStatus.commands?.workerPoll ?? "", new RegExp(`agent workers poll ${worker.id}`));
 
@@ -9431,6 +9485,10 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(localStatusText.stdout, /mode=resolve_attention/);
   assert.match(localStatusText.stdout, /next=agent approvals pending/);
   assert.match(localStatusText.stdout, /blocked=run-scheduler,poll-worker/);
+  assert.match(localStatusText.stdout, /Daemon service plan:/);
+  assert.match(localStatusText.stdout, /service=soloclaw-local-agent/);
+  assert.match(localStatusText.stdout, /entrypoint=agent scheduler run/);
+  assert.match(localStatusText.stdout, /supervision=plan_only/);
   assert.match(localStatusText.stdout, /Daemon runbook:/);
   assert.match(localStatusText.stdout, /\[required\] Resolve attention items: agent approvals pending/);
   assert.match(localStatusText.stdout, /\[blocked\] Run scheduler loop: agent scheduler run/);
@@ -9439,6 +9497,28 @@ test("agent session report summarizes engineering execution evidence", async (t)
   const soloclawAgentStatus = await run(process.execPath, [cli, "agent", "status", "--json", "--limit", "10"], dir);
   assert.equal(soloclawAgentStatus.exitCode, 0, soloclawAgentStatus.stderr);
   assert.equal((JSON.parse(soloclawAgentStatus.stdout) as { summary?: { state?: string } }).summary?.state, "needs_attention");
+
+  const localServiceJson = await run(process.execPath, [cli, "local", "service", "--json", "--limit", "10"], dir);
+  assert.equal(localServiceJson.exitCode, 0, localServiceJson.stderr);
+  const localService = JSON.parse(localServiceJson.stdout) as {
+    serviceName?: string;
+    blocked?: boolean;
+    entrypoint?: { schedulerCommand?: string; workerCommand?: string };
+    health?: { statusCommand?: string };
+    supervision?: { installState?: string };
+  };
+  assert.equal(localService.serviceName, "soloclaw-local-agent");
+  assert.equal(localService.blocked, true);
+  assert.match(localService.entrypoint?.schedulerCommand ?? "", /agent scheduler run/);
+  assert.match(localService.entrypoint?.workerCommand ?? "", new RegExp(`agent workers poll ${worker.id}`));
+  assert.equal(localService.health?.statusCommand, "agent local status --json");
+  assert.equal(localService.supervision?.installState, "plan_only");
+
+  const localServiceText = await run(process.execPath, [cli, "local", "service", "--limit", "10"], dir);
+  assert.equal(localServiceText.exitCode, 0, localServiceText.stderr);
+  assert.match(localServiceText.stdout, /Local daemon service plan:/);
+  assert.match(localServiceText.stdout, /service=soloclaw-local-agent/);
+  assert.match(localServiceText.stdout, /This plan is metadata-only/);
 
   const localLogsJson = await run(process.execPath, [cli, "local", "logs", "--json", "--limit", "30"], dir);
   assert.equal(localLogsJson.exitCode, 0, localLogsJson.stderr);
