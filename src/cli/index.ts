@@ -5165,6 +5165,17 @@ type PhaseTwoEngineeringSmokeResult = {
     queuedApprovalFileChanges: number;
     queuedApprovalToolResults: number;
     queuedApprovalAuditEvents: number;
+    queuedApprovalExpiredAssignmentId?: string;
+    queuedApprovalRetryAssignmentId?: string;
+    queuedApprovalRetryDelayMs: number;
+    queuedApprovalRetryNotBefore?: string;
+    queuedApprovalDelayedRunReason?: string;
+    queuedApprovalDelayedRetries: number;
+    queuedApprovalDueRetries: number;
+    queuedApprovalOperatorQueueStatus?: string;
+    queuedApprovalOperatorAssignmentStatus?: string;
+    queuedApprovalRetryCompleted: boolean;
+    queuedApprovalRetryAuditEvents: number;
     tuiApprovalSessionId?: string;
     tuiApprovalApprovedStatus?: ApprovalStatus;
     tuiApprovalDeniedStatus?: ApprovalStatus;
@@ -5965,6 +5976,28 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `session=${queuedApproval.sessionId ?? "-"}, worker=${queuedApproval.workerId ?? "-"}, ` +
         `assignment=${queuedApproval.assignmentId ?? "-"}, outcome=${queuedApproval.outcome ?? "-"}, completed=${queuedApproval.completed}`,
     });
+    checks.push({
+      id: "queued-approval-retry-backoff-evidence",
+      label: "queued approval retry backoff evidence",
+      status:
+        Boolean(queuedApproval.expiredAssignmentId) &&
+        Boolean(queuedApproval.retryAssignmentId) &&
+        queuedApproval.retryDelayMs > 0 &&
+        Boolean(queuedApproval.retryNotBefore) &&
+        queuedApproval.delayedRunReason === "no_assignment" &&
+        queuedApproval.delayedRetries >= 1 &&
+        queuedApproval.dueRetries >= 1 &&
+        queuedApproval.operatorQueueStatus === "retry_delayed" &&
+        queuedApproval.operatorAssignmentStatus === "retry_delayed" &&
+        queuedApproval.retryCompleted &&
+        queuedApproval.retryAuditEvents >= 2
+          ? "pass"
+          : "fail",
+      summary:
+        `expired=${queuedApproval.expiredAssignmentId ?? "-"}, retry=${queuedApproval.retryAssignmentId ?? "-"}, ` +
+        `delayMs=${queuedApproval.retryDelayMs}, notBefore=${queuedApproval.retryNotBefore ?? "-"}, ` +
+        `operator=${queuedApproval.operatorQueueStatus ?? "-"}/${queuedApproval.operatorAssignmentStatus ?? "-"}`,
+    });
 
     const tuiApproval = await runPhaseTwoTuiApprovalSmoke(platform, actor);
     checks.push({
@@ -6213,6 +6246,17 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         queuedApprovalFileChanges: queuedApproval.fileChanges,
         queuedApprovalToolResults: queuedApproval.toolResults,
         queuedApprovalAuditEvents: queuedApproval.auditEvents,
+        queuedApprovalExpiredAssignmentId: queuedApproval.expiredAssignmentId,
+        queuedApprovalRetryAssignmentId: queuedApproval.retryAssignmentId,
+        queuedApprovalRetryDelayMs: queuedApproval.retryDelayMs,
+        queuedApprovalRetryNotBefore: queuedApproval.retryNotBefore,
+        queuedApprovalDelayedRunReason: queuedApproval.delayedRunReason,
+        queuedApprovalDelayedRetries: queuedApproval.delayedRetries,
+        queuedApprovalDueRetries: queuedApproval.dueRetries,
+        queuedApprovalOperatorQueueStatus: queuedApproval.operatorQueueStatus,
+        queuedApprovalOperatorAssignmentStatus: queuedApproval.operatorAssignmentStatus,
+        queuedApprovalRetryCompleted: queuedApproval.retryCompleted,
+        queuedApprovalRetryAuditEvents: queuedApproval.retryAuditEvents,
         tuiApprovalSessionId: tuiApproval.sessionId,
         tuiApprovalApprovedStatus: tuiApproval.approvedStatus,
         tuiApprovalDeniedStatus: tuiApproval.deniedStatus,
@@ -6468,6 +6512,14 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- queuedApprovalFileChanges=${result.evidence.queuedApprovalFileChanges}`);
   console.log(`- queuedApprovalToolResults=${result.evidence.queuedApprovalToolResults}`);
   console.log(`- queuedApprovalAuditEvents=${result.evidence.queuedApprovalAuditEvents}`);
+  console.log(
+    `- queuedApprovalRetry=expired:${result.evidence.queuedApprovalExpiredAssignmentId ?? "-"},` +
+    `retry:${result.evidence.queuedApprovalRetryAssignmentId ?? "-"},delayMs:${result.evidence.queuedApprovalRetryDelayMs},` +
+    `notBefore:${result.evidence.queuedApprovalRetryNotBefore ?? "-"},delayedRun:${result.evidence.queuedApprovalDelayedRunReason ?? "-"},` +
+    `delayedRetries:${result.evidence.queuedApprovalDelayedRetries},dueRetries:${result.evidence.queuedApprovalDueRetries},` +
+    `operator:${result.evidence.queuedApprovalOperatorQueueStatus ?? "-"}/${result.evidence.queuedApprovalOperatorAssignmentStatus ?? "-"},` +
+    `completed:${result.evidence.queuedApprovalRetryCompleted},audits:${result.evidence.queuedApprovalRetryAuditEvents}`,
+  );
   console.log(
     `- tuiApproval=session:${result.evidence.tuiApprovalSessionId ?? "-"},approved:${result.evidence.tuiApprovalApprovedStatus ?? "-"},` +
     `denied:${result.evidence.tuiApprovalDeniedStatus ?? "-"},audits:${result.evidence.tuiApprovalDecisionAuditEvents},` +
@@ -6778,7 +6830,7 @@ async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<Retu
     machineId: platform.localAgent.machineId,
     displayName: "Phase 2 queued approval worker",
     capabilities: ["workspace.exec"],
-    maxConcurrentTasks: 1,
+    maxConcurrentTasks: 2,
     ttlSeconds: 60,
   });
   const approvalId = makeId<"ArtifactId">("appr");
@@ -6836,6 +6888,7 @@ async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<Retu
         actor,
         workerId: worker.id,
         sessionId: session.id,
+        leaseTtlSeconds: 0,
         metadata: {
           continuation: "approval_resume",
           approvalId,
@@ -6844,7 +6897,44 @@ async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<Retu
         },
       })
     : undefined;
-  const run = assignment
+  const recovered = assignment
+    ? await platform.taskBroker.recoverExpired({
+        actor,
+        retryWorkerId: worker.id,
+        now: new Date(Date.now() + 1_000).toISOString(),
+        leaseTtlSeconds: 300,
+        baseBackoffMs: 60_000,
+        maxBackoffMs: 60_000,
+        jitterMs: 0,
+      })
+    : undefined;
+  const retryAssignment = recovered?.retries[0];
+  const delayedRun = retryAssignment
+    ? await platform.workerRunner.runOnce({
+        workerId: worker.id,
+        actor,
+        leaseTtlSeconds: 60,
+      })
+    : undefined;
+  const delayedHealth = await platform.workerHealth.getSummary({ limit: 1000 });
+  const delayedOperator = (await new ControlPlaneService(platform).getState()).operator;
+  const operatorAssignment = retryAssignment
+    ? delayedOperator.assignments.find((item) => item.refs?.assignmentId === retryAssignment.id)
+    : undefined;
+  const dueRetryAssignment = retryAssignment
+    ? {
+        ...retryAssignment,
+        metadata: {
+          ...(retryAssignment.metadata ?? {}),
+          retryNotBefore: new Date(Date.now() - 1_000).toISOString(),
+        },
+      }
+    : undefined;
+  if (dueRetryAssignment) {
+    await platform.store.updateTaskAssignment(dueRetryAssignment);
+  }
+  const dueHealth = await platform.workerHealth.getSummary({ limit: 1000 });
+  const run = retryAssignment
     ? await platform.workerRunner.runOnce({
         workerId: worker.id,
         actor,
@@ -6857,13 +6947,24 @@ async function runPhaseTwoQueuedApprovalContinuationSmoke(platform: Awaited<Retu
   return {
     sessionId: session.id,
     workerId: worker.id,
-    assignmentId: assignment?.id,
+    assignmentId: retryAssignment?.id ?? assignment?.id,
     outcome: result.summary.outcome,
     completed: run?.ran === true && run.completed && result.summary.outcome === "succeeded",
     replayOk: replay.ok,
     fileChanges: fileChanges.length,
     toolResults: result.summary.toolResults,
     auditEvents: auditEvents.filter((event) => event.type === "task.assigned" || event.type === "task.completed" || event.type === "tool.completed").length,
+    expiredAssignmentId: recovered?.expired[0]?.id,
+    retryAssignmentId: retryAssignment?.id,
+    retryDelayMs: typeof retryAssignment?.metadata?.retryDelayMs === "number" ? retryAssignment.metadata.retryDelayMs : 0,
+    retryNotBefore: typeof retryAssignment?.metadata?.retryNotBefore === "string" ? retryAssignment.metadata.retryNotBefore : undefined,
+    delayedRunReason: delayedRun?.ran === false ? delayedRun.reason : undefined,
+    delayedRetries: delayedHealth.assignments.delayedRetries,
+    dueRetries: dueHealth.assignments.dueRetries,
+    operatorQueueStatus: delayedOperator.queue.status,
+    operatorAssignmentStatus: operatorAssignment?.status,
+    retryCompleted: run?.ran === true && run.completed && run.assignment.id === retryAssignment?.id,
+    retryAuditEvents: auditEvents.filter((event) => event.type === "task.expired" || event.type === "task.retry_scheduled" || event.type === "task.completed").length,
   };
 }
 
