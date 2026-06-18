@@ -85,11 +85,13 @@ agent run --provider openai_compatible --base-url http://localhost:8000/v1 --api
 agent run --provider anthropic_compatible --base-url http://localhost:8000 --api-key-secret sec_xxxxxxxx "task"
 ```
 
-Known provider profiles also support environment variables. Defaults include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY` / `GROK_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `GLM_API_KEY` / `ZHIPU_API_KEY` / `BIGMODEL_API_KEY`, and `MIMO_API_KEY` / `XIAOMI_MIMO_API_KEY`. `--api-key-env` overrides the default lookup for the selected provider.
+Known provider profiles also support environment variables. Defaults include `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `MOONSHOT_API_KEY` / `KIMI_API_KEY`, `XAI_API_KEY` / `GROK_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `ZAI_API_KEY` / `GLM_API_KEY` / `ZHIPU_API_KEY` / `BIGMODEL_API_KEY`, `DASHSCOPE_API_KEY` / `QWEN_API_KEY`, and `MIMO_API_KEY` / `XIAOMI_MIMO_API_KEY`. `--api-key-env` overrides the default lookup for the selected provider.
 
 Local provider profile overrides can be managed with:
 
 ```text
+soloclaw
+# then run /model setup for the menu-style provider/base URL/model/API key flow
 soloclaw model setup --provider openai --api-key-env OPENAI_API_KEY
 soloclaw model setup --provider openai_compatible --base-url http://localhost:8000/v1 --model local-model --api-key-env LOCAL_LLM_API_KEY
 soloclaw model list --json
@@ -103,7 +105,7 @@ agent models profiles set openai_compatible --base-url http://localhost:8000/v1 
 agent models profiles remove openai_compatible
 ```
 
-These overrides are stored in `.agent/model-providers.json` and must not contain raw API keys. The file records only provider metadata, `defaultProvider`, and environment variable names. Use `--api-key-secret` or an environment variable for the secret value itself. The JSON file is intentionally editable by hand, for example:
+These overrides are stored in `.agent/model-providers.json` and must not contain raw API keys. The file records only provider metadata, `defaultProvider`, environment variable names, and optional `apiKeySecretRef` identifiers. TUI `/model setup` can accept a pasted API key and store it into `.agent/secrets.vault.json` as an encrypted local secret, then write only the `apiKeySecretRef` into the model profile. Use `--api-key-secret` or an environment variable for the secret value itself. The JSON file is intentionally editable by hand, for example:
 
 ```json
 {
@@ -115,7 +117,8 @@ These overrides are stored in `.agent/model-providers.json` and must not contain
       "protocol": "openai_chat",
       "defaultBaseUrl": "http://localhost:8000/v1",
       "defaultModel": "local-model",
-      "apiKeyEnvNames": ["LOCAL_LLM_API_KEY"]
+      "apiKeyEnvNames": ["LOCAL_LLM_API_KEY"],
+      "apiKeySecretRef": "sec_xxxxxxxx"
     }
   }
 }

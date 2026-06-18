@@ -12,9 +12,10 @@ import {
   readJson,
   requiredString,
 } from "../control-plane/control-plane-service.js";
-import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, RoomDeliveryAckEnvelope, RoomMemberStatus, RoomRole } from "../domain/index.js";
+import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, PolicyAction, RoomDeliveryAckEnvelope, RoomMemberStatus, RoomRole, Session } from "../domain/index.js";
 import type { OperatorItemKind, OperatorSeverity, OperatorStatus } from "../operator/operator-view-models.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
+import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
 
 export type LocalRoomWebServerOptions = {
   host?: string;
@@ -32,6 +33,10 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? "/", `http://${host}:${port}`);
+      if (request.method === "GET" && url.pathname === "/favicon.ico") {
+        sendNoContent(response);
+        return;
+      }
       if (!isAuthorized(request, url, token)) {
         sendJson(response, { error: "Unauthorized" }, 401);
         return;
@@ -457,6 +462,83 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
         return;
       }
 
+      if (request.method === "GET" && url.pathname === "/api/sessions") {
+        sendJson(response, await control.getSessionDashboard(sessionDashboardOptionsFromUrl(url)));
+        return;
+      }
+
+      const sessionStatusMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/status$/);
+      if (request.method === "GET" && sessionStatusMatch) {
+        const sessionId = decodeURIComponent(sessionStatusMatch[1]);
+        const status = await control.getSessionStatus(sessionId, sessionTimelineOptionsFromUrl(url));
+        if (!status) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, status);
+        return;
+      }
+
+      const sessionResultMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/result$/);
+      if (request.method === "GET" && sessionResultMatch) {
+        const sessionId = decodeURIComponent(sessionResultMatch[1]);
+        const result = await control.getSessionResult(sessionId);
+        if (!result) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, result);
+        return;
+      }
+
+      const sessionDiffMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/diff$/);
+      if (request.method === "GET" && sessionDiffMatch) {
+        const sessionId = decodeURIComponent(sessionDiffMatch[1]);
+        const diff = await control.getSessionDiff(sessionId);
+        if (!diff) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, diff);
+        return;
+      }
+
+      const sessionReportMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/report$/);
+      if (request.method === "GET" && sessionReportMatch) {
+        const sessionId = decodeURIComponent(sessionReportMatch[1]);
+        const report = await control.getSessionReport(sessionId);
+        if (!report) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, report);
+        return;
+      }
+
+      const sessionVerificationMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/verify$/);
+      if (request.method === "GET" && sessionVerificationMatch) {
+        const sessionId = decodeURIComponent(sessionVerificationMatch[1]);
+        const verification = await control.getSessionVerification(sessionId, sessionVerificationOptionsFromUrl(url));
+        if (!verification) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, verification);
+        return;
+      }
+
+      const sessionBundleMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/bundle$/);
+      if (request.method === "GET" && sessionBundleMatch) {
+        const sessionId = decodeURIComponent(sessionBundleMatch[1]);
+        const bundle = await control.getSessionBundle(sessionId, sessionBundleOptionsFromUrl(url));
+        if (!bundle) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, bundle);
+        return;
+      }
+
       const sessionInspectionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/inspect$/);
       if (request.method === "GET" && sessionInspectionMatch) {
         const sessionId = decodeURIComponent(sessionInspectionMatch[1]);
@@ -466,6 +548,42 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
           return;
         }
         sendJson(response, inspection);
+        return;
+      }
+
+      const sessionNextMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/next$/);
+      if (request.method === "GET" && sessionNextMatch) {
+        const sessionId = decodeURIComponent(sessionNextMatch[1]);
+        const next = await control.getSessionNext(sessionId);
+        if (!next) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, next);
+        return;
+      }
+
+      const sessionTimelineMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/timeline$/);
+      if (request.method === "GET" && sessionTimelineMatch) {
+        const sessionId = decodeURIComponent(sessionTimelineMatch[1]);
+        const timeline = await control.getSessionTimeline(sessionId, sessionTimelineOptionsFromUrl(url));
+        if (!timeline) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, timeline);
+        return;
+      }
+
+      const sessionReviewMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/review$/);
+      if (request.method === "GET" && sessionReviewMatch) {
+        const sessionId = decodeURIComponent(sessionReviewMatch[1]);
+        const review = await control.getSessionReview(sessionId, sessionTimelineOptionsFromUrl(url));
+        if (!review) {
+          sendJson(response, { error: `Session not found: ${sessionId}` }, 404);
+          return;
+        }
+        sendJson(response, review);
         return;
       }
 
@@ -658,6 +776,13 @@ function sendHtml(response: ServerResponse, html: string): void {
   response.end(html);
 }
 
+function sendNoContent(response: ServerResponse): void {
+  response.writeHead(204, {
+    "cache-control": "no-store",
+  });
+  response.end();
+}
+
 function httpErrorStatus(error: unknown): number {
   const message = error instanceof Error ? error.message : String(error);
   if (/Actor lacks room capability|lacks capability|Policy denied/i.test(message)) {
@@ -670,7 +795,7 @@ function httpErrorStatus(error: unknown): number {
     return 409;
   }
   if (
-    /Missing required|Invalid room|Invalid agent identity|Invalid worker status|Invalid exhausted target status|Expected non-negative|must be a number|alias already exists|alias conflicts|alias is reserved|exceeding maxRoutedAgentTargets|Wide room mentions are disabled|Signed .* envelope is required/i.test(
+    /Missing required|Invalid room|Invalid agent identity|Invalid worker status|Invalid exhausted target status|Invalid kind|Invalid status|Invalid severity|Invalid targetMode|Expected non-negative|must be a number|must be an integer between|alias already exists|alias conflicts|alias is reserved|exceeding maxRoutedAgentTargets|Wide room mentions are disabled|Signed .* envelope is required/i.test(
       message,
     )
   ) {
@@ -773,6 +898,55 @@ function operatorRowsFromUrl(url: URL) {
   };
 }
 
+function sessionDashboardOptionsFromUrl(url: URL) {
+  return {
+    limit: optionalOperatorUrlInteger(url, "limit", 1, 50),
+    status: optionalOperatorUrlEnum(url, "status", ["created", "running", "paused", "cancelled", "failed", "completed"] satisfies Session["status"][]),
+    targetMode: optionalOperatorUrlEnum(url, "targetMode", ["plan", "build", "goal"] satisfies Session["targetMode"][]),
+  };
+}
+
+function sessionTimelineOptionsFromUrl(url: URL) {
+  return {
+    limit: optionalOperatorUrlInteger(url, "limit", 1, 100),
+  };
+}
+
+function sessionVerificationOptionsFromUrl(url: URL) {
+  const executionProfiles = url.searchParams.getAll("executionProfile")
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const requiredExecutionProfiles = executionProfiles.filter((value): value is CommandExecutionProfileName =>
+    COMMAND_EXECUTION_PROFILE_NAMES.includes(value as CommandExecutionProfileName)
+  );
+  const requiredApprovalActions = url.searchParams.getAll("approvalAction")
+    .flatMap((value) => value.split(","))
+    .map((value) => value.trim())
+    .filter(Boolean) as PolicyAction[];
+  return {
+    preset: optionalOperatorUrlEnum(url, "preset", ["handoff"] as const),
+    requireChange: optionalUrlBoolean(url, "requireChange"),
+    requirePatch: optionalUrlBoolean(url, "requirePatch"),
+    requireRecovery: optionalUrlBoolean(url, "requireRecovery"),
+    requireTimeout: optionalUrlBoolean(url, "requireTimeout"),
+    requireDiffStat: optionalUrlBoolean(url, "requireDiffStat"),
+    requireReviewProfile: optionalUrlBoolean(url, "requireReviewProfile"),
+    requireModelCall: optionalUrlBoolean(url, "requireModelCall"),
+    requireNoPendingApprovals: optionalUrlBoolean(url, "requireNoPendingApprovals"),
+    requireCommand: optionalUrlBoolean(url, "requireCommand"),
+    requiredExecutionProfiles,
+    requiredApprovalActions,
+  };
+}
+
+function sessionBundleOptionsFromUrl(url: URL) {
+  return {
+    ...sessionVerificationOptionsFromUrl(url),
+    limit: optionalOperatorUrlInteger(url, "limit", 1, 100),
+  };
+}
+
 function optionalOperatorUrlEnum<T extends string>(url: URL, key: string, values: readonly T[]): T | undefined {
   const value = optionalUrlString(url, key);
   if (!value) {
@@ -829,6 +1003,21 @@ function optionalBodyNonNegativeNumber(value: unknown, field: string): number | 
 function optionalUrlString(url: URL, key: string): string | undefined {
   const value = url.searchParams.get(key);
   return value && value.trim().length > 0 ? value : undefined;
+}
+
+function optionalUrlBoolean(url: URL, key: string): boolean | undefined {
+  const value = optionalUrlString(url, key);
+  if (value === undefined) {
+    return undefined;
+  }
+  const normalized = value.toLowerCase();
+  if (normalized === "1" || normalized === "true" || normalized === "yes") {
+    return true;
+  }
+  if (normalized === "0" || normalized === "false" || normalized === "no") {
+    return false;
+  }
+  throw new Error(`Invalid ${key}: ${value}`);
 }
 
 function optionalUrlInteger(url: URL, key: string): number | undefined {
@@ -890,7 +1079,7 @@ function optionalExhaustedStatus(value: unknown): "paused" | "failed" | undefine
   throw new Error(`Invalid exhausted target status: ${String(value)}`);
 }
 
-function renderAppHtml(): string {
+export function renderAppHtml(): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -988,6 +1177,7 @@ function renderAppHtml(): string {
     .session-inspection-section { display: grid; gap: 5px; }
     .session-inspection-list { display: grid; gap: 6px; }
     .session-inspection-item { border-left: 3px solid var(--line); padding: 4px 0 4px 8px; display: grid; gap: 3px; min-width: 0; }
+    .session-diff-patch { margin: 4px 0 0; padding: 8px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 6px; background: #f7f8f8; color: var(--muted); font-size: 12px; line-height: 1.35; }
     .health-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-bottom: 8px; }
     .health-stat { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px; min-width: 0; }
     .health-stat strong { display: block; font-size: 16px; line-height: 1.2; }
@@ -999,6 +1189,14 @@ function renderAppHtml(): string {
     .health-state.online, .health-state.idle, .health-state.running { color: var(--good); border-color: #9ac7a9; background: #f1f8f3; }
     .health-state.error, .health-state.stale { color: var(--danger); border-color: #efb4ad; background: #fff5f3; }
     .health-state.offline, .health-state.unknown { color: var(--muted); background: #f7f8f8; }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .section-heading h2 { margin: 0; }
+    .section-heading button { padding: 5px 8px; font-size: 12px; }
+    .section-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+    .live-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .live-toggle input { width: auto; margin: 0; }
+    .session-dashboard-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; margin: 8px 0; }
+    .session-dashboard-controls select { min-width: 0; padding: 6px 8px; font-size: 12px; }
     .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
     .actions button { padding: 5px 8px; font-size: 12px; }
@@ -1006,6 +1204,7 @@ function renderAppHtml(): string {
     .status.pending, .status.paused, .status.waiting_for_approval, .status.retry_delayed, .status.draining, .status.saturated { color: var(--warn); }
     .status.approved, .status.completed, .status.running, .status.healthy, .status.idle, .status.queued { color: var(--good); }
     .status.denied, .status.failed, .status.cancelled, .status.blocked, .status.stale, .status.offline { color: var(--danger); }
+    .status.command { color: var(--muted); }
     .empty { color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; padding: 14px; background: #fff; }
     @media (max-width: 980px) {
       .shell { grid-template-columns: 1fr; }
@@ -1100,11 +1299,37 @@ function renderAppHtml(): string {
         <div class="queue" id="approvals"></div>
       </section>
       <section class="section">
-        <h2>Sessions</h2>
+        <div class="section-heading">
+          <h2>Sessions</h2>
+          <button id="session-dashboard-refresh" type="button">Dashboard</button>
+        </div>
+        <div class="session-dashboard-controls">
+          <select id="session-dashboard-status" aria-label="Session dashboard status">
+            <option value="">any status</option>
+            <option value="created">created</option>
+            <option value="running">running</option>
+            <option value="paused">paused</option>
+            <option value="cancelled">cancelled</option>
+            <option value="failed">failed</option>
+            <option value="completed">completed</option>
+          </select>
+          <select id="session-dashboard-target-mode" aria-label="Session dashboard target mode">
+            <option value="">any mode</option>
+            <option value="plan">plan</option>
+            <option value="build">build</option>
+            <option value="goal">goal</option>
+          </select>
+        </div>
         <div class="queue" id="sessions"></div>
       </section>
       <section class="section">
-        <h2>Session Inspect</h2>
+        <div class="section-heading">
+          <h2>Session Inspect</h2>
+          <div class="section-actions">
+            <label class="live-toggle"><input id="session-inspection-live" type="checkbox"> Live</label>
+            <button id="session-inspection-refresh" type="button">Refresh</button>
+          </div>
+        </div>
         <div id="session-inspection"></div>
       </section>
     </aside>
@@ -1116,6 +1341,8 @@ function renderAppHtml(): string {
     let selectedOperatorItemId = null;
     let selectedSessionInspection = null;
     let selectedSessionInspectionId = null;
+    let selectedSessionInspectionKind = null;
+    let sessionDashboard = null;
     const controlToken = new URLSearchParams(window.location.search).get('token') || '';
 
     function apiFetch(path, options = {}) {
@@ -1665,12 +1892,12 @@ function renderAppHtml(): string {
         approve.className = 'primary';
         approve.type = 'button';
         approve.textContent = 'Approve';
-        approve.onclick = () => decideApproval(approval.id, 'approve', true);
+        approve.onclick = () => decideApproval(approval.id, 'approve', true, approval.sessionId);
         const deny = document.createElement('button');
         deny.className = 'danger';
         deny.type = 'button';
         deny.textContent = 'Deny';
-        deny.onclick = () => decideApproval(approval.id, 'deny', false);
+        deny.onclick = () => decideApproval(approval.id, 'deny', false, approval.sessionId);
         controls.append(approve, deny);
         item.append(controls);
         root.append(item);
@@ -1681,17 +1908,37 @@ function renderAppHtml(): string {
       const root = document.getElementById('sessions');
       root.textContent = '';
       const operatorSessions = state.operator?.sessions || [];
-      const visibleSessionIds = new Set(state.sessions.map((session) => session.id));
+      const dashboardEntries = sessionDashboard?.sessions || [];
+      const dashboardSessions = dashboardEntries.map((entry) => entry.session).filter(Boolean);
+      const usingDashboard = Boolean(sessionDashboard);
+      const sessionRows = usingDashboard ? dashboardSessions : state.sessions.slice(0, 12);
+      const visibleSessionIds = new Set(sessionRows.map((session) => session.id));
       if (selectedSessionInspectionId && !visibleSessionIds.has(selectedSessionInspectionId)) {
         selectedSessionInspection = null;
         selectedSessionInspectionId = null;
+        selectedSessionInspectionKind = null;
       }
-      if (state.sessions.length === 0) {
-        root.append(empty('No sessions'));
+      if (sessionRows.length === 0) {
+        root.append(empty(usingDashboard ? 'No dashboard sessions' : 'No sessions'));
         return;
       }
-      for (const session of state.sessions.slice(0, 12)) {
+      if (sessionDashboard?.summary) {
+        const filters = sessionDashboard.summary.filters || {};
+        const filterText = [
+          filters.status ? 'status=' + filters.status : null,
+          filters.targetMode ? 'mode=' + filters.targetMode : null,
+        ].filter(Boolean).join(' ');
+        root.append(text(
+          'div',
+          'dashboard returned=' + sessionDashboard.summary.returned + '/' + sessionDashboard.summary.scanned +
+            ' handoff=' + formatCounts(sessionDashboard.summary.byHandoffState) +
+            (filterText ? ' ' + filterText : ''),
+          'meta',
+        ));
+      }
+      for (const session of sessionRows) {
         const view = operatorSessions.find((item) => item.id === session.id);
+        const dashboard = dashboardEntries.find((entry) => entry.session?.id === session.id);
         const item = document.createElement('div');
         item.className = 'session';
         item.append(row(session.id, view?.status || session.status, 'status ' + (view?.status || session.status)));
@@ -1699,6 +1946,19 @@ function renderAppHtml(): string {
         item.append(text('div', view?.reason || session.updatedAt, 'meta'));
         if (view?.nextAction) {
           item.append(text('div', view.nextAction, 'meta'));
+        }
+        if (dashboard?.summary) {
+          item.append(text(
+            'div',
+            'handoff=' + (dashboard.summary.handoffState || '-') + ' next=' + (dashboard.summary.handoffNextCommand || '-'),
+            'meta',
+          ));
+          item.append(text(
+            'div',
+            'commands=' + (dashboard.summary.commandsFinished || 0) + '/' + (dashboard.summary.failedCommands || 0) +
+              ' changes=' + ((dashboard.summary.changedPaths || []).join(',') || '-'),
+            'meta',
+          ));
         }
         const controls = sessionActions(session);
         if (controls.childElementCount > 0) {
@@ -1711,11 +1971,56 @@ function renderAppHtml(): string {
     function sessionActions(session) {
       const controls = document.createElement('div');
       controls.className = 'actions';
+      const status = document.createElement('button');
+      status.type = 'button';
+      status.textContent = 'Status';
+      status.onclick = () => loadSessionStatus(session.id);
+      controls.append(status);
+      const review = document.createElement('button');
+      review.type = 'button';
+      review.textContent = 'Review';
+      review.onclick = () => loadSessionReview(session.id);
+      controls.append(review);
+      const result = document.createElement('button');
+      result.type = 'button';
+      result.textContent = 'Result';
+      result.onclick = () => loadSessionResult(session.id);
+      controls.append(result);
+      const diff = document.createElement('button');
+      diff.type = 'button';
+      diff.textContent = 'Diff';
+      diff.onclick = () => loadSessionDiff(session.id);
+      controls.append(diff);
+      const report = document.createElement('button');
+      report.type = 'button';
+      report.textContent = 'Report';
+      report.onclick = () => loadSessionReport(session.id);
+      controls.append(report);
+      const verify = document.createElement('button');
+      verify.type = 'button';
+      verify.textContent = 'Verify';
+      verify.onclick = () => loadSessionVerify(session.id);
+      controls.append(verify);
+      const bundle = document.createElement('button');
+      bundle.type = 'button';
+      bundle.textContent = 'Bundle';
+      bundle.onclick = () => loadSessionBundle(session.id);
+      controls.append(bundle);
       const inspect = document.createElement('button');
       inspect.type = 'button';
       inspect.textContent = 'Inspect';
       inspect.onclick = () => loadSessionInspection(session.id);
       controls.append(inspect);
+      const next = document.createElement('button');
+      next.type = 'button';
+      next.textContent = 'Next';
+      next.onclick = () => loadSessionNext(session.id);
+      controls.append(next);
+      const timeline = document.createElement('button');
+      timeline.type = 'button';
+      timeline.textContent = 'Timeline';
+      timeline.onclick = () => loadSessionTimeline(session.id);
+      controls.append(timeline);
       if (session.status === 'created' || session.status === 'running' || session.status === 'failed') {
         controls.append(sessionActionButton(session.id, 'pause', 'Pause'));
       }
@@ -1737,15 +2042,136 @@ function renderAppHtml(): string {
       return button;
     }
 
-    async function loadSessionInspection(sessionId) {
-      const response = await apiFetch('/api/sessions/' + encodeURIComponent(sessionId) + '/inspect');
+    const sessionInspectionPaths = {
+      status: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/status?limit=12',
+      result: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/result',
+      diff: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/diff',
+      report: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/report',
+      verify: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/verify?preset=handoff',
+      bundle: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/bundle?preset=handoff&limit=12',
+      inspect: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/inspect',
+      next: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/next',
+      timeline: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/timeline?limit=12',
+      review: (sessionId) => '/api/sessions/' + encodeURIComponent(sessionId) + '/review?limit=12',
+    };
+
+    function sessionInspectionPath(sessionId, kind) {
+      const build = sessionInspectionPaths[kind];
+      if (!build) {
+        throw new Error('Unknown session view: ' + kind);
+      }
+      return build(sessionId);
+    }
+
+    async function loadSessionInspectionView(sessionId, kind) {
+      const response = await apiFetch(sessionInspectionPath(sessionId, kind));
       if (!response.ok) {
         alert((await response.json()).error || 'Request failed');
         return;
       }
       selectedSessionInspection = await response.json();
       selectedSessionInspectionId = sessionId;
+      selectedSessionInspectionKind = kind;
       renderSessionInspection();
+    }
+
+    async function refreshSelectedSessionInspection() {
+      if (!selectedSessionInspectionId || !selectedSessionInspectionKind) {
+        return;
+      }
+      await loadSessionInspectionView(selectedSessionInspectionId, selectedSessionInspectionKind);
+    }
+
+    function isSessionInspectionLive() {
+      return Boolean(document.getElementById('session-inspection-live')?.checked);
+    }
+
+    async function refreshOpenSessionViews() {
+      const shouldRefreshLiveViews = isSessionInspectionLive();
+      const shouldRefreshDashboard = Boolean(sessionDashboard);
+      const inspectionId = selectedSessionInspectionId;
+      const inspectionKind = selectedSessionInspectionKind;
+      await loadState();
+      if (!shouldRefreshLiveViews) {
+        return;
+      }
+      if (shouldRefreshDashboard) {
+        await loadSessionDashboard();
+      }
+      if (inspectionId && inspectionKind) {
+        await loadSessionInspectionView(inspectionId, inspectionKind);
+      }
+    }
+
+    async function refreshAfterSessionMutation(sessionId) {
+      const shouldRefreshInspection = Boolean(sessionId && selectedSessionInspectionId === sessionId && selectedSessionInspectionKind);
+      const inspectionKind = selectedSessionInspectionKind;
+      await loadState();
+      if (sessionDashboard) {
+        await loadSessionDashboard();
+      }
+      if (shouldRefreshInspection) {
+        await loadSessionInspectionView(sessionId, inspectionKind);
+      }
+    }
+
+    async function loadSessionDashboard() {
+      const response = await apiFetch(sessionDashboardPath());
+      if (!response.ok) {
+        alert((await response.json()).error || 'Request failed');
+        return;
+      }
+      sessionDashboard = await response.json();
+      renderSessions();
+    }
+
+    function sessionDashboardPath() {
+      const params = new URLSearchParams({ limit: '12' });
+      const status = document.getElementById('session-dashboard-status').value;
+      const targetMode = document.getElementById('session-dashboard-target-mode').value;
+      if (status) params.set('status', status);
+      if (targetMode) params.set('targetMode', targetMode);
+      return '/api/sessions?' + params.toString();
+    }
+
+    async function loadSessionStatus(sessionId) {
+      await loadSessionInspectionView(sessionId, 'status');
+    }
+
+    async function loadSessionResult(sessionId) {
+      await loadSessionInspectionView(sessionId, 'result');
+    }
+
+    async function loadSessionDiff(sessionId) {
+      await loadSessionInspectionView(sessionId, 'diff');
+    }
+
+    async function loadSessionReport(sessionId) {
+      await loadSessionInspectionView(sessionId, 'report');
+    }
+
+    async function loadSessionVerify(sessionId) {
+      await loadSessionInspectionView(sessionId, 'verify');
+    }
+
+    async function loadSessionBundle(sessionId) {
+      await loadSessionInspectionView(sessionId, 'bundle');
+    }
+
+    async function loadSessionInspection(sessionId) {
+      await loadSessionInspectionView(sessionId, 'inspect');
+    }
+
+    async function loadSessionNext(sessionId) {
+      await loadSessionInspectionView(sessionId, 'next');
+    }
+
+    async function loadSessionTimeline(sessionId) {
+      await loadSessionInspectionView(sessionId, 'timeline');
+    }
+
+    async function loadSessionReview(sessionId) {
+      await loadSessionInspectionView(sessionId, 'review');
     }
 
     function renderSessionInspection() {
@@ -1756,6 +2182,38 @@ function renderAppHtml(): string {
         return;
       }
       const view = selectedSessionInspection;
+      if (view.kind === 'session_status') {
+        renderSessionStatus(root, view);
+        return;
+      }
+      if (view.kind === 'session_result') {
+        renderSessionResult(root, view);
+        return;
+      }
+      if (view.kind === 'session_diff') {
+        renderSessionDiff(root, view);
+        return;
+      }
+      if (view.kind === 'session_report') {
+        renderSessionReport(root, view);
+        return;
+      }
+      if (view.kind === 'session_verification') {
+        renderSessionVerification(root, view);
+        return;
+      }
+      if (view.kind === 'session_bundle') {
+        renderSessionBundle(root, view);
+        return;
+      }
+      if (Array.isArray(view.checklist)) {
+        renderSessionReview(root, view);
+        return;
+      }
+      if (Array.isArray(view.items)) {
+        renderSessionTimeline(root, view);
+        return;
+      }
       const panel = document.createElement('div');
       panel.className = 'session-inspection';
       const head = document.createElement('div');
@@ -1766,6 +2224,9 @@ function renderAppHtml(): string {
         head.append(text('div', view.session.objective, 'meta'));
       }
       panel.append(head);
+      if (view.handoff) {
+        panel.append(text('div', 'handoff=' + (view.handoff.state || '-') + ' next=' + (view.handoff.nextCommand || '-'), 'meta'));
+      }
       panel.append(text('div', view.summary?.inspectionSummary || view.inspection?.summary || '-', 'meta'));
       const focusPaths = view.summary?.inspectionFocusPaths || view.inspection?.focusPaths || [];
       panel.append(text('div', 'focus=' + (focusPaths.length > 0 ? focusPaths.join(', ') : '-'), 'meta'));
@@ -1801,6 +2262,843 @@ function renderAppHtml(): string {
       }
       actionsSection.append(actionList);
       panel.append(actionsSection);
+
+      const commands = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const commandsSection = document.createElement('div');
+      commandsSection.className = 'session-inspection-section';
+      commandsSection.append(text('strong', 'Commands'));
+      const commandList = document.createElement('div');
+      commandList.className = 'session-inspection-list';
+      if (commands.length === 0) {
+        commandList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of commands) {
+          commandList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      commandsSection.append(commandList);
+      panel.append(commandsSection);
+      root.append(panel);
+    }
+
+    function renderSessionStatus(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.summary?.outcome || 'status', 'status ' + (view.summary?.outcome || 'status')));
+      head.append(text(
+        'div',
+        (view.summary?.status || '-') + ' | target=' + (view.summary?.targetMode || '-') +
+          ' | timeline=' + (view.summary?.returnedTimelineItems || 0) + '/' + (view.summary?.timelineItems || 0),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text(
+        'div',
+        'commands=' + (view.summary?.commandsFinished || 0) + '/' + (view.summary?.failedCommands || 0) +
+          ' timedOut=' + (view.summary?.timedOutCommands || 0) +
+          ' pendingApprovals=' + (view.summary?.pendingApprovals || 0),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'handoff=' + (view.summary?.handoffState || '-') + ' next=' + (view.summary?.handoffNextCommand || '-'),
+        'meta',
+      ));
+      const focusPaths = view.summary?.inspectionFocusPaths || [];
+      panel.append(text('div', 'focus=' + (focusPaths.length > 0 ? focusPaths.join(', ') : '-'), 'meta'));
+      const changedPaths = view.summary?.changedPaths || [];
+      panel.append(text('div', 'changes=' + (changedPaths.length > 0 ? changedPaths.join(', ') : '-') + ' patches=' + (view.summary?.patches || 0), 'meta'));
+
+      const actions = view.nextActions || [];
+      const actionsSection = document.createElement('div');
+      actionsSection.className = 'session-inspection-section';
+      actionsSection.append(text('strong', 'Next actions'));
+      const actionList = document.createElement('div');
+      actionList.className = 'session-inspection-list';
+      if (actions.length === 0) {
+        actionList.append(empty('No next actions'));
+      } else {
+        for (const action of actions) {
+          actionList.append(sessionInspectionItem(action.label || action.id || 'action', action.status || 'optional', action.reason || '-', action.command));
+        }
+      }
+      actionsSection.append(actionList);
+      panel.append(actionsSection);
+
+      const timeline = view.latestTimeline || [];
+      const timelineSection = document.createElement('div');
+      timelineSection.className = 'session-inspection-section';
+      timelineSection.append(text('strong', 'Latest timeline'));
+      const timelineList = document.createElement('div');
+      timelineList.className = 'session-inspection-list';
+      if (timeline.length === 0) {
+        timelineList.append(empty('No timeline items'));
+      } else {
+        for (const item of timeline) {
+          const detail = [item.createdAt, item.actor, item.summary].filter(Boolean).join(' | ');
+          timelineList.append(sessionInspectionItem(item.title || item.sourceId || 'event', item.kind || 'audit', detail, item.command || item.path));
+        }
+      }
+      timelineSection.append(timelineList);
+      panel.append(timelineSection);
+
+      const commands = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const commandsSection = document.createElement('div');
+      commandsSection.className = 'session-inspection-section';
+      commandsSection.append(text('strong', 'Commands'));
+      const commandList = document.createElement('div');
+      commandList.className = 'session-inspection-list';
+      if (commands.length === 0) {
+        commandList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of commands) {
+          commandList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      commandsSection.append(commandList);
+      panel.append(commandsSection);
+      root.append(panel);
+    }
+
+    function renderSessionResult(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.summary?.outcome || 'result', 'status ' + (view.summary?.outcome || 'result')));
+      head.append(text(
+        'div',
+        (view.summary?.status || '-') + ' | target=' + (view.summary?.targetMode || '-') +
+          ' | recovered=' + (view.summary?.recovered ? 'yes' : 'no'),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text(
+        'div',
+        'commands=' + (view.summary?.commandsFinished || 0) + '/' + (view.summary?.failedCommands || 0) +
+          ' timedOut=' + (view.summary?.timedOutCommands || 0) +
+          ' approvals=' + (view.approvals?.length || 0) + ' pending=' + (view.summary?.pendingApprovals || 0),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'handoff=' + (view.summary?.handoffState || '-') + ' next=' + (view.summary?.handoffNextCommand || '-'),
+        'meta',
+      ));
+      const reviewHint = view.summary?.reviewProfile?.reviewHint || view.changes?.reviewProfile?.reviewHint || '-';
+      panel.append(text('div', 'review=' + reviewHint, 'meta'));
+      const changedPaths = view.summary?.changedPaths || view.changes?.changedPaths || [];
+      panel.append(text('div', 'changes=' + (changedPaths.length > 0 ? changedPaths.join(', ') : '-') + ' patches=' + (view.summary?.patches || 0), 'meta'));
+
+      if (view.recovery?.observedFailure) {
+        const recoverySection = document.createElement('div');
+        recoverySection.className = 'session-inspection-section';
+        recoverySection.append(text('strong', 'Recovery'));
+        const recoveryList = document.createElement('div');
+        recoveryList.className = 'session-inspection-list';
+        if (view.recovery.firstFailedCommand) {
+          recoveryList.append(sessionInspectionItem('first failure', view.recovery.firstFailedCommand.status || 'fail', commandSummaryText(view.recovery.firstFailedCommand), view.recovery.firstFailedCommand.command));
+        }
+        if (view.recovery.recoveryCommand) {
+          recoveryList.append(sessionInspectionItem('recovery command', view.recovery.recoveryCommand.status || 'pass', commandSummaryText(view.recovery.recoveryCommand), view.recovery.recoveryCommand.command));
+        }
+        recoverySection.append(recoveryList);
+        panel.append(recoverySection);
+      }
+
+      const commands = view.commands || [];
+      const commandSection = document.createElement('div');
+      commandSection.className = 'session-inspection-section';
+      commandSection.append(text('strong', 'Command results'));
+      const commandList = document.createElement('div');
+      commandList.className = 'session-inspection-list';
+      if (commands.length === 0) {
+        commandList.append(empty('No command results'));
+      } else {
+        for (const command of commands) {
+          commandList.append(sessionInspectionItem((command.ordinal || '-') + '. ' + (command.command || 'command'), command.status || 'unknown', commandSummaryText(command)));
+        }
+      }
+      commandSection.append(commandList);
+      panel.append(commandSection);
+
+      const approvals = view.approvals || [];
+      const approvalSection = document.createElement('div');
+      approvalSection.className = 'session-inspection-section';
+      approvalSection.append(text('strong', 'Approvals'));
+      const approvalList = document.createElement('div');
+      approvalList.className = 'session-inspection-list';
+      if (approvals.length === 0) {
+        approvalList.append(empty('No approvals'));
+      } else {
+        for (const approval of approvals) {
+          approvalList.append(sessionInspectionItem(approval.action || approval.id || 'approval', approval.status || 'unknown', approval.reason || '-', approval.id));
+        }
+      }
+      approvalSection.append(approvalList);
+      panel.append(approvalSection);
+
+      const actions = view.nextActions || [];
+      const actionsSection = document.createElement('div');
+      actionsSection.className = 'session-inspection-section';
+      actionsSection.append(text('strong', 'Next actions'));
+      const actionList = document.createElement('div');
+      actionList.className = 'session-inspection-list';
+      if (actions.length === 0) {
+        actionList.append(empty('No next actions'));
+      } else {
+        for (const action of actions) {
+          actionList.append(sessionInspectionItem(action.label || action.id || 'action', action.status || 'optional', action.reason || '-', action.command));
+        }
+      }
+      actionsSection.append(actionList);
+      panel.append(actionsSection);
+
+      const followUps = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const followUpSection = document.createElement('div');
+      followUpSection.className = 'session-inspection-section';
+      followUpSection.append(text('strong', 'Commands'));
+      const followUpList = document.createElement('div');
+      followUpList.className = 'session-inspection-list';
+      if (followUps.length === 0) {
+        followUpList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of followUps) {
+          followUpList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      followUpSection.append(followUpList);
+      panel.append(followUpSection);
+      root.append(panel);
+    }
+
+    function commandSummaryText(command) {
+      return [
+        'exit=' + (command.exitCode ?? '-'),
+        'timedOut=' + (command.timedOut ? 'true' : 'false'),
+        command.durationMs === undefined ? null : 'durationMs=' + command.durationMs,
+        command.executionProfile ? 'profile=' + command.executionProfile : null,
+      ].filter(Boolean).join(' | ');
+    }
+
+    function renderSessionDiff(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', 'diff', 'status command'));
+      head.append(text(
+        'div',
+        (view.summary?.status || '-') + ' | target=' + (view.summary?.targetMode || '-') +
+          ' | patches=' + (view.summary?.patches || 0) +
+          ' | fileChanges=' + (view.summary?.fileChanges || 0),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text('div', 'diffStats=' + diffStatsText(view.summary?.diffStats), 'meta'));
+      const changedPaths = view.summary?.changedPaths || [];
+      panel.append(text('div', 'changedPaths=' + (changedPaths.length > 0 ? changedPaths.join(', ') : '-'), 'meta'));
+      panel.append(text('div', 'review=' + (view.summary?.reviewProfile?.reviewHint || '-'), 'meta'));
+
+      const plan = view.summary?.inspectionPlan;
+      const planSection = document.createElement('div');
+      planSection.className = 'session-inspection-section';
+      planSection.append(text('strong', 'Inspection plan'));
+      const planList = document.createElement('div');
+      planList.className = 'session-inspection-list';
+      if (!plan || !plan.items || plan.items.length === 0) {
+        planList.append(empty('No diff inspection items'));
+      } else {
+        planList.append(sessionInspectionItem('summary', plan.state || 'ready', plan.summary || '-'));
+        for (const item of plan.items) {
+          planList.append(sessionInspectionItem((item.priority || '-') + '. ' + (item.path || 'file'), item.reviewSize || 'small', item.reason || '-', item.command));
+        }
+      }
+      planSection.append(planList);
+      panel.append(planSection);
+
+      const summaries = view.summary?.fileSummaries || [];
+      const summarySection = document.createElement('div');
+      summarySection.className = 'session-inspection-section';
+      summarySection.append(text('strong', 'File summary'));
+      const summaryList = document.createElement('div');
+      summaryList.className = 'session-inspection-list';
+      if (summaries.length === 0) {
+        summaryList.append(empty('No changed files'));
+      } else {
+        for (const summary of summaries) {
+          summaryList.append(sessionInspectionItem(summary.path || 'file', summary.changeType || 'modified', diffFileSummaryText(summary)));
+        }
+      }
+      summarySection.append(summaryList);
+      panel.append(summarySection);
+
+      const patches = view.patches || [];
+      const patchSection = document.createElement('div');
+      patchSection.className = 'session-inspection-section';
+      patchSection.append(text('strong', 'Patches'));
+      const patchList = document.createElement('div');
+      patchList.className = 'session-inspection-list';
+      if (patches.length === 0) {
+        patchList.append(empty('No persisted patches'));
+      } else {
+        for (const patch of patches) {
+          const item = sessionInspectionItem(
+            'patch ' + (patch.ordinal || '-'),
+            'command',
+            [patch.createdAt, patch.actor, diffStatsText(patch.stats), (patch.paths || []).join(', ')].filter(Boolean).join(' | '),
+          );
+          if (patch.patch) {
+            const pre = document.createElement('pre');
+            pre.className = 'session-diff-patch';
+            pre.textContent = patch.patch;
+            item.append(pre);
+          } else {
+            item.append(text('div', 'Patch text unavailable', 'meta'));
+          }
+          patchList.append(item);
+        }
+      }
+      patchSection.append(patchList);
+      panel.append(patchSection);
+
+      const followUps = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const followUpSection = document.createElement('div');
+      followUpSection.className = 'session-inspection-section';
+      followUpSection.append(text('strong', 'Commands'));
+      const followUpList = document.createElement('div');
+      followUpList.className = 'session-inspection-list';
+      if (followUps.length === 0) {
+        followUpList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of followUps) {
+          followUpList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      followUpSection.append(followUpList);
+      panel.append(followUpSection);
+      root.append(panel);
+    }
+
+    function renderSessionReport(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', 'report', 'status command'));
+      head.append(text(
+        'div',
+        (view.session?.status || '-') + ' | target=' + (view.session?.targetMode || '-') +
+          ' | risk=' + (view.session?.risk || '-'),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text(
+        'div',
+        'messages=' + (view.summary?.messages || 0) +
+          ' toolResults=' + (view.summary?.toolResults || 0) + '/' + (view.summary?.failedToolResults || 0) +
+          ' fileChanges=' + (view.summary?.fileChanges || 0),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'commands=' + (view.summary?.commandsFinished || 0) + '/' + (view.summary?.failedCommands || 0) +
+          ' timedOut=' + (view.summary?.timedOutCommands || 0) +
+          ' profiles=' + recordCountsText(view.summary?.executionProfiles),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'approvals=' + (view.summary?.approvals || 0) +
+          ' pending=' + (view.summary?.pendingApprovals || 0) +
+          ' modelCalls=' + (view.summary?.modelCalls || 0) + '/' + (view.summary?.modelFailedCalls || 0),
+        'meta',
+      ));
+      panel.append(text('div', 'diffStats=' + diffStatsText(view.summary?.diffStats), 'meta'));
+      panel.append(text('div', 'changedPaths=' + ((view.summary?.changedPaths || []).join(', ') || '-'), 'meta'));
+      panel.append(text('div', 'review=' + (view.summary?.reviewProfile?.reviewHint || '-'), 'meta'));
+
+      const plan = view.summary?.inspectionPlan;
+      const planSection = document.createElement('div');
+      planSection.className = 'session-inspection-section';
+      planSection.append(text('strong', 'Inspection plan'));
+      const planList = document.createElement('div');
+      planList.className = 'session-inspection-list';
+      if (!plan || !plan.items || plan.items.length === 0) {
+        planList.append(empty('No diff inspection items'));
+      } else {
+        planList.append(sessionInspectionItem('summary', plan.state || 'ready', plan.summary || '-'));
+        for (const item of plan.items) {
+          planList.append(sessionInspectionItem((item.priority || '-') + '. ' + (item.path || 'file'), item.reviewSize || 'small', item.reason || '-', item.command));
+        }
+      }
+      planSection.append(planList);
+      panel.append(planSection);
+
+      const fileChanges = view.fileChanges || [];
+      const fileSection = document.createElement('div');
+      fileSection.className = 'session-inspection-section';
+      fileSection.append(text('strong', 'File changes'));
+      const fileList = document.createElement('div');
+      fileList.className = 'session-inspection-list';
+      if (fileChanges.length === 0) {
+        fileList.append(empty('No file changes'));
+      } else {
+        for (const change of fileChanges) {
+          fileList.append(sessionInspectionItem(change.path || 'file', change.kind || 'change', change.summary || '-', change.createdAt));
+        }
+      }
+      fileSection.append(fileList);
+      panel.append(fileSection);
+
+      const commandEvents = view.commandEvents || [];
+      const commandSection = document.createElement('div');
+      commandSection.className = 'session-inspection-section';
+      commandSection.append(text('strong', 'Command events'));
+      const commandList = document.createElement('div');
+      commandList.className = 'session-inspection-list';
+      if (commandEvents.length === 0) {
+        commandList.append(empty('No command events'));
+      } else {
+        for (const command of commandEvents) {
+          commandList.append(sessionInspectionItem(command.type || 'command', command.timedOut ? 'timeout' : command.exitCode === 0 ? 'pass' : 'command', reportCommandText(command), command.command));
+        }
+      }
+      commandSection.append(commandList);
+      panel.append(commandSection);
+
+      const toolResults = view.toolResults || [];
+      const toolSection = document.createElement('div');
+      toolSection.className = 'session-inspection-section';
+      toolSection.append(text('strong', 'Tool results'));
+      const toolList = document.createElement('div');
+      toolList.className = 'session-inspection-list';
+      if (toolResults.length === 0) {
+        toolList.append(empty('No tool results'));
+      } else {
+        for (const result of toolResults) {
+          const detail = result.error?.message || result.outputExcerpt || '-';
+          toolList.append(sessionInspectionItem(result.callId || 'tool', result.ok ? 'pass' : 'fail', detail));
+        }
+      }
+      toolSection.append(toolList);
+      panel.append(toolSection);
+
+      const approvals = view.approvals || [];
+      const approvalSection = document.createElement('div');
+      approvalSection.className = 'session-inspection-section';
+      approvalSection.append(text('strong', 'Approvals'));
+      const approvalList = document.createElement('div');
+      approvalList.className = 'session-inspection-list';
+      if (approvals.length === 0) {
+        approvalList.append(empty('No approvals'));
+      } else {
+        for (const approval of approvals) {
+          approvalList.append(sessionInspectionItem(approval.action || approval.id || 'approval', approval.status || 'unknown', approval.reason || '-', approval.id));
+        }
+      }
+      approvalSection.append(approvalList);
+      panel.append(approvalSection);
+
+      const auditEvents = view.recentAuditEvents || [];
+      const auditSection = document.createElement('div');
+      auditSection.className = 'session-inspection-section';
+      auditSection.append(text('strong', 'Recent audit'));
+      const auditList = document.createElement('div');
+      auditList.className = 'session-inspection-list';
+      if (auditEvents.length === 0) {
+        auditList.append(empty('No recent audit events'));
+      } else {
+        for (const event of auditEvents) {
+          auditList.append(sessionInspectionItem(event.type || 'audit', 'audit', [event.createdAt, event.summary].filter(Boolean).join(' | ')));
+        }
+      }
+      auditSection.append(auditList);
+      panel.append(auditSection);
+
+      const followUps = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const followUpSection = document.createElement('div');
+      followUpSection.className = 'session-inspection-section';
+      followUpSection.append(text('strong', 'Commands'));
+      const followUpList = document.createElement('div');
+      followUpList.className = 'session-inspection-list';
+      if (followUps.length === 0) {
+        followUpList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of followUps) {
+          followUpList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      followUpSection.append(followUpList);
+      panel.append(followUpSection);
+      root.append(panel);
+    }
+
+    function renderSessionVerification(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.status || 'verify', 'status ' + (view.status || 'unknown')));
+      head.append(text(
+        'div',
+        (view.summary?.outcome || '-') + ' | ' + (view.summary?.status || '-') +
+          ' | target=' + (view.summary?.targetMode || '-') +
+          ' | preset=' + (view.options?.preset || '-'),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text(
+        'div',
+        'checks=' + ((view.checks || []).length) +
+          ' commands=' + (view.summary?.commandsFinished || 0) + '/' + (view.summary?.failedCommands || 0) +
+          ' timedOut=' + (view.summary?.timedOutCommands || 0) +
+          ' profiles=' + recordCountsText(view.summary?.executionProfiles),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'fileChanges=' + (view.summary?.fileChanges || 0) +
+          ' patches=' + (view.summary?.patches || 0) +
+          ' diffStats=' + diffStatsText(view.summary?.diffStats) +
+          ' pendingApprovals=' + (view.summary?.pendingApprovals || 0),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'options=' + verificationOptionsText(view.options),
+        'meta',
+      ));
+
+      const checkSection = document.createElement('div');
+      checkSection.className = 'session-inspection-section';
+      checkSection.append(text('strong', 'Verification checks'));
+      const checkList = document.createElement('div');
+      checkList.className = 'session-inspection-list';
+      const checks = view.checks || [];
+      if (checks.length === 0) {
+        checkList.append(empty('No verification checks'));
+      } else {
+        for (const check of checks) {
+          checkList.append(sessionInspectionItem(check.label || check.id || 'check', check.status || 'unknown', check.summary || '-'));
+        }
+      }
+      checkSection.append(checkList);
+      panel.append(checkSection);
+
+      const followUps = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const followUpSection = document.createElement('div');
+      followUpSection.className = 'session-inspection-section';
+      followUpSection.append(text('strong', 'Commands'));
+      const followUpList = document.createElement('div');
+      followUpList.className = 'session-inspection-list';
+      if (followUps.length === 0) {
+        followUpList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of followUps) {
+          followUpList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      followUpSection.append(followUpList);
+      panel.append(followUpSection);
+      root.append(panel);
+    }
+
+    function renderSessionBundle(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.summary?.verificationStatus || 'bundle', 'status ' + (view.summary?.verificationStatus || 'unknown')));
+      head.append(text(
+        'div',
+        (view.summary?.outcome || '-') + ' | ' + (view.summary?.status || '-') +
+          ' | target=' + (view.summary?.targetMode || '-') +
+          ' | preset=' + (view.sections?.verification?.options?.preset || '-'),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      panel.append(text(
+        'div',
+        'sections=' + ((view.summary?.sections || []).join(',') || '-') +
+          ' review=' + (view.summary?.reviewState || '-') +
+          ' handoff=' + (view.summary?.handoffState || '-') +
+          ' next=' + (view.summary?.handoffNextCommand || '-'),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'fileChanges=' + (view.summary?.fileChanges || 0) +
+          ' patches=' + (view.summary?.patches || 0) +
+          ' diffStats=' + diffStatsText(view.summary?.diffStats) +
+          ' pendingApprovals=' + (view.summary?.pendingApprovals || 0) +
+          ' timeline=' + (view.summary?.returnedTimelineItems || 0) + '/' + (view.summary?.timelineItems || 0),
+        'meta',
+      ));
+      panel.append(text(
+        'div',
+        'commands=' + (view.summary?.commandsFinished || 0) + '/' + (view.summary?.failedCommands || 0) +
+          ' timedOut=' + (view.summary?.timedOutCommands || 0) +
+          ' profiles=' + recordCountsText(view.summary?.executionProfiles),
+        'meta',
+      ));
+
+      const sectionList = document.createElement('div');
+      sectionList.className = 'session-inspection-section';
+      sectionList.append(text('strong', 'Bundle sections'));
+      const sections = document.createElement('div');
+      sections.className = 'session-inspection-list';
+      const sectionNames = view.summary?.sections || [];
+      if (sectionNames.length === 0) {
+        sections.append(empty('No bundle sections'));
+      } else {
+        for (const name of sectionNames) {
+          const section = view.sections?.[name] || {};
+          const summary = section.summary || {};
+          sections.append(sessionInspectionItem(
+            name,
+            section.kind || 'section',
+            [
+              summary.outcome ? 'outcome=' + summary.outcome : null,
+              summary.status ? 'status=' + summary.status : null,
+              summary.patches === undefined ? null : 'patches=' + summary.patches,
+              summary.fileChanges === undefined ? null : 'fileChanges=' + summary.fileChanges,
+              summary.returnedItems === undefined ? null : 'items=' + summary.returnedItems + '/' + (summary.totalItems || 0),
+              summary.reviewState ? 'review=' + summary.reviewState : null,
+            ].filter(Boolean).join(' | ') || section.generatedAt || '-',
+          ));
+        }
+      }
+      sectionList.append(sections);
+      panel.append(sectionList);
+
+      const checkSection = document.createElement('div');
+      checkSection.className = 'session-inspection-section';
+      checkSection.append(text('strong', 'Verification checks'));
+      const checkList = document.createElement('div');
+      checkList.className = 'session-inspection-list';
+      const checks = view.sections?.verification?.checks || [];
+      if (checks.length === 0) {
+        checkList.append(empty('No verification checks'));
+      } else {
+        for (const check of checks) {
+          checkList.append(sessionInspectionItem(check.label || check.id || 'check', check.status || 'unknown', check.summary || '-'));
+        }
+      }
+      checkSection.append(checkList);
+      panel.append(checkSection);
+      panel.append(text('div', 'options=' + verificationOptionsText(view.sections?.verification?.options), 'meta'));
+
+      const actions = view.sections?.result?.nextActions || [];
+      const actionsSection = document.createElement('div');
+      actionsSection.className = 'session-inspection-section';
+      actionsSection.append(text('strong', 'Next actions'));
+      const actionList = document.createElement('div');
+      actionList.className = 'session-inspection-list';
+      if (actions.length === 0) {
+        actionList.append(empty('No next actions'));
+      } else {
+        for (const action of actions) {
+          actionList.append(sessionInspectionItem(action.label || action.id || 'action', action.status || 'optional', action.reason || '-', action.command));
+        }
+      }
+      actionsSection.append(actionList);
+      panel.append(actionsSection);
+
+      const followUps = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const followUpSection = document.createElement('div');
+      followUpSection.className = 'session-inspection-section';
+      followUpSection.append(text('strong', 'Commands'));
+      const followUpList = document.createElement('div');
+      followUpList.className = 'session-inspection-list';
+      if (followUps.length === 0) {
+        followUpList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of followUps) {
+          followUpList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      followUpSection.append(followUpList);
+      panel.append(followUpSection);
+      root.append(panel);
+    }
+
+    function diffStatsText(stats) {
+      return stats ? 'files=' + (stats.files || 0) + ',+' + (stats.additions || 0) + ',-' + (stats.deletions || 0) : 'files=0,+0,-0';
+    }
+
+    function reportCommandText(command) {
+      return [
+        command.createdAt || null,
+        'exit=' + (command.exitCode ?? '-'),
+        'timedOut=' + (command.timedOut ? 'true' : 'false'),
+        command.durationMs === undefined ? null : 'durationMs=' + command.durationMs,
+        command.executionProfile ? 'profile=' + command.executionProfile : null,
+        command.summary || null,
+      ].filter(Boolean).join(' | ');
+    }
+
+    function recordCountsText(counts) {
+      const entries = Object.entries(counts || {}).sort((left, right) => left[0].localeCompare(right[0]));
+      return entries.length === 0 ? '-' : entries.map((entry) => entry[0] + ':' + entry[1]).join(',');
+    }
+
+    function verificationOptionsText(options) {
+      const flags = [];
+      if (!options) return '-';
+      for (const key of ['requireCommand', 'requireChange', 'requirePatch', 'requireRecovery', 'requireTimeout', 'requireDiffStat', 'requireReviewProfile', 'requireModelCall', 'requireNoPendingApprovals']) {
+        if (options[key]) flags.push(key);
+      }
+      if (Array.isArray(options.requiredExecutionProfiles) && options.requiredExecutionProfiles.length > 0) {
+        flags.push('profiles=' + options.requiredExecutionProfiles.join(','));
+      }
+      if (Array.isArray(options.requiredApprovalActions) && options.requiredApprovalActions.length > 0) {
+        flags.push('approvals=' + options.requiredApprovalActions.join(','));
+      }
+      return flags.join(' ') || '-';
+    }
+
+    function diffFileSummaryText(summary) {
+      return [
+        '+' + (summary.additions || 0) + '/-' + (summary.deletions || 0),
+        'patches=' + (summary.patches || 0),
+        'review=' + (summary.reviewSize || '-'),
+        summary.reviewHint || null,
+      ].filter(Boolean).join(' | ');
+    }
+
+    function renderSessionTimeline(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', 'timeline', 'status command'));
+      head.append(text(
+        'div',
+        'items=' + (view.summary?.returnedItems || 0) + '/' + (view.summary?.totalItems || 0) +
+          ' latest=' + (view.summary?.latestAt || '-'),
+        'meta',
+      ));
+      panel.append(head);
+      const list = document.createElement('div');
+      list.className = 'session-inspection-list';
+      if (view.items.length === 0) {
+        list.append(empty('No timeline items'));
+      } else {
+        for (const item of view.items) {
+          const detail = [item.createdAt, item.actor, item.summary].filter(Boolean).join(' | ');
+          list.append(sessionInspectionItem(item.title || item.sourceId || 'event', item.kind || 'audit', detail, item.command || item.path));
+        }
+      }
+      panel.append(list);
+      root.append(panel);
+    }
+
+    function renderSessionReview(root, view) {
+      const panel = document.createElement('div');
+      panel.className = 'session-inspection';
+      const head = document.createElement('div');
+      head.className = 'session-inspection-head';
+      head.append(row(view.session?.id || selectedSessionInspectionId || 'session', view.summary?.reviewState || 'review', 'status ' + (view.summary?.reviewState || 'review')));
+      head.append(text(
+        'div',
+        (view.summary?.outcome || '-') + ' | ' + (view.summary?.status || '-') + ' | target=' + (view.summary?.targetMode || '-') +
+          ' | timeline=' + (view.summary?.returnedTimelineItems || 0) + '/' + (view.summary?.timelineItems || 0),
+        'meta',
+      ));
+      if (view.session?.objective) {
+        head.append(text('div', view.session.objective, 'meta'));
+      }
+      panel.append(head);
+      if (view.handoff) {
+        panel.append(text('div', 'handoff=' + (view.handoff.state || '-') + ' next=' + (view.handoff.nextCommand || '-'), 'meta'));
+      }
+      const changedPaths = view.summary?.changedPaths || view.changes?.changedPaths || [];
+      panel.append(text('div', 'changes=' + (changedPaths.length > 0 ? changedPaths.join(', ') : '-') + ' patches=' + (view.summary?.patches || 0), 'meta'));
+
+      const checklistSection = document.createElement('div');
+      checklistSection.className = 'session-inspection-section';
+      checklistSection.append(text('strong', 'Checklist'));
+      const checklistList = document.createElement('div');
+      checklistList.className = 'session-inspection-list';
+      if (view.checklist.length === 0) {
+        checklistList.append(empty('No review checklist'));
+      } else {
+        for (const item of view.checklist) {
+          checklistList.append(sessionInspectionItem(item.label || item.id || 'check', item.status || 'warn', item.summary || '-', item.command));
+        }
+      }
+      checklistSection.append(checklistList);
+      panel.append(checklistSection);
+
+      const actions = view.nextActions || [];
+      const actionsSection = document.createElement('div');
+      actionsSection.className = 'session-inspection-section';
+      actionsSection.append(text('strong', 'Next actions'));
+      const actionList = document.createElement('div');
+      actionList.className = 'session-inspection-list';
+      if (actions.length === 0) {
+        actionList.append(empty('No next actions'));
+      } else {
+        for (const action of actions) {
+          actionList.append(sessionInspectionItem(action.label || action.id || 'action', action.status || 'optional', action.reason || '-', action.command));
+        }
+      }
+      actionsSection.append(actionList);
+      panel.append(actionsSection);
+
+      const timeline = view.latestTimeline || [];
+      const timelineSection = document.createElement('div');
+      timelineSection.className = 'session-inspection-section';
+      timelineSection.append(text('strong', 'Latest timeline'));
+      const timelineList = document.createElement('div');
+      timelineList.className = 'session-inspection-list';
+      if (timeline.length === 0) {
+        timelineList.append(empty('No timeline items'));
+      } else {
+        for (const item of timeline) {
+          const detail = [item.createdAt, item.actor, item.summary].filter(Boolean).join(' | ');
+          timelineList.append(sessionInspectionItem(item.title || item.sourceId || 'event', item.kind || 'audit', detail, item.command || item.path));
+        }
+      }
+      timelineSection.append(timelineList);
+      panel.append(timelineSection);
+
+      const commands = Object.entries(view.reviewCommands || {}).filter((entry) => typeof entry[1] === 'string' && entry[1]);
+      const commandsSection = document.createElement('div');
+      commandsSection.className = 'session-inspection-section';
+      commandsSection.append(text('strong', 'Commands'));
+      const commandList = document.createElement('div');
+      commandList.className = 'session-inspection-list';
+      if (commands.length === 0) {
+        commandList.append(empty('No follow-up commands'));
+      } else {
+        for (const command of commands) {
+          commandList.append(sessionInspectionItem(command[0], 'command', command[1]));
+        }
+      }
+      commandsSection.append(commandList);
+      panel.append(commandsSection);
       root.append(panel);
     }
 
@@ -1825,10 +3123,10 @@ function renderAppHtml(): string {
         alert((await response.json()).error || 'Request failed');
         return;
       }
-      await loadState();
+      await refreshAfterSessionMutation(sessionId);
     }
 
-    async function decideApproval(id, decision, autoResume) {
+    async function decideApproval(id, decision, autoResume, sessionId) {
       const response = await apiFetch('/api/approvals/' + encodeURIComponent(id) + '/' + decision, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -1836,8 +3134,9 @@ function renderAppHtml(): string {
       });
       if (!response.ok) {
         alert((await response.json()).error || 'Request failed');
+        return;
       }
-      await loadState();
+      await refreshAfterSessionMutation(sessionId);
     }
 
     document.getElementById('composer').addEventListener('submit', async (event) => {
@@ -1857,7 +3156,11 @@ function renderAppHtml(): string {
     });
 
     document.getElementById('refresh').onclick = loadState;
-    setInterval(loadState, 5000);
+    document.getElementById('session-dashboard-refresh').onclick = loadSessionDashboard;
+    document.getElementById('session-dashboard-status').onchange = loadSessionDashboard;
+    document.getElementById('session-dashboard-target-mode').onchange = loadSessionDashboard;
+    document.getElementById('session-inspection-refresh').onclick = refreshSelectedSessionInspection;
+    setInterval(refreshOpenSessionViews, 5000);
     loadState();
 
     function row(left, right, className) {
@@ -1866,6 +3169,10 @@ function renderAppHtml(): string {
       wrapper.append(text('strong', left));
       wrapper.append(text('span', right, className));
       return wrapper;
+    }
+
+    function formatCounts(counts) {
+      return Object.entries(counts || {}).map((entry) => entry[0] + ':' + entry[1]).join(',') || '-';
     }
 
     function text(tag, value, className) {

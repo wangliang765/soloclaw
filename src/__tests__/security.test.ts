@@ -207,6 +207,74 @@ test("model api key secret resolver uses policy broker audit path", async (t) =>
   platform.store.close();
 });
 
+test("stored model profile secret ref configures the default model client", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-model-profile-secret-"));
+  const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
+  process.env.AGENT_SECRETS_PASSPHRASE = "test-passphrase-12345";
+  t.after(async () => {
+    if (previousPassphrase === undefined) {
+      delete process.env.AGENT_SECRETS_PASSPHRASE;
+    } else {
+      process.env.AGENT_SECRETS_PASSPHRASE = previousPassphrase;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  let seenAuthorization = "";
+  const server = createServer((request, response) => {
+    seenAuthorization = request.headers.authorization ?? "";
+    request.resume();
+    response.writeHead(200, { "content-type": "application/json", connection: "close" });
+    response.end(JSON.stringify({ choices: [{ message: { content: "profile-secret-ok" } }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected TCP test server address.");
+  }
+
+  const setupPlatform = await createLocalPlatform(dir);
+  const ref = await setupPlatform.secrets.putSecret({
+    name: "profile-model",
+    class: "model_api_key",
+    scopeType: "workspace",
+    scopeId: "local",
+    value: "profile-model-secret",
+  });
+  setupPlatform.locks.close();
+  setupPlatform.store.close();
+
+  const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+  await profiles.set({
+    name: "openai_compatible",
+    protocol: "openai_chat",
+    defaultBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+    defaultModel: "profile-secret-model",
+    apiKeyEnvNames: ["PROFILE_MODEL_API_KEY"],
+    apiKeySecretRef: ref.id,
+  });
+  await profiles.setDefaultProvider("openai_compatible");
+
+  const platform = await createLocalPlatform(dir, { executionMode: "full_access" });
+  const client = platform.modelRegistry.get("openai_compatible");
+  assert(client);
+  const response = await client.complete({
+    messages: [{ role: "user", content: "hello" }],
+    tools: [],
+  });
+  assert.equal(response.type, "message");
+  assert.equal(response.content, "profile-secret-ok");
+  assert.equal(seenAuthorization, "Bearer profile-model-secret");
+  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+  assert.equal(configText.includes("profile-model-secret"), false);
+  platform.locks.close();
+  platform.store.close();
+});
+
 test("known OpenAI-compatible provider profiles send real chat requests with default models", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-model-provider-profile-"));
   const previousKey = process.env.DEEPSEEK_API_KEY;
@@ -726,7 +794,7 @@ test("soloclaw accepts custom as an OpenAI-compatible provider alias", async (t)
     "CUSTOM_MODEL_API_KEY",
   ], dir);
   assert.equal(setup.exitCode, 0, setup.stderr);
-  assert.match(setup.stdout, /^openai_compatible\tlocal\topenai_chat\tmodel=custom-model\tbaseUrl=http:\/\/localhost:8000\/v1\tenv=CUSTOM_MODEL_API_KEY\tdefault=openai_compatible/m);
+  assert.match(setup.stdout, /^openai_compatible\tlocal\topenai_chat\tmodel=custom-model\tbaseUrl=http:\/\/localhost:8000\/v1\tenv=CUSTOM_MODEL_API_KEY\tsecret=-\tdefault=openai_compatible/m);
 
   const tui = await runWithInput(
     process.execPath,
@@ -1240,8 +1308,8 @@ test("agent run can emit session evidence and verify the completed run", async (
     summary?: { returned?: number; byOutcome?: Record<string, number>; changedSessions?: number };
     sessions?: Array<{
       session?: { id?: string; targetMode?: string; status?: string };
-      summary?: { outcome?: string; pendingApprovals?: number; commandsFinished?: number };
-      reviewCommands?: { review?: string; result?: string };
+      summary?: { outcome?: string; pendingApprovals?: number; commandsFinished?: number; handoffState?: string; handoffNextCommand?: string };
+      reviewCommands?: { review?: string; next?: string; result?: string };
     }>;
   };
   const listedRunSession = sessions.sessions?.find((entry) => entry.session?.id === parsed.session?.id);
@@ -1253,6 +1321,9 @@ test("agent run can emit session evidence and verify the completed run", async (
   assert.equal(listedRunSession?.summary?.outcome, "succeeded");
   assert.equal(listedRunSession?.summary?.pendingApprovals, 0);
   assert.equal(listedRunSession?.summary?.commandsFinished, 0);
+  assert.equal(listedRunSession?.summary?.handoffState, "ready");
+  assert.match(listedRunSession?.summary?.handoffNextCommand ?? "", new RegExp(`agent session verify ${parsed.session?.id}`));
+  assert.match(listedRunSession?.reviewCommands?.next ?? "", new RegExp(`agent session next ${parsed.session?.id}`));
   assert.match(listedRunSession?.reviewCommands?.result ?? "", new RegExp(`agent session result ${parsed.session?.id}`));
 
   const sessionsText = await run(process.execPath, [cli, "sessions", "--limit", "1"], dir);
@@ -1260,7 +1331,9 @@ test("agent run can emit session evidence and verify the completed run", async (
   assert.match(sessionsText.stdout, /Session dashboard:/);
   assert.match(sessionsText.stdout, /byOutcome=succeeded:1/);
   assert.match(sessionsText.stdout, /outcome=succeeded/);
+  assert.match(sessionsText.stdout, /handoff: ready next=agent session verify sess_/);
   assert.match(sessionsText.stdout, /review: agent session review sess_/);
+  assert.match(sessionsText.stdout, /next: agent session next sess_/);
 
   const failedGate = await run(process.execPath, [cli, "run", "--verify-session", "--require-change", "inspect", "this", "workspace"], dir);
   assert.equal(failedGate.exitCode, 1);
@@ -1770,6 +1843,9 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
       "/agent status --limit 5",
       "/agent service --limit 5",
       "/agent logs --limit 20",
+      "/operator status --kind queue --limit 3",
+      "/operator status --kind approval --rows --json",
+      "/operator show --kind queue --select 1",
       "/approvals pending",
       "/approve appr_tui_agent_status approved from TUI",
       "/deny appr_tui_agent_status_deny denied from TUI",
@@ -1785,6 +1861,8 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.match(result.stdout, /\/agent status\s+Show sessions, approvals, workers, and assignments/);
   assert.match(result.stdout, /\/agent service\s+Show daemon service supervision plan/);
   assert.match(result.stdout, /\/agent logs\s+Show merged local execution logs/);
+  assert.match(result.stdout, /\/operator status\s+Show shared operator rows and status/);
+  assert.match(result.stdout, /\/operator show <item-id>\s+Show shared operator item detail/);
   assert.match(result.stdout, /\/approvals \[status\]\s+List approval requests/);
   assert.match(result.stdout, /\/approve <approval-id> \[reason\]\s+Approve an approval request/);
   assert.match(result.stdout, /\/deny <approval-id> \[reason\]\s+Deny an approval request/);
@@ -1799,6 +1877,14 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
   assert.match(result.stdout, /Local agent logs:/);
   assert.match(result.stdout, /command\.finished/);
   assert.match(result.stdout, /approval requested workspace\.write/);
+  assert.match(result.stdout, /operator\tgenerated=/);
+  assert.match(result.stdout, /\[queue\]/);
+  assert.match(result.stdout, /\[1\]\tqueue\t/);
+  assert.match(result.stdout, /"filters": \{\s+"kind": "approval"/);
+  assert.match(result.stdout, /"rows": \[/);
+  assert.match(result.stdout, /"id": "appr_tui_agent_status"/);
+  assert.match(result.stdout, /queue\t[a-z_]+\t[a-z]+\tqueue:local/);
+  assert.match(result.stdout, /\[detail:Overview\]/);
   assert.match(result.stdout, /appr_tui_agent_status\tpending\tworkspace\.write/);
   assert.match(result.stdout, /appr_tui_agent_status_deny\tpending\tdependency\.install/);
   assert.match(result.stdout, /appr_tui_agent_status\tapproved\tworkspace\.write\tapproved from TUI/);
@@ -1897,8 +1983,12 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
     dir,
     [
       "/help",
+      "/sessions --limit 5",
+      "/sessions --json --status completed --target-mode build --limit 3",
       `/session diff ${session.id}`,
       `/session diff ${session.id} --json`,
+      `/session report ${session.id}`,
+      `/session report ${session.id} --json`,
       `/session status ${session.id} --limit 10`,
       `/session status ${session.id} --json --limit 2`,
       `/session inspect ${session.id}`,
@@ -1909,28 +1999,56 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
       `/session review ${session.id} --json --limit 2`,
       `/session result ${session.id}`,
       `/session result ${session.id} --json`,
+      `/session next ${session.id}`,
+      `/session next ${session.id} --json`,
+      `/session verify ${session.id} --require-change --require-patch --require-diff-stat --require-review-profile --require-execution-profile local-safe --require-approval-action workspace.write`,
+      `/session verify ${session.id} --json --require-no-pending-approvals`,
+      `/session bundle ${session.id} --limit 10`,
+      `/session bundle ${session.id} --json --limit 2 --output .agent/tmp/tui-session-bundle.json`,
       "/session diff",
+      "/session report",
       "/session status",
       "/session timeline",
       "/session inspect",
       "/session review",
       "/session result",
+      "/session next",
+      "/session verify",
+      "/session bundle",
       "/exit",
       "",
     ].join("\n"),
   );
   assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /\/sessions\s+Show recent session dashboard/);
+  assert.match(result.stdout, /Session dashboard:/);
+  assert.match(result.stdout, /returned=\d+\/\d+\s+limit=5/);
+  assert.match(result.stdout, new RegExp(`${escapeRegExp(session.id)}\\s+build\\s+completed\\s+outcome=succeeded`));
+  assert.match(result.stdout, new RegExp(`handoff: blocked next=agent approve ${escapeRegExp("appr_tui_session_inspect")} --auto-replay`));
+  assert.match(result.stdout, new RegExp(`next: agent session next ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /"filters": \{\s+"status": "completed",\s+"targetMode": "build"/);
+  assert.match(result.stdout, /"returned": [1-9]\d*/);
   assert.match(result.stdout, /\/session diff <session-id>\s+Show persisted patch diff/);
+  assert.match(result.stdout, /\/session report <session-id>\s+Show consolidated session evidence/);
   assert.match(result.stdout, /\/session status <session-id>\s+Show session status snapshot/);
   assert.match(result.stdout, /\/session inspect <session-id>\s+Show focused session inspection/);
   assert.match(result.stdout, /\/session timeline <session-id>\s+Show safe session timeline/);
   assert.match(result.stdout, /\/session logs <session-id>\s+Show safe session timeline/);
   assert.match(result.stdout, /\/session review <session-id>\s+Show operator review package/);
   assert.match(result.stdout, /\/session result <session-id>\s+Show session result summary/);
+  assert.match(result.stdout, /\/session next <session-id>\s+Show next operator actions/);
+  assert.match(result.stdout, /\/session verify <session-id>\s+Run session evidence gate/);
+  assert.match(result.stdout, /\/session bundle <session-id>\s+Export session evidence bundle/);
   assert.match(result.stdout, new RegExp(`Session diff: ${escapeRegExp(session.id)}`));
   assert.match(result.stdout, /diffStats=files:1,\+1,-1/);
   assert.match(result.stdout, /diff --git a\/src\/math\.js b\/src\/math\.js/);
   assert.match(result.stdout, /"patches": 1/);
+  assert.match(result.stdout, new RegExp(`Session report: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /toolResults=0 failed=0/);
+  assert.match(result.stdout, /fileChanges=1 paths=1/);
+  assert.match(result.stdout, /approvals=1 pending=1/);
+  assert.match(result.stdout, /"pendingApprovals": 1/);
+  assert.match(result.stdout, /"reviewSize": "small"/);
   assert.match(result.stdout, new RegExp(`Session status: ${escapeRegExp(session.id)}`));
   assert.match(result.stdout, /inspection=blocked/);
   assert.match(result.stdout, /Latest timeline:/);
@@ -1954,13 +2072,49 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
   assert.match(result.stdout, /outcome=succeeded/);
   assert.match(result.stdout, /Changed files:/);
   assert.match(result.stdout, /"outcome": "succeeded"/);
+  assert.match(result.stdout, new RegExp(`Session next actions: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /handoff=blocked/);
+  assert.match(result.stdout, /Next actions:/);
+  assert.match(result.stdout, /resolve pending approvals/i);
+  assert.match(result.stdout, new RegExp(`agent session timeline ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, new RegExp(`agent session verify ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /"handoffState": "blocked"/);
+  assert.match(result.stdout, /"nextActions": \[/);
+  assert.match(result.stdout, new RegExp(`Session verification: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /\[pass\] change evidence/);
+  assert.match(result.stdout, /\[pass\] patch evidence/);
+  assert.match(result.stdout, /\[pass\] execution profile local-safe/);
+  assert.match(result.stdout, /\[pass\] approval workspace\.write/);
+  assert.match(result.stdout, /"id": "no-pending-approvals"/);
+  assert.match(result.stdout, /"status": "fail"/);
+  assert.match(result.stdout, new RegExp(`Session bundle: ${escapeRegExp(session.id)}`));
+  assert.match(result.stdout, /Sections:/);
+  assert.match(result.stdout, /- localStatus/);
+  assert.match(result.stdout, /"verificationStatus": "pass"/);
+  assert.match(result.stdout, /tui-session-bundle\.json/);
   assert.match(result.stdout, /Usage: \/session diff <session-id> \[--json\]/);
+  assert.match(result.stdout, /Usage: \/session report <session-id> \[--json\]/);
   assert.match(result.stdout, /Usage: \/session status <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session timeline <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session inspect <session-id> \[--json\]/);
   assert.match(result.stdout, /Usage: \/session review <session-id> \[--json\] \[--limit n\]/);
   assert.match(result.stdout, /Usage: \/session result <session-id> \[--json\]/);
+  assert.match(result.stdout, /Usage: \/session next <session-id> \[--json\]/);
+  assert.match(result.stdout, /Usage: \/session verify <session-id> \[--json\] \[--preset handoff\]/);
+  assert.match(result.stdout, /Usage: \/session bundle <session-id> \[--json\] \[--output path\] \[--limit n\] \[verification options\]/);
   assert.match(result.stdout, /bye/);
+
+  const bundle = JSON.parse(await fs.readFile(path.join(dir, ".agent", "tmp", "tui-session-bundle.json"), "utf8")) as {
+    session?: { id?: string };
+    summary?: { inspectionState?: string; verificationStatus?: string };
+    sections?: { result?: { summary?: { outcome?: string } }; localStatus?: unknown; localLogs?: unknown };
+  };
+  assert.equal(bundle.session?.id, session.id);
+  assert.equal(bundle.summary?.inspectionState, "blocked");
+  assert.equal(bundle.summary?.verificationStatus, "pass");
+  assert.equal(bundle.sections?.result?.summary?.outcome, "succeeded");
+  assert.equal(Boolean(bundle.sections?.localStatus), true);
+  assert.equal(Boolean(bundle.sections?.localLogs), true);
 });
 
 test("soloclaw TUI init prepares workspace and model config", async (t) => {
@@ -2117,6 +2271,89 @@ test("soloclaw TUI can set up editable model provider profiles", async (t) => {
   assert.equal(config.profiles?.openai_compatible?.defaultBaseUrl, "http://localhost:11434/v1");
   assert.equal(config.profiles?.openai_compatible?.defaultModel, "llama-local");
   assert.deepEqual(config.profiles?.openai_compatible?.apiKeyEnvNames, ["LOCAL_LLM_API_KEY"]);
+});
+
+test("soloclaw TUI reports invalid model api key env without exiting or leaking input", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-setup-invalid-env-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Model Setup Invalid Env Project\n", "utf8");
+
+  const pastedSecret = "sk-test-secret-should-not-leak";
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup custom --base-url https://api.deepseek.com --model deepseek-v4-flash --api-key-env ${pastedSecret}\n/model setup deepseek --api-key-env DEEPSEEK_API_KEY\n/config\n/exit\n`,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Error: --api-key-env must be an environment variable name like DEEPSEEK_API_KEY, not the API key value\./);
+  assert.equal(result.stdout.includes(pastedSecret), false);
+  assert.equal(result.stderr.includes(pastedSecret), false);
+  assert.match(result.stdout, /Model: deepseek/);
+  assert.match(result.stdout, /deepseek\tlocal\topenai_chat\tmodel=deepseek-v4-flash\tbaseUrl=https:\/\/api\.deepseek\.com\tenv=DEEPSEEK_API_KEY/);
+  assert.match(result.stdout, /bye/);
+
+  const config = JSON.parse(await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8")) as {
+    defaultProvider?: string;
+    profiles?: Record<string, { defaultBaseUrl?: string; defaultModel?: string; apiKeyEnvNames?: string[] }>;
+  };
+  assert.equal(config.defaultProvider, "deepseek");
+  assert.equal(config.profiles?.deepseek?.defaultBaseUrl, "https://api.deepseek.com");
+  assert.equal(config.profiles?.deepseek?.defaultModel, "deepseek-v4-flash");
+  assert.deepEqual(config.profiles?.deepseek?.apiKeyEnvNames, ["DEEPSEEK_API_KEY"]);
+});
+
+test("soloclaw TUI model setup menu stores pasted API key as encrypted secret ref", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-setup-menu-"));
+  const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
+  process.env.AGENT_SECRETS_PASSPHRASE = "test-passphrase-12345";
+  t.after(async () => {
+    if (previousPassphrase === undefined) {
+      delete process.env.AGENT_SECRETS_PASSPHRASE;
+    } else {
+      process.env.AGENT_SECRETS_PASSPHRASE = previousPassphrase;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Model Setup Menu Project\n", "utf8");
+
+  const pastedSecret = "sk-menu-secret-should-not-leak";
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup\n5\n1\n1\n1\n${pastedSecret}\n/model check\n/config\n/exit\n`,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Model setup/);
+  assert.match(result.stdout, /Google Gemini \(gemini\)/);
+  assert.match(result.stdout, /Kimi \/ Moonshot AI \(kimi\)/);
+  assert.match(result.stdout, /Qwen \/ DashScope \(qwen\)/);
+  assert.match(result.stdout, /API key:/);
+  assert.equal(result.stdout.includes(pastedSecret), false);
+  assert.equal(result.stderr.includes(pastedSecret), false);
+  assert.match(result.stdout, /deepseek\tlocal\topenai_chat\tmodel=deepseek-v4-flash\tbaseUrl=https:\/\/api\.deepseek\.com\tenv=DEEPSEEK_API_KEY\tsecret=configured\tdefault=deepseek/);
+  assert.match(result.stdout, /status=ready/);
+
+  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+  const config = JSON.parse(configText) as {
+    defaultProvider?: string;
+    profiles?: Record<string, { defaultBaseUrl?: string; defaultModel?: string; apiKeyEnvNames?: string[]; apiKeySecretRef?: string }>;
+  };
+  assert.equal(config.defaultProvider, "deepseek");
+  assert.equal(config.profiles?.deepseek?.defaultBaseUrl, "https://api.deepseek.com");
+  assert.equal(config.profiles?.deepseek?.defaultModel, "deepseek-v4-flash");
+  assert.deepEqual(config.profiles?.deepseek?.apiKeyEnvNames, ["DEEPSEEK_API_KEY"]);
+  assert.match(config.profiles?.deepseek?.apiKeySecretRef ?? "", /^sec_[a-z0-9]+$/);
+  assert.equal(configText.includes(pastedSecret), false);
+
+  const vaultText = await fs.readFile(path.join(dir, ".agent", "secrets.vault.json"), "utf8");
+  assert.equal(vaultText.includes(pastedSecret), false);
+  assert.match(vaultText, /"ciphertext"/);
 });
 
 test("soloclaw model check validates local provider readiness without leaking keys", async (t) => {
@@ -7864,7 +8101,7 @@ test("agent phase1 verify reports local project-reading readiness", async (t) =>
   assert.match(parsed.commands?.realProviderSmoke ?? "", /soloclaw ask --provider/);
 });
 
-test("agent phase2 verify reports partial engineering execution smoke", async (t) => {
+test("agent phase2 verify reports local alpha deliverable engineering execution smoke", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-verify-"));
   t.after(async () => {
     await fs.rm(dir, { recursive: true, force: true });
@@ -7935,6 +8172,40 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionDiffFileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string; reviewHint?: string }>;
       sessionDiffReviewProfile?: DiffReviewProfileShape;
       sessionDiffInspectionPlan?: DiffInspectionPlanShape;
+      controlPlaneSessionDiffPatches?: number;
+      controlPlaneSessionDiffChangedPaths?: string[];
+      controlPlaneSessionDiffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      controlPlaneSessionDiffReviewProfile?: DiffReviewProfileShape;
+      controlPlaneSessionDiffInspectionPlan?: DiffInspectionPlanShape;
+      controlPlaneSessionDiffHasPatchText?: boolean;
+      controlPlaneSessionDiffCommand?: string;
+      controlPlaneSessionReportFileChanges?: number;
+      controlPlaneSessionReportToolResults?: number;
+      controlPlaneSessionReportCommandsFinished?: number;
+      controlPlaneSessionReportTimedOutCommands?: number;
+      controlPlaneSessionReportExecutionProfiles?: Record<string, number>;
+      controlPlaneSessionReportDiffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      controlPlaneSessionReportReviewProfile?: DiffReviewProfileShape;
+      controlPlaneSessionReportInspectionPlan?: DiffInspectionPlanShape;
+      controlPlaneSessionReportCommand?: string;
+      controlPlaneSessionVerificationStatus?: string;
+      controlPlaneSessionVerificationChecks?: number;
+      controlPlaneSessionVerificationPreset?: string;
+      controlPlaneSessionVerificationCommand?: string;
+      controlPlaneSessionBundleVerificationStatus?: string;
+      controlPlaneSessionBundleSections?: string[];
+      controlPlaneSessionBundleTimelineItems?: number;
+      controlPlaneSessionBundleCommand?: string;
+      controlPlaneSessionRefreshViews?: string[];
+      controlPlaneSessionRefreshButton?: boolean;
+      controlPlaneSessionRefreshGenericLoader?: boolean;
+      controlPlaneSessionMutationRefreshActions?: string[];
+      controlPlaneSessionMutationRefreshesDashboard?: boolean;
+      controlPlaneSessionMutationRefreshesInspection?: boolean;
+      controlPlaneSessionLiveRefreshToggle?: boolean;
+      controlPlaneSessionLiveRefreshPoller?: boolean;
+      controlPlaneSessionLiveRefreshesDashboard?: boolean;
+      controlPlaneSessionLiveRefreshesInspection?: boolean;
       sessionReportFileChanges?: number;
       sessionReportToolResults?: number;
       sessionReportCommandsFinished?: number;
@@ -7966,24 +8237,82 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionResultHandoffRequiredIssues?: number;
       sessionResultHandoffRequiredActions?: number;
       sessionResultHandoffNextCommand?: string;
+      sessionNextActions?: number;
+      sessionNextActionStatuses?: Record<string, number>;
+      sessionNextHandoffState?: string;
+      sessionNextHandoffRequiredActions?: number;
+      sessionNextHandoffNextCommand?: string;
+      sessionNextInspectionState?: string;
+      sessionNextInspectionIssues?: number;
+      sessionNextInspectionFocusPaths?: string[];
+      sessionNextReviewCommand?: string;
+      sessionNextTimelineCommand?: string;
+      sessionNextVerifyCommand?: string;
       sessionInspectState?: string;
       sessionInspectIssues?: number;
       sessionInspectIssueSeverities?: Record<string, number>;
       sessionInspectFocusPaths?: string[];
       sessionInspectNextActions?: number;
+      sessionInspectHandoffState?: string;
+      sessionInspectHandoffRequiredActions?: number;
+      sessionInspectHandoffNextCommand?: string;
       sessionInspectReviewCommand?: string;
+      controlPlaneSessionInspectState?: string;
+      controlPlaneSessionInspectIssues?: number;
+      controlPlaneSessionInspectNextActions?: number;
+      controlPlaneSessionInspectHandoffState?: string;
+      controlPlaneSessionInspectHandoffRequiredActions?: number;
+      controlPlaneSessionInspectHandoffNextCommand?: string;
+      controlPlaneSessionInspectReviewCommand?: string;
       sessionTimelineItems?: number;
       sessionTimelineReturnedItems?: number;
       sessionTimelineKinds?: Record<string, number>;
+      controlPlaneSessionTimelineItems?: number;
+      controlPlaneSessionTimelineReturnedItems?: number;
+      controlPlaneSessionTimelineKinds?: Record<string, number>;
+      controlPlaneSessionReviewState?: string;
+      controlPlaneSessionReviewChecklistStatuses?: Record<string, number>;
+      controlPlaneSessionReviewTimelineItems?: number;
+      controlPlaneSessionReviewReturnedTimelineItems?: number;
+      controlPlaneSessionReviewHandoffState?: string;
+      controlPlaneSessionReviewCommand?: string;
+      controlPlaneSessionNextActions?: number;
+      controlPlaneSessionNextHandoffState?: string;
+      controlPlaneSessionNextInspectionState?: string;
+      controlPlaneSessionNextReviewCommand?: string;
+      controlPlaneSessionNextTimelineCommand?: string;
+      controlPlaneSessionNextVerifyCommand?: string;
+      controlPlaneSessionDashboardReturned?: number;
+      controlPlaneSessionDashboardHandoffState?: string;
+      controlPlaneSessionDashboardNextCommand?: string;
+      controlPlaneSessionDashboardReviewCommand?: string;
       sessionStatusOutcome?: string;
       sessionStatusTimelineItems?: number;
       sessionStatusNextActions?: number;
       sessionStatusNextActionStatuses?: Record<string, number>;
       sessionStatusInspectionState?: string;
       sessionStatusInspectionIssues?: number;
+      controlPlaneSessionStatusOutcome?: string;
+      controlPlaneSessionStatusTimelineItems?: number;
+      controlPlaneSessionStatusReturnedTimelineItems?: number;
+      controlPlaneSessionStatusHandoffState?: string;
+      controlPlaneSessionStatusInspectionState?: string;
+      controlPlaneSessionStatusNextActions?: number;
+      controlPlaneSessionStatusCommand?: string;
+      controlPlaneSessionResultOutcome?: string;
+      controlPlaneSessionResultRecovered?: boolean;
+      controlPlaneSessionResultCommandsFinished?: number;
+      controlPlaneSessionResultPendingApprovals?: number;
+      controlPlaneSessionResultChangedPaths?: string[];
+      controlPlaneSessionResultHandoffState?: string;
+      controlPlaneSessionResultInspectionState?: string;
+      controlPlaneSessionResultCommand?: string;
       sessionListReturned?: number;
       sessionListOutcome?: string;
       sessionListPendingApprovals?: number;
+      sessionListHandoffState?: string;
+      sessionListHandoffNextCommand?: string;
+      sessionListNextCommand?: string;
       localAgentState?: string;
       localAgentSessions?: number;
       localAgentPendingApprovals?: number;
@@ -8035,6 +8364,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionReviewHandoffRequiredActions?: number;
       sessionVerificationStatus?: string;
       sessionVerificationChecks?: number;
+      sessionHandoffPresetVerificationStatus?: string;
+      sessionHandoffPresetVerificationChecks?: number;
+      sessionHandoffPresetVerificationPreset?: string;
       sessionNoPendingVerificationStatus?: string;
       sessionNoPendingVerificationChecks?: number;
       sessionNoPendingVerificationPendingApprovals?: number;
@@ -8125,6 +8457,24 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       tuiApprovalUsageShown?: boolean;
       tuiApprovalNoPendingVerificationStatus?: string;
       tuiApprovalNoPendingVerificationChecks?: number;
+      tuiOperatorSessionId?: string;
+      tuiOperatorApprovalId?: string;
+      tuiOperatorStatusOutputLines?: number;
+      tuiOperatorRowsOutputLines?: number;
+      tuiOperatorDetailOutputLines?: number;
+      tuiOperatorQueueStatus?: string;
+      tuiOperatorApprovalRows?: number;
+      tuiOperatorDetailItemId?: string;
+      tuiOperatorDetailSections?: string[];
+      tuiSessionWatchSessionId?: string;
+      tuiSessionWatchKind?: string;
+      tuiSessionWatchTicks?: number;
+      tuiSessionWatchOutputLines?: number;
+      tuiSessionWatchLatestTimelineShown?: boolean;
+      tuiSessionsWatchTicks?: number;
+      tuiSessionsWatchOutputLines?: number;
+      tuiSessionsWatchReturned?: number;
+      tuiSessionsWatchDashboardShown?: boolean;
       targetModeWorkspace?: string;
       targetModeSessions?: Array<{
         mode?: string;
@@ -8136,6 +8486,30 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
         modelCalls?: number;
         modelFailedCalls?: number;
       }>;
+      rustRuntimeSmokeOk?: boolean;
+      rustRuntimeSmokeSkipped?: boolean;
+      rustRuntimeSmokeReason?: string;
+      rustRuntimeSmokeRunner?: string;
+      rustRuntimeSmokeMethods?: string[];
+      rustRuntimeSmokePatchOperations?: string[];
+      rustRuntimeSmokeProtectedPathRejections?: string[];
+      rustRuntimeSmokeAgentTmpWriteAllowed?: boolean;
+      rustRuntimeSmokeCommandExitCode?: number | null;
+      rustRuntimeSmokeCommandStdoutMatched?: boolean;
+      rustRuntimeToolsSmokeOk?: boolean;
+      rustRuntimeToolsSmokeSkipped?: boolean;
+      rustRuntimeToolsSmokeReason?: string;
+      rustRuntimeToolsSmokeRunner?: string;
+      rustRuntimeToolsSmokeSessionId?: string;
+      rustRuntimeToolsSmokeToolAuditEvents?: number;
+      rustRuntimeToolsSmokeCommandAuditEvents?: number;
+      rustRuntimeToolsSmokeFileChanges?: string[];
+      rustRuntimeToolsSmokePolicyActions?: string[];
+      rustRuntimeToolsSmokeApprovalActions?: string[];
+      rustRuntimeToolsSmokePatchFiles?: string[];
+      rustRuntimeToolsSmokePolicyApprovalRequired?: boolean;
+      rustRuntimeToolsSmokeCommandExitCode?: number | null;
+      rustRuntimeToolsSmokeCommandStdoutMatched?: boolean;
       lifecycleAuditEvents?: number;
       lifecycleSessionIds?: string[];
       pauseStatus?: string;
@@ -8159,6 +8533,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       sessionInspect?: string;
       sessionTimeline?: string;
       sessionReview?: string;
+      sessionNext?: string;
       sessionNoPendingVerify?: string;
     localAgentStatus?: string;
     localAgentServicePlan?: string;
@@ -8171,12 +8546,19 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
       tuiApprove?: string;
       tuiDeny?: string;
       tuiApprovalVerify?: string;
+      tuiOperatorStatus?: string;
+      tuiOperatorRows?: string;
+      tuiOperatorShow?: string;
+      tuiSessionWatch?: string;
+      tuiSessionsWatch?: string;
       localDaemonRun?: string;
+      rustRuntimeSmoke?: string;
+      rustRuntimeToolsSmoke?: string;
     };
   };
 
   assert.equal(parsed.status, "pass", result.stdout);
-  assert.equal(parsed.phaseClosure, "partial");
+  assert.equal(parsed.phaseClosure, "local_alpha_deliverable");
   assert.equal(parsed.root, path.resolve(dir));
   assert.match(parsed.sessionId ?? "", /^sess_/);
   assert.match(parsed.sampleWorkspace ?? "", /phase2-smoke-/);
@@ -8220,6 +8602,59 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.match(parsed.evidence?.sessionDiffInspectionPlan?.items?.[0]?.reason ?? "", /confirm intent/);
   assert.match(parsed.evidence?.sessionDiffInspectionPlan?.items?.[0]?.command ?? "", /agent session diff sess_/);
   assert.match(parsed.evidence?.sessionDiffInspectionPlan?.commands?.review ?? "", /agent session review sess_/);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffPatches, parsed.evidence?.sessionDiffPatches);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffChangedPaths?.includes("src/math.js"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffStats?.files, parsed.evidence?.sessionDiffStats?.files);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffStats?.additions, parsed.evidence?.sessionDiffStats?.additions);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffStats?.deletions, parsed.evidence?.sessionDiffStats?.deletions);
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffReviewProfile?.largestFile?.path, "src/math.js");
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffInspectionPlan?.items?.[0]?.path, "src/math.js");
+  assert.equal(parsed.evidence?.controlPlaneSessionDiffHasPatchText, true);
+  assert.match(parsed.evidence?.controlPlaneSessionDiffCommand ?? "", /agent session diff sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-diff-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportFileChanges, parsed.evidence?.sessionReportFileChanges);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportToolResults, parsed.evidence?.sessionReportToolResults);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportCommandsFinished, parsed.evidence?.sessionReportCommandsFinished);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportTimedOutCommands, parsed.evidence?.sessionReportTimedOutCommands);
+  assert.equal((parsed.evidence?.controlPlaneSessionReportExecutionProfiles?.["local-safe"] ?? 0) >= 3, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportDiffStats?.additions, parsed.evidence?.sessionReportDiffStats?.additions);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportDiffStats?.deletions, parsed.evidence?.sessionReportDiffStats?.deletions);
+  assert.equal(parsed.evidence?.controlPlaneSessionReportReviewProfile?.largestFile?.path, "src/math.js");
+  assert.equal(parsed.evidence?.controlPlaneSessionReportInspectionPlan?.items?.[0]?.path, "src/math.js");
+  assert.match(parsed.evidence?.controlPlaneSessionReportCommand ?? "", /agent session report sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-report-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionVerificationStatus, "pass");
+  assert.equal((parsed.evidence?.controlPlaneSessionVerificationChecks ?? 0) >= 10, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionVerificationPreset, "handoff");
+  assert.match(parsed.evidence?.controlPlaneSessionVerificationCommand ?? "", /agent session verify sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-verification-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleVerificationStatus, "pass");
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("diff"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("report"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("status"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("timeline"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("review"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("result"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionBundleSections?.includes("verification"), true);
+  assert.equal((parsed.evidence?.controlPlaneSessionBundleTimelineItems ?? 0) >= 1, true);
+  assert.match(parsed.evidence?.controlPlaneSessionBundleCommand ?? "", /agent session bundle sess_.* --json/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-bundle-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionRefreshButton, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionRefreshGenericLoader, true);
+  for (const view of ["status", "result", "diff", "report", "verify", "bundle", "inspect", "next", "timeline", "review"]) {
+    assert.equal(parsed.evidence?.controlPlaneSessionRefreshViews?.includes(view), true);
+  }
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-refresh-ui-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionMutationRefreshesDashboard, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionMutationRefreshesInspection, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionMutationRefreshActions?.includes("changeSessionState"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionMutationRefreshActions?.includes("decideApproval"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-mutation-refresh-ui-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionLiveRefreshToggle, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionLiveRefreshPoller, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionLiveRefreshesDashboard, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionLiveRefreshesInspection, true);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-live-refresh-ui-evidence" && check.status === "pass"), true);
   assert.equal((parsed.evidence?.sessionReportFileChanges ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionReportToolResults ?? 0) >= 3, true);
   assert.equal((parsed.evidence?.sessionReportCommandsFinished ?? 0) >= 2, true);
@@ -8252,29 +8687,90 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionResultHandoffRequiredIssues ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionResultHandoffRequiredActions ?? 0) >= 1, true);
   assert.match(parsed.evidence?.sessionResultHandoffNextCommand ?? "", /agent approve/);
+  assert.equal(parsed.evidence?.sessionNextActions, parsed.evidence?.sessionResultNextActions);
+  assert.equal((parsed.evidence?.sessionNextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.sessionNextHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.sessionNextHandoffRequiredActions, parsed.evidence?.sessionResultHandoffRequiredActions);
+  assert.match(parsed.evidence?.sessionNextHandoffNextCommand ?? "", /agent approve/);
+  assert.equal(parsed.evidence?.sessionNextInspectionState, parsed.evidence?.sessionResultInspectionState);
+  assert.equal(parsed.evidence?.sessionNextInspectionIssues, parsed.evidence?.sessionResultInspectionIssues);
+  assert.equal(parsed.evidence?.sessionNextInspectionFocusPaths?.includes("src/math.js"), true);
+  assert.match(parsed.evidence?.sessionNextReviewCommand ?? "", /agent session review sess_/);
+  assert.match(parsed.evidence?.sessionNextTimelineCommand ?? "", /agent session timeline sess_/);
+  assert.match(parsed.evidence?.sessionNextVerifyCommand ?? "", /agent session verify sess_/);
   assert.equal(parsed.evidence?.sessionInspectState, parsed.evidence?.sessionResultInspectionState);
   assert.equal(parsed.evidence?.sessionInspectIssues, parsed.evidence?.sessionResultInspectionIssues);
   assert.equal((parsed.evidence?.sessionInspectIssueSeverities?.required ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionInspectIssueSeverities?.warning ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionInspectFocusPaths?.includes("src/math.js"), true);
   assert.equal(parsed.evidence?.sessionInspectNextActions, parsed.evidence?.sessionResultNextActions);
+  assert.equal(parsed.evidence?.sessionInspectHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.sessionInspectHandoffRequiredActions, parsed.evidence?.sessionResultHandoffRequiredActions);
+  assert.match(parsed.evidence?.sessionInspectHandoffNextCommand ?? "", /agent approve/);
   assert.match(parsed.evidence?.sessionInspectReviewCommand ?? "", /agent session result sess_/);
   assert.equal((parsed.evidence?.sessionResultNextActions ?? 0) >= 4, true);
   assert.equal((parsed.evidence?.sessionResultNextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectState, parsed.evidence?.sessionInspectState);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectIssues, parsed.evidence?.sessionInspectIssues);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectNextActions, parsed.evidence?.sessionInspectNextActions);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectHandoffState, parsed.evidence?.sessionInspectHandoffState);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectHandoffRequiredActions, parsed.evidence?.sessionInspectHandoffRequiredActions);
+  assert.equal(parsed.evidence?.controlPlaneSessionInspectHandoffNextCommand, parsed.evidence?.sessionInspectHandoffNextCommand);
+  assert.match(parsed.evidence?.controlPlaneSessionInspectReviewCommand ?? "", /agent session inspect sess_/);
+  assert.equal(parsed.evidence?.controlPlaneSessionNextActions, parsed.evidence?.sessionNextActions);
+  assert.equal(parsed.evidence?.controlPlaneSessionNextHandoffState, parsed.evidence?.sessionNextHandoffState);
+  assert.equal(parsed.evidence?.controlPlaneSessionNextInspectionState, parsed.evidence?.sessionNextInspectionState);
+  assert.match(parsed.evidence?.controlPlaneSessionNextReviewCommand ?? "", /agent session review sess_/);
+  assert.match(parsed.evidence?.controlPlaneSessionNextTimelineCommand ?? "", /agent session timeline sess_/);
+  assert.match(parsed.evidence?.controlPlaneSessionNextVerifyCommand ?? "", /agent session verify sess_/);
+  assert.equal((parsed.evidence?.controlPlaneSessionDashboardReturned ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionDashboardHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.controlPlaneSessionDashboardNextCommand, parsed.evidence?.sessionResultHandoffNextCommand);
+  assert.match(parsed.evidence?.controlPlaneSessionDashboardReviewCommand ?? "", /agent session next sess_/);
   assert.equal((parsed.evidence?.sessionTimelineItems ?? 0) >= 10, true);
   assert.equal((parsed.evidence?.sessionTimelineReturnedItems ?? 0) >= 10, true);
   assert.equal((parsed.evidence?.sessionTimelineKinds?.audit ?? 0) >= 6, true);
   assert.equal((parsed.evidence?.sessionTimelineKinds?.file_change ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.sessionTimelineKinds?.approval ?? 0) >= 4, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionTimelineItems, parsed.evidence?.sessionTimelineItems);
+  assert.equal((parsed.evidence?.controlPlaneSessionTimelineReturnedItems ?? 0) <= 5, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionTimelineKinds?.audit, parsed.evidence?.sessionTimelineKinds?.audit);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-timeline-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionReviewState, "waiting_for_approval");
+  assert.equal(parsed.evidence?.controlPlaneSessionReviewTimelineItems, parsed.evidence?.sessionTimelineItems);
+  assert.equal((parsed.evidence?.controlPlaneSessionReviewReturnedTimelineItems ?? 0) <= 5, true);
+  assert.equal((parsed.evidence?.controlPlaneSessionReviewChecklistStatuses?.warn ?? 0) >= 1, true);
+  assert.match(parsed.evidence?.controlPlaneSessionReviewCommand ?? "", /agent session review sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-review-evidence" && check.status === "pass"), true);
   assert.equal(parsed.evidence?.sessionStatusOutcome, "succeeded");
   assert.equal(parsed.evidence?.sessionStatusTimelineItems, parsed.evidence?.sessionTimelineItems);
   assert.equal(parsed.evidence?.sessionStatusInspectionState, parsed.evidence?.sessionResultInspectionState);
   assert.equal(parsed.evidence?.sessionStatusInspectionIssues, parsed.evidence?.sessionResultInspectionIssues);
   assert.equal(parsed.evidence?.sessionStatusNextActions, parsed.evidence?.sessionResultNextActions);
   assert.equal((parsed.evidence?.sessionStatusNextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionStatusOutcome, parsed.evidence?.sessionStatusOutcome);
+  assert.equal(parsed.evidence?.controlPlaneSessionStatusTimelineItems, parsed.evidence?.sessionStatusTimelineItems);
+  assert.equal((parsed.evidence?.controlPlaneSessionStatusReturnedTimelineItems ?? 0) <= 5, true);
+  assert.equal(parsed.evidence?.controlPlaneSessionStatusHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.controlPlaneSessionStatusInspectionState, parsed.evidence?.sessionResultInspectionState);
+  assert.equal(parsed.evidence?.controlPlaneSessionStatusNextActions, parsed.evidence?.sessionResultNextActions);
+  assert.match(parsed.evidence?.controlPlaneSessionStatusCommand ?? "", /agent session status sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-status-evidence" && check.status === "pass"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultOutcome, parsed.evidence?.sessionResultOutcome);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultRecovered, parsed.evidence?.sessionResultRecovered);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultCommandsFinished, parsed.evidence?.sessionResultCommandsFinished);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultPendingApprovals, parsed.evidence?.sessionResultPendingApprovals);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultChangedPaths?.includes("src/math.js"), true);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.controlPlaneSessionResultInspectionState, parsed.evidence?.sessionResultInspectionState);
+  assert.match(parsed.evidence?.controlPlaneSessionResultCommand ?? "", /agent session result sess_/);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-result-evidence" && check.status === "pass"), true);
   assert.equal((parsed.evidence?.sessionListReturned ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionListOutcome, "succeeded");
   assert.equal((parsed.evidence?.sessionListPendingApprovals ?? 0) >= 4, true);
+  assert.equal(parsed.evidence?.sessionListHandoffState, parsed.evidence?.sessionResultHandoffState);
+  assert.equal(parsed.evidence?.sessionListHandoffNextCommand, parsed.evidence?.sessionResultHandoffNextCommand);
+  assert.match(parsed.evidence?.sessionListNextCommand ?? "", /agent session next sess_/);
   assert.equal(parsed.evidence?.localAgentState, "needs_attention");
   assert.equal((parsed.evidence?.localAgentSessions ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.localAgentPendingApprovals ?? 0) >= 4, true);
@@ -8335,6 +8831,9 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal((parsed.evidence?.sessionReviewNextActionStatuses?.required ?? 0) >= 1, true);
   assert.equal(parsed.evidence?.sessionVerificationStatus, "pass");
   assert.equal((parsed.evidence?.sessionVerificationChecks ?? 0) >= 7, true);
+  assert.equal(parsed.evidence?.sessionHandoffPresetVerificationStatus, "pass");
+  assert.equal((parsed.evidence?.sessionHandoffPresetVerificationChecks ?? 0) >= 7, true);
+  assert.equal(parsed.evidence?.sessionHandoffPresetVerificationPreset, "handoff");
   assert.equal(parsed.evidence?.sessionNoPendingVerificationStatus, "fail");
   assert.equal((parsed.evidence?.sessionNoPendingVerificationChecks ?? 0) >= 3, true);
   assert.equal((parsed.evidence?.sessionNoPendingVerificationPendingApprovals ?? 0) >= 4, true);
@@ -8433,6 +8932,24 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.tuiApprovalUsageShown, true);
   assert.equal(parsed.evidence?.tuiApprovalNoPendingVerificationStatus, "pass");
   assert.equal((parsed.evidence?.tuiApprovalNoPendingVerificationChecks ?? 0) >= 3, true);
+  assert.match(parsed.evidence?.tuiOperatorSessionId ?? "", /^sess_/);
+  assert.match(parsed.evidence?.tuiOperatorApprovalId ?? "", /^appr_/);
+  assert.equal((parsed.evidence?.tuiOperatorStatusOutputLines ?? 0) >= 3, true);
+  assert.equal((parsed.evidence?.tuiOperatorRowsOutputLines ?? 0) >= 1, true);
+  assert.equal((parsed.evidence?.tuiOperatorDetailOutputLines ?? 0) >= 3, true);
+  assert.equal(["idle", "running", "queued", "waiting_for_approval", "retry_delayed", "saturated", "blocked"].includes(parsed.evidence?.tuiOperatorQueueStatus ?? ""), true);
+  assert.equal((parsed.evidence?.tuiOperatorApprovalRows ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.tuiOperatorDetailItemId, "queue:local");
+  assert.equal(parsed.evidence?.tuiOperatorDetailSections?.includes("Overview"), true);
+  assert.equal(parsed.evidence?.tuiSessionWatchSessionId, parsed.sessionId);
+  assert.equal(parsed.evidence?.tuiSessionWatchKind, "status");
+  assert.equal(parsed.evidence?.tuiSessionWatchTicks, 2);
+  assert.equal((parsed.evidence?.tuiSessionWatchOutputLines ?? 0) >= 6, true);
+  assert.equal(parsed.evidence?.tuiSessionWatchLatestTimelineShown, true);
+  assert.equal(parsed.evidence?.tuiSessionsWatchTicks, 2);
+  assert.equal((parsed.evidence?.tuiSessionsWatchOutputLines ?? 0) >= 6, true);
+  assert.equal((parsed.evidence?.tuiSessionsWatchReturned ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.tuiSessionsWatchDashboardShown, true);
   assert.match(parsed.evidence?.targetModeWorkspace ?? "", /phase2-target-modes-/);
   assert.deepEqual(parsed.evidence?.targetModeSessions?.map((entry) => entry.mode), ["plan", "build", "goal"]);
   assert.equal(parsed.evidence?.targetModeSessions?.every((entry) => /^sess_/.test(entry.sessionId ?? "")), true);
@@ -8443,6 +8960,29 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "plan")?.toolResults, 0);
   assert.equal((parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "build")?.toolResults ?? 0) >= 1, true);
   assert.equal((parsed.evidence?.targetModeSessions?.find((entry) => entry.mode === "goal")?.toolResults ?? 0) >= 1, true);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeOk, true);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeSkipped, false);
+  assert.match(parsed.evidence?.rustRuntimeSmokeRunner ?? "", /agent-runner/);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeMethods?.length, 7);
+  assert.deepEqual(parsed.evidence?.rustRuntimeSmokePatchOperations, ["modify", "create", "delete"]);
+  assert.deepEqual(parsed.evidence?.rustRuntimeSmokeProtectedPathRejections, ["read:.git", "write:.agent"]);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeAgentTmpWriteAllowed, true);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeCommandExitCode, 0);
+  assert.equal(parsed.evidence?.rustRuntimeSmokeCommandStdoutMatched, true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeOk, true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeSkipped, false);
+  assert.match(parsed.evidence?.rustRuntimeToolsSmokeRunner ?? "", /agent-runner/);
+  assert.match(parsed.evidence?.rustRuntimeToolsSmokeSessionId ?? "", /^sess_/);
+  assert.equal((parsed.evidence?.rustRuntimeToolsSmokeToolAuditEvents ?? 0) >= 5, true);
+  assert.equal((parsed.evidence?.rustRuntimeToolsSmokeCommandAuditEvents ?? 0) >= 2, true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeFileChanges?.includes("patch:src/math.js"), true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokePolicyActions?.includes("workspace.write"), true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokePolicyActions?.includes("shell.run.safe"), true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeApprovalActions?.includes("workspace.write"), true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokePatchFiles?.includes("modify:src/math.js"), true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokePolicyApprovalRequired, true);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeCommandExitCode, 0);
+  assert.equal(parsed.evidence?.rustRuntimeToolsSmokeCommandStdoutMatched, true);
   assert.equal((parsed.evidence?.lifecycleAuditEvents ?? 0) >= 3, true);
   assert.equal(parsed.evidence?.lifecycleSessionIds?.length, 2);
   assert.equal(parsed.evidence?.pauseStatus, "paused");
@@ -8470,8 +9010,11 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "session-diff-inspection-plan-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-report-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-result-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-next-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-inspection-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-inspect-command-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-dashboard-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "control-plane-session-next-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "command-profile-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-timeline-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-status-evidence"), true);
@@ -8482,6 +9025,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.checks?.some((check) => check.id === "local-agent-logs-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-review-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-verification-gate"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "session-handoff-preset-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "pending-approval-verification-gate"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-bundle-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "session-handoff-evidence"), true);
@@ -8501,6 +9045,7 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.sessionVerify?.includes("--require-approval-actions"), true);
   assert.equal(parsed.commands?.sessionStatus?.includes("agent session status"), true);
   assert.equal(parsed.commands?.sessionInspect?.includes("agent session inspect"), true);
+  assert.equal(parsed.commands?.sessionNext?.includes("agent session next"), true);
   assert.equal(parsed.commands?.sessionTimeline?.includes("agent session timeline"), true);
   assert.equal(parsed.commands?.sessionReview?.includes("agent session review"), true);
   assert.equal(parsed.commands?.sessionNoPendingVerify?.includes("--require-no-pending-approvals"), true);
@@ -8518,15 +9063,33 @@ test("agent phase2 verify reports partial engineering execution smoke", async (t
   assert.equal(parsed.commands?.tuiDeny?.includes("/deny <approval-id>"), true);
   assert.equal(parsed.commands?.tuiApprovalVerify?.includes("--require-no-pending-approvals"), true);
   assert.equal(parsed.commands?.tuiApprovalVerify?.includes("--allow-no-command"), true);
+  assert.equal(parsed.commands?.tuiOperatorStatus?.includes("/operator status --kind queue"), true);
+  assert.equal(parsed.commands?.tuiOperatorRows?.includes("/operator status --kind approval --rows --json"), true);
+  assert.equal(parsed.commands?.tuiOperatorShow?.includes("/operator show --kind queue --select 1"), true);
+  assert.equal(parsed.commands?.tuiSessionWatch?.includes("/session watch"), true);
+  assert.equal(parsed.commands?.tuiSessionWatch?.includes("--ticks 2"), true);
+  assert.equal(parsed.commands?.tuiSessionWatch?.includes("--interval-ms 0"), true);
+  assert.equal(parsed.commands?.tuiSessionsWatch?.includes("/sessions watch"), true);
+  assert.equal(parsed.commands?.tuiSessionsWatch?.includes("--ticks 2"), true);
+  assert.equal(parsed.commands?.tuiSessionsWatch?.includes("--interval-ms 0"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("agent scheduler run"), true);
   assert.equal(parsed.commands?.localDaemonRun?.includes("--stop-when-idle"), true);
+  assert.equal(parsed.commands?.rustRuntimeSmoke?.includes("cargo build -p agent-runner"), true);
+  assert.equal(parsed.commands?.rustRuntimeSmoke?.includes("workspace-runtime-jsonrpc.test.js"), true);
+  assert.equal(parsed.commands?.rustRuntimeToolsSmoke?.includes("cargo build -p agent-runner"), true);
+  assert.equal(parsed.commands?.rustRuntimeToolsSmoke?.includes("Rust agent-runner stays behind workspace tools policy and audit"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "run-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "agent-loop-repair-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "resume-session-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "queued-approval-continuation-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "queued-approval-retry-backoff-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "tui-approval-decision-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "tui-operator-view-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "tui-session-watch-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "tui-sessions-watch-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "target-mode-evidence"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "workspace-runtime-jsonrpc-rust-smoke"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "workspace-runtime-jsonrpc-rust-tools-policy-audit"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "lifecycle-evidence"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "local-daemon-run-lifecycle-evidence"), true);
   assert.equal(await exists(parsed.sampleWorkspace ?? path.join(dir, "missing")), false);
@@ -9233,7 +9796,11 @@ test("agent session report summarizes engineering execution evidence", async (t)
       reviewProfile?: DiffReviewProfileShape;
       nextActions?: number;
       nextActionStatuses?: Record<string, number>;
+      handoffState?: string;
+      handoffRequiredActions?: number;
+      handoffNextCommand?: string;
     };
+    handoff?: { state?: string; requiredActions?: number; nextCommand?: string };
     inspection?: {
       state?: string;
       summary?: string;
@@ -9266,6 +9833,12 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(sessionInspect.summary?.reviewProfile?.reviewSize, "small");
   assert.equal((sessionInspect.summary?.nextActions ?? 0) >= 4, true);
   assert.equal((sessionInspect.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(sessionInspect.summary?.handoffState, "blocked");
+  assert.equal(sessionInspect.summary?.handoffRequiredActions, 1);
+  assert.match(sessionInspect.summary?.handoffNextCommand ?? "", /agent approve appr_report_write --auto-replay/);
+  assert.equal(sessionInspect.handoff?.state, sessionInspect.summary?.handoffState);
+  assert.equal(sessionInspect.handoff?.requiredActions, sessionInspect.summary?.handoffRequiredActions);
+  assert.equal(sessionInspect.handoff?.nextCommand, sessionInspect.summary?.handoffNextCommand);
   assert.equal(sessionInspect.inspection?.state, "blocked");
   assert.equal(sessionInspect.inspection?.summary, sessionInspect.summary?.inspectionSummary);
   assert.equal(sessionInspect.inspection?.issues?.some((issue) => issue.id === "pending-approvals" && issue.severity === "required"), true);
@@ -9285,6 +9858,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(inspectText.stdout, /Issues:/);
   assert.match(inspectText.stdout, /Pending approvals remain/);
   assert.match(inspectText.stdout, /focusPaths=src\/math\.js/);
+  assert.match(inspectText.stdout, /handoff=blocked requiredIssues=1 requiredActions=1 next=agent approve appr_report_write --auto-replay/);
   assert.match(inspectText.stdout, /Next actions:/);
   assert.match(inspectText.stdout, /agent session bundle/);
 
@@ -9320,7 +9894,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
     };
     latestTimeline?: Array<{ kind?: string; title?: string }>;
     nextActions?: Array<{ id?: string; status?: string; command?: string }>;
-    reviewCommands?: { timeline?: string; review?: string; inspect?: string; result?: string; report?: string };
+    reviewCommands?: { timeline?: string; review?: string; inspect?: string; next?: string; result?: string; report?: string };
   };
   assert.equal(status.session?.id, session.id);
   assert.equal(status.summary?.outcome, "succeeded");
@@ -9350,6 +9924,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.equal(status.latestTimeline?.length, 5);
   assert.match(status.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${session.id}`));
   assert.match(status.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${session.id}`));
+  assert.match(status.reviewCommands?.next ?? "", new RegExp(`agent session next ${session.id}`));
 
   const statusText = await run(process.execPath, [cli, "session", "status", session.id, "--limit", "5"], dir);
   assert.equal(statusText.exitCode, 0, statusText.stderr);
@@ -9360,6 +9935,7 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(statusText.stdout, /modelCalls=1 ok=1 failed=0 totalTokens=15 durationMs=123/);
   assert.match(statusText.stdout, /inspection=blocked/);
   assert.match(statusText.stdout, /handoff=blocked requiredIssues=1 requiredActions=1 next=agent approve appr_report_write --auto-replay/);
+  assert.match(statusText.stdout, new RegExp(`agent session next ${escapeRegExp(session.id)}`));
   assert.match(statusText.stdout, /Latest timeline:/);
 
   const localStatusJson = await run(process.execPath, [cli, "local", "status", "--json", "--limit", "10"], dir);
@@ -9966,6 +10542,44 @@ test("agent session report summarizes engineering execution evidence", async (t)
   assert.match(bundleText.stdout, /agent session bundle/);
   assert.match(bundleText.stdout, /agent local status/);
   assert.match(bundleText.stdout, /agent local logs/);
+
+  const handoffVerify = await run(process.execPath, [cli, "session", "verify", session.id, "--preset", "handoff", "--json"], dir);
+  assert.equal(handoffVerify.exitCode, 0, handoffVerify.stderr);
+  const parsedHandoffVerify = JSON.parse(handoffVerify.stdout) as {
+    status?: string;
+    options?: {
+      preset?: string;
+      requireChange?: boolean;
+      requirePatch?: boolean;
+      requireRecovery?: boolean;
+      requireDiffStat?: boolean;
+      requireReviewProfile?: boolean;
+      requireModelCall?: boolean;
+      requireNoPendingApprovals?: boolean;
+    };
+    checks?: Array<{ id?: string; status?: string }>;
+  };
+  assert.equal(parsedHandoffVerify.status, "pass");
+  assert.equal(parsedHandoffVerify.options?.preset, "handoff");
+  assert.equal(parsedHandoffVerify.options?.requireChange, true);
+  assert.equal(parsedHandoffVerify.options?.requirePatch, true);
+  assert.equal(parsedHandoffVerify.options?.requireRecovery, true);
+  assert.equal(parsedHandoffVerify.options?.requireDiffStat, true);
+  assert.equal(parsedHandoffVerify.options?.requireReviewProfile, true);
+  assert.equal(parsedHandoffVerify.options?.requireModelCall, true);
+  assert.equal(parsedHandoffVerify.options?.requireNoPendingApprovals, false);
+  assert.equal(parsedHandoffVerify.checks?.some((check) => check.id === "model-call-evidence" && check.status === "pass"), true);
+
+  const handoffBundle = await run(process.execPath, [cli, "session", "bundle", session.id, "--json", "--preset", "handoff"], dir);
+  assert.equal(handoffBundle.exitCode, 0, handoffBundle.stderr);
+  const parsedHandoffBundle = JSON.parse(handoffBundle.stdout) as {
+    summary?: { verificationStatus?: string };
+    sections?: { verification?: { options?: { preset?: string; requireModelCall?: boolean }; checks?: Array<{ id?: string; status?: string }> } };
+  };
+  assert.equal(parsedHandoffBundle.summary?.verificationStatus, "pass");
+  assert.equal(parsedHandoffBundle.sections?.verification?.options?.preset, "handoff");
+  assert.equal(parsedHandoffBundle.sections?.verification?.options?.requireModelCall, true);
+  assert.equal(parsedHandoffBundle.sections?.verification?.checks?.some((check) => check.id === "model-call-evidence" && check.status === "pass"), true);
 
   const verifyFailure = await run(process.execPath, [cli, "session", "verify", noChangeSession.id, "--require-change", "--json"], dir);
   assert.equal(verifyFailure.exitCode, 1);
@@ -17081,6 +17695,10 @@ test("control plane web API requires the local access token", async (t) => {
   const denied = await fetch(`${server.baseUrl}/api/health`);
   assert.equal(denied.status, 401);
 
+  const favicon = await fetch(`${server.baseUrl}/favicon.ico`);
+  assert.equal(favicon.status, 204);
+  assert.equal(await favicon.text(), "");
+
   const allowed = await fetch(`${server.baseUrl}/api/health`, {
     headers: { "x-agent-control-token": "test-control-token" },
   });
@@ -17121,10 +17739,81 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(html, /renderRetention/);
   assert.match(html, /renderAudit/);
   assert.match(html, /id="session-inspection"/);
+  assert.match(html, /id="session-inspection-refresh"/);
+  assert.match(html, /id="session-inspection-live"/);
+  assert.match(html, /id="session-dashboard-refresh"/);
+  assert.match(html, /id="session-dashboard-status"/);
+  assert.match(html, /id="session-dashboard-target-mode"/);
+  assert.match(html, /sessionDashboardPath/);
+  assert.match(html, /loadSessionDashboard/);
+  assert.match(html, /loadSessionStatus/);
+  assert.match(html, /loadSessionResult/);
+  assert.match(html, /loadSessionDiff/);
+  assert.match(html, /loadSessionReport/);
+  assert.match(html, /loadSessionVerify/);
+  assert.match(html, /loadSessionBundle/);
   assert.match(html, /loadSessionInspection/);
+  assert.match(html, /loadSessionNext/);
+  assert.match(html, /loadSessionTimeline/);
+  assert.match(html, /loadSessionReview/);
+  assert.match(html, /loadSessionInspectionView/);
+  assert.match(html, /refreshSelectedSessionInspection/);
+  assert.match(html, /isSessionInspectionLive/);
+  assert.match(html, /refreshOpenSessionViews/);
+  assert.match(html, /refreshAfterSessionMutation/);
+  assert.match(html, /sessionInspectionPath/);
+  assert.match(html, /selectedSessionInspectionKind/);
   assert.match(html, /renderSessionInspection/);
+  assert.match(html, /renderSessionStatus/);
+  assert.match(html, /renderSessionResult/);
+  assert.match(html, /renderSessionDiff/);
+  assert.match(html, /renderSessionReport/);
+  assert.match(html, /renderSessionVerification/);
+  assert.match(html, /renderSessionBundle/);
+  assert.match(html, /renderSessionTimeline/);
+  assert.match(html, /renderSessionReview/);
+  assert.match(html, /Command results/);
+  assert.match(html, /Inspection plan/);
+  assert.match(html, /Command events/);
+  assert.match(html, /Verification checks/);
+  assert.match(html, /Bundle sections/);
+  assert.match(html, /No persisted patches/);
+  assert.match(html, /No file changes/);
+  assert.match(html, /No recent audit events/);
   assert.match(html, /sessionInspectionItem/);
+  assert.match(html, /view\.reviewCommands/);
+  assert.match(html, /No timeline items/);
+  assert.match(html, /No review checklist/);
+  assert.match(html, /No command results/);
+  assert.match(html, /No follow-up commands/);
+  assert.match(html, /sessionInspectionItem\(command\[0\], 'command', command\[1\]\)/);
+  assert.match(html, /new URLSearchParams\(\{ limit: '12' \}\)/);
+  assert.match(html, /sessionInspectionPaths/);
+  assert.match(html, /selectedSessionInspectionKind = kind/);
+  assert.match(html, /const shouldRefreshInspection = Boolean\(sessionId && selectedSessionInspectionId === sessionId && selectedSessionInspectionKind\)/);
+  assert.match(html, /if \(sessionDashboard\) \{\s+await loadSessionDashboard\(\);/);
+  assert.match(html, /await loadSessionInspectionView\(sessionId, inspectionKind\)/);
+  assert.match(html, /const shouldRefreshLiveViews = isSessionInspectionLive\(\)/);
+  assert.match(html, /const shouldRefreshDashboard = Boolean\(sessionDashboard\)/);
+  assert.match(html, /if \(!shouldRefreshLiveViews\) \{\s+return;/);
+  assert.match(html, /await loadSessionInspectionView\(inspectionId, inspectionKind\)/);
+  assert.match(html, /setInterval\(refreshOpenSessionViews, 5000\)/);
+  assert.match(html, /await refreshAfterSessionMutation\(sessionId\)/);
+  assert.match(html, /decideApproval\(approval\.id, 'approve', true, approval\.sessionId\)/);
+  assert.match(html, /decideApproval\(approval\.id, 'deny', false, approval\.sessionId\)/);
+  assert.match(html, /params\.set\('status', status\)/);
+  assert.match(html, /params\.set\('targetMode', targetMode\)/);
+  assert.match(html, /No dashboard sessions/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/status\?limit=12/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/result/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/diff/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/report/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/verify\?preset=handoff/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/bundle\?preset=handoff&limit=12/);
   assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/inspect/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/next/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/timeline\?limit=12/);
+  assert.match(html, /\/api\/sessions\/'\s*\+\s*encodeURIComponent\(sessionId\)\s*\+\s*'\/review\?limit=12/);
   assert.match(html, /operator\.queue/);
   assert.match(html, /operator\?\.workers/);
   assert.match(html, /operator\?\.assignments/);
@@ -17201,11 +17890,22 @@ test("control plane web API requires the local access token", async (t) => {
     headers: { "x-agent-control-token": "test-control-token" },
   });
   const webSessionInspectionJson = await webSessionInspection.json() as {
-    summary?: { inspectionState?: string; inspectionFocusPaths?: string[]; pendingApprovals?: number };
+    summary?: {
+      handoffState?: string;
+      handoffNextCommand?: string;
+      inspectionState?: string;
+      inspectionFocusPaths?: string[];
+      pendingApprovals?: number;
+    };
+    handoff?: { state?: string; nextCommand?: string };
     inspection?: { issues?: Array<{ id?: string }> };
     reviewCommands?: { result?: string; bundle?: string };
   };
   assert.equal(webSessionInspection.status, 200);
+  assert.equal(webSessionInspectionJson.summary?.handoffState, "blocked");
+  assert.match(webSessionInspectionJson.summary?.handoffNextCommand ?? "", /agent approve web_inspect_approval/);
+  assert.equal(webSessionInspectionJson.handoff?.state, webSessionInspectionJson.summary?.handoffState);
+  assert.equal(webSessionInspectionJson.handoff?.nextCommand, webSessionInspectionJson.summary?.handoffNextCommand);
   assert.equal(webSessionInspectionJson.summary?.inspectionState, "blocked");
   assert.equal(webSessionInspectionJson.summary?.pendingApprovals, 1);
   assert.deepEqual(webSessionInspectionJson.summary?.inspectionFocusPaths, ["src/web-target.ts"]);
@@ -17213,10 +17913,541 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(webSessionInspectionJson.reviewCommands?.result ?? "", new RegExp(`agent session result ${webSession.id}`));
   assert.match(webSessionInspectionJson.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${webSession.id} --json`));
 
+  const deniedNext = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/next`);
+  assert.equal(deniedNext.status, 401);
+
+  const deniedDashboard = await fetch(`${server.baseUrl}/api/sessions?limit=5`);
+  assert.equal(deniedDashboard.status, 401);
+
+  const webSessionDashboard = await fetch(`${server.baseUrl}/api/sessions?limit=5`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionDashboardJson = await webSessionDashboard.json() as {
+    summary?: {
+      returned?: number;
+      byHandoffState?: Record<string, number>;
+      pendingApprovals?: number;
+      changedSessions?: number;
+      filters?: { status?: string; targetMode?: string };
+    };
+    sessions?: Array<{
+      session?: { id?: string; status?: string; targetMode?: string };
+      summary?: {
+        outcome?: string;
+        handoffState?: string;
+        handoffNextCommand?: string;
+        changedPaths?: string[];
+        pendingApprovals?: number;
+        commandsFinished?: number;
+      };
+      reviewCommands?: { next?: string; inspect?: string; verify?: string };
+    }>;
+  };
+  assert.equal(webSessionDashboard.status, 200);
+  assert.equal((webSessionDashboardJson.summary?.returned ?? 0) >= 1, true);
+  assert.equal((webSessionDashboardJson.summary?.byHandoffState?.blocked ?? 0) >= 1, true);
+  assert.equal((webSessionDashboardJson.summary?.pendingApprovals ?? 0) >= 1, true);
+  assert.equal((webSessionDashboardJson.summary?.changedSessions ?? 0) >= 1, true);
+  const webSessionDashboardEntry = webSessionDashboardJson.sessions?.find((entry) => entry.session?.id === webSession.id);
+  assert.equal(webSessionDashboardEntry?.session?.status, "completed");
+  assert.equal(webSessionDashboardEntry?.session?.targetMode, "build");
+  assert.equal(webSessionDashboardEntry?.summary?.outcome, "succeeded");
+  assert.equal(webSessionDashboardEntry?.summary?.handoffState, "blocked");
+  assert.match(webSessionDashboardEntry?.summary?.handoffNextCommand ?? "", /agent approve web_inspect_approval/);
+  assert.deepEqual(webSessionDashboardEntry?.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionDashboardEntry?.summary?.pendingApprovals, 1);
+  assert.equal(webSessionDashboardEntry?.summary?.commandsFinished, 0);
+  assert.match(webSessionDashboardEntry?.reviewCommands?.next ?? "", new RegExp(`agent session next ${webSession.id}`));
+  assert.match(webSessionDashboardEntry?.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${webSession.id}`));
+  assert.match(webSessionDashboardEntry?.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+
+  const filteredSessionDashboard = await fetch(`${server.baseUrl}/api/sessions?limit=5&status=completed&targetMode=build`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const filteredSessionDashboardJson = await filteredSessionDashboard.json() as typeof webSessionDashboardJson;
+  assert.equal(filteredSessionDashboard.status, 200);
+  assert.equal(filteredSessionDashboardJson.summary?.filters?.status, "completed");
+  assert.equal(filteredSessionDashboardJson.summary?.filters?.targetMode, "build");
+  assert.equal(filteredSessionDashboardJson.sessions?.some((entry) => entry.session?.id === webSession.id), true);
+  assert.equal(filteredSessionDashboardJson.sessions?.every((entry) => entry.session?.status === "completed" && entry.session?.targetMode === "build"), true);
+
+  const invalidSessionDashboardStatus = await fetch(`${server.baseUrl}/api/sessions?status=bogus`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidSessionDashboardStatus.status, 400);
+
+  const invalidSessionDashboardLimit = await fetch(`${server.baseUrl}/api/sessions?limit=51`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidSessionDashboardLimit.status, 400);
+
+  const webSessionNext = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/next`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionNextJson = await webSessionNext.json() as {
+    summary?: {
+      handoffState?: string;
+      handoffNextCommand?: string;
+      inspectionState?: string;
+      inspectionFocusPaths?: string[];
+      nextActions?: number;
+      nextActionStatuses?: Record<string, number>;
+    };
+    handoff?: { state?: string; nextCommand?: string };
+    nextActions?: Array<{ id?: string; status?: string; command?: string }>;
+    reviewCommands?: { review?: string; inspect?: string; timeline?: string; verify?: string };
+  };
+  assert.equal(webSessionNext.status, 200);
+  assert.equal(webSessionNextJson.summary?.handoffState, "blocked");
+  assert.match(webSessionNextJson.summary?.handoffNextCommand ?? "", /agent approve web_inspect_approval/);
+  assert.equal(webSessionNextJson.summary?.inspectionState, webSessionInspectionJson.summary?.inspectionState);
+  assert.deepEqual(webSessionNextJson.summary?.inspectionFocusPaths, ["src/web-target.ts"]);
+  assert.equal((webSessionNextJson.summary?.nextActions ?? 0) >= 4, true);
+  assert.equal((webSessionNextJson.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(webSessionNextJson.nextActions?.some((action) => action.id === "resolve-pending-approvals" && action.status === "required"), true);
+  assert.match(webSessionNextJson.reviewCommands?.review ?? "", new RegExp(`agent session review ${webSession.id}`));
+  assert.match(webSessionNextJson.reviewCommands?.inspect ?? "", new RegExp(`agent session inspect ${webSession.id}`));
+  assert.match(webSessionNextJson.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${webSession.id}`));
+  assert.match(webSessionNextJson.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+
+  const deniedStatus = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/status?limit=5`);
+  assert.equal(deniedStatus.status, 401);
+
+  const webSessionStatus = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/status?limit=5`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionStatusJson = await webSessionStatus.json() as {
+    kind?: string;
+    summary?: {
+      outcome?: string;
+      handoffState?: string;
+      handoffNextCommand?: string;
+      inspectionState?: string;
+      changedPaths?: string[];
+      pendingApprovals?: number;
+      timelineItems?: number;
+      returnedTimelineItems?: number;
+      nextActions?: number;
+      nextActionStatuses?: Record<string, number>;
+    };
+    latestTimeline?: Array<{ kind?: string; title?: string; path?: string; action?: string }>;
+    reviewCommands?: { status?: string; review?: string; timeline?: string; verify?: string };
+  };
+  assert.equal(webSessionStatus.status, 200);
+  assert.equal(webSessionStatusJson.kind, "session_status");
+  assert.equal(webSessionStatusJson.summary?.outcome, "succeeded");
+  assert.equal(webSessionStatusJson.summary?.handoffState, "blocked");
+  assert.match(webSessionStatusJson.summary?.handoffNextCommand ?? "", /agent approve web_inspect_approval/);
+  assert.equal(webSessionStatusJson.summary?.inspectionState, webSessionInspectionJson.summary?.inspectionState);
+  assert.deepEqual(webSessionStatusJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionStatusJson.summary?.pendingApprovals, 1);
+  assert.equal(webSessionStatusJson.summary?.timelineItems, 3);
+  assert.equal(webSessionStatusJson.summary?.returnedTimelineItems, 3);
+  assert.equal((webSessionStatusJson.summary?.nextActions ?? 0) >= 4, true);
+  assert.equal((webSessionStatusJson.summary?.nextActionStatuses?.required ?? 0) >= 1, true);
+  assert.equal(webSessionStatusJson.latestTimeline?.some((item) => item.kind === "file_change" && item.path === "src/web-target.ts"), true);
+  assert.match(webSessionStatusJson.reviewCommands?.status ?? "", new RegExp(`agent session status ${webSession.id}`));
+  assert.match(webSessionStatusJson.reviewCommands?.review ?? "", new RegExp(`agent session review ${webSession.id}`));
+  assert.match(webSessionStatusJson.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${webSession.id}`));
+  assert.match(webSessionStatusJson.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+
+  const deniedResult = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/result`);
+  assert.equal(deniedResult.status, 401);
+
+  const webSessionResult = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/result`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionResultJson = await webSessionResult.json() as {
+    kind?: string;
+    summary?: {
+      outcome?: string;
+      recovered?: boolean;
+      handoffState?: string;
+      handoffNextCommand?: string;
+      inspectionState?: string;
+      changedPaths?: string[];
+      patches?: number;
+      pendingApprovals?: number;
+      commandsFinished?: number;
+      nextActions?: number;
+    };
+    recovery?: { observedFailure?: boolean; recovered?: boolean };
+    commands?: unknown[];
+    approvals?: Array<{ id?: string; status?: string; action?: string }>;
+    changes?: { changedPaths?: string[]; reviewProfile?: { files?: number; reviewSize?: string } };
+    reviewCommands?: { result?: string; status?: string; diff?: string; verify?: string };
+  };
+  assert.equal(webSessionResult.status, 200);
+  assert.equal(webSessionResultJson.kind, "session_result");
+  assert.equal(webSessionResultJson.summary?.outcome, "succeeded");
+  assert.equal(webSessionResultJson.summary?.recovered, false);
+  assert.equal(webSessionResultJson.summary?.handoffState, "blocked");
+  assert.match(webSessionResultJson.summary?.handoffNextCommand ?? "", /agent approve web_inspect_approval/);
+  assert.equal(webSessionResultJson.summary?.inspectionState, webSessionInspectionJson.summary?.inspectionState);
+  assert.deepEqual(webSessionResultJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionResultJson.summary?.patches, 1);
+  assert.equal(webSessionResultJson.summary?.pendingApprovals, 1);
+  assert.equal(webSessionResultJson.summary?.commandsFinished, 0);
+  assert.equal((webSessionResultJson.summary?.nextActions ?? 0) >= 4, true);
+  assert.equal(webSessionResultJson.recovery?.observedFailure, false);
+  assert.equal(webSessionResultJson.recovery?.recovered, false);
+  assert.equal(webSessionResultJson.commands?.length, 0);
+  assert.equal(webSessionResultJson.approvals?.some((approval) =>
+    approval.id === "web_inspect_approval" &&
+    approval.status === "pending" &&
+    approval.action === "workspace.write"
+  ), true);
+  assert.deepEqual(webSessionResultJson.changes?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionResultJson.changes?.reviewProfile?.files, 1);
+  assert.equal(webSessionResultJson.changes?.reviewProfile?.reviewSize, "small");
+  assert.match(webSessionResultJson.reviewCommands?.result ?? "", new RegExp(`agent session result ${webSession.id}`));
+  assert.match(webSessionResultJson.reviewCommands?.status ?? "", new RegExp(`agent session status ${webSession.id}`));
+  assert.match(webSessionResultJson.reviewCommands?.diff ?? "", new RegExp(`agent session diff ${webSession.id}`));
+  assert.match(webSessionResultJson.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+
+  const deniedDiff = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/diff`);
+  assert.equal(deniedDiff.status, 401);
+
+  const webSessionDiff = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/diff`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionDiffJson = await webSessionDiff.json() as {
+    kind?: string;
+    summary?: {
+      patches?: number;
+      fileChanges?: number;
+      changedPaths?: string[];
+      diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      fileSummaries?: Array<{ path?: string; changeType?: string; additions?: number; deletions?: number; patches?: number; reviewSize?: string }>;
+      reviewProfile?: { files?: number; reviewSize?: string; largestFile?: { path?: string } };
+      inspectionPlan?: { state?: string; focusPaths?: string[]; items?: Array<{ path?: string; priority?: number; command?: string }> };
+    };
+    patches?: Array<{ paths?: string[]; hasPatchText?: boolean; patch?: string }>;
+    fileChanges?: Array<{ path?: string; kind?: string }>;
+    reviewCommands?: { diff?: string; result?: string; review?: string };
+  };
+  assert.equal(webSessionDiff.status, 200);
+  assert.equal(webSessionDiffJson.kind, "session_diff");
+  assert.equal(webSessionDiffJson.summary?.patches, 1);
+  assert.equal(webSessionDiffJson.summary?.fileChanges, 1);
+  assert.deepEqual(webSessionDiffJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionDiffJson.summary?.diffStats?.files, 1);
+  assert.equal(webSessionDiffJson.summary?.diffStats?.additions, 1);
+  assert.equal(webSessionDiffJson.summary?.diffStats?.deletions, 1);
+  assert.equal(webSessionDiffJson.summary?.diffStats?.byPath?.some((entry) => entry.path === "src/web-target.ts" && entry.additions === 1 && entry.deletions === 1), true);
+  assert.equal(webSessionDiffJson.summary?.fileSummaries?.some((entry) =>
+    entry.path === "src/web-target.ts" &&
+    entry.changeType === "modified" &&
+    entry.additions === 1 &&
+    entry.deletions === 1 &&
+    entry.patches === 1 &&
+    entry.reviewSize === "small"
+  ), true);
+  assert.equal(webSessionDiffJson.summary?.reviewProfile?.files, 1);
+  assert.equal(webSessionDiffJson.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(webSessionDiffJson.summary?.reviewProfile?.largestFile?.path, "src/web-target.ts");
+  assert.equal(webSessionDiffJson.summary?.inspectionPlan?.state, "ready");
+  assert.equal(webSessionDiffJson.summary?.inspectionPlan?.focusPaths?.includes("src/web-target.ts"), true);
+  assert.equal(webSessionDiffJson.summary?.inspectionPlan?.items?.some((item) =>
+    item.path === "src/web-target.ts" &&
+    item.priority === 1 &&
+    /agent session diff/.test(item.command ?? "")
+  ), true);
+  assert.equal(webSessionDiffJson.patches?.some((patch) =>
+    patch.paths?.includes("src/web-target.ts") &&
+    patch.hasPatchText === true &&
+    /--- a\/src\/web-target\.ts/.test(patch.patch ?? "") &&
+    /\+new/.test(patch.patch ?? "")
+  ), true);
+  assert.equal(webSessionDiffJson.fileChanges?.some((change) => change.path === "src/web-target.ts" && change.kind === "patch"), true);
+  assert.match(webSessionDiffJson.reviewCommands?.diff ?? "", new RegExp(`agent session diff ${webSession.id}`));
+  assert.match(webSessionDiffJson.reviewCommands?.result ?? "", new RegExp(`agent session result ${webSession.id}`));
+  assert.match(webSessionDiffJson.reviewCommands?.review ?? "", new RegExp(`agent session review ${webSession.id}`));
+
+  const deniedReport = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/report`);
+  assert.equal(deniedReport.status, 401);
+
+  const webSessionReport = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/report`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionReportJson = await webSessionReport.json() as {
+    kind?: string;
+    summary?: {
+      fileChanges?: number;
+      toolResults?: number;
+      commandEvents?: number;
+      commandsFinished?: number;
+      approvals?: number;
+      pendingApprovals?: number;
+      changedPaths?: string[];
+      diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      reviewProfile?: { files?: number; reviewSize?: string; largestFile?: { path?: string } };
+      inspectionPlan?: { state?: string; focusPaths?: string[]; items?: Array<{ path?: string; priority?: number; command?: string }> };
+      auditEvents?: number;
+    };
+    fileChanges?: Array<{ path?: string; kind?: string }>;
+    commandEvents?: unknown[];
+    toolResults?: unknown[];
+    approvals?: Array<{ id?: string; status?: string; action?: string }>;
+    recentAuditEvents?: Array<{ type?: string; summary?: string }>;
+    reviewCommands?: { report?: string; diff?: string; result?: string };
+  };
+  assert.equal(webSessionReport.status, 200);
+  assert.equal(webSessionReportJson.kind, "session_report");
+  assert.equal(webSessionReportJson.summary?.fileChanges, 1);
+  assert.equal(webSessionReportJson.summary?.toolResults, 0);
+  assert.equal(webSessionReportJson.summary?.commandEvents, 0);
+  assert.equal(webSessionReportJson.summary?.commandsFinished, 0);
+  assert.equal(webSessionReportJson.summary?.approvals, 1);
+  assert.equal(webSessionReportJson.summary?.pendingApprovals, 1);
+  assert.deepEqual(webSessionReportJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionReportJson.summary?.diffStats?.files, 1);
+  assert.equal(webSessionReportJson.summary?.diffStats?.additions, 1);
+  assert.equal(webSessionReportJson.summary?.diffStats?.deletions, 1);
+  assert.equal(webSessionReportJson.summary?.reviewProfile?.largestFile?.path, "src/web-target.ts");
+  assert.equal(webSessionReportJson.summary?.inspectionPlan?.state, "ready");
+  assert.equal(webSessionReportJson.summary?.inspectionPlan?.focusPaths?.includes("src/web-target.ts"), true);
+  assert.equal(webSessionReportJson.summary?.inspectionPlan?.items?.some((item) => item.path === "src/web-target.ts" && item.priority === 1), true);
+  assert.equal(webSessionReportJson.fileChanges?.some((change) => change.path === "src/web-target.ts" && change.kind === "patch"), true);
+  assert.equal(webSessionReportJson.commandEvents?.length, 0);
+  assert.equal(webSessionReportJson.toolResults?.length, 0);
+  assert.equal(webSessionReportJson.approvals?.some((approval) =>
+    approval.id === "web_inspect_approval" &&
+    approval.status === "pending" &&
+    approval.action === "workspace.write"
+  ), true);
+  assert.equal(webSessionReportJson.recentAuditEvents?.some((event) => event.type === "tool.completed" && /Applied patch/.test(event.summary ?? "")), true);
+  assert.match(webSessionReportJson.reviewCommands?.report ?? "", new RegExp(`agent session report ${webSession.id}`));
+  assert.match(webSessionReportJson.reviewCommands?.diff ?? "", new RegExp(`agent session diff ${webSession.id}`));
+  assert.match(webSessionReportJson.reviewCommands?.result ?? "", new RegExp(`agent session result ${webSession.id}`));
+
+  const deniedVerify = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/verify?preset=handoff`);
+  assert.equal(deniedVerify.status, 401);
+
+  const webSessionVerify = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/verify?preset=handoff&requireCommand=false&approvalAction=workspace.write`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionVerifyJson = await webSessionVerify.json() as {
+    kind?: string;
+    status?: string;
+    options?: {
+      preset?: string;
+      requireCommand?: boolean;
+      requireChange?: boolean;
+      requirePatch?: boolean;
+      requireDiffStat?: boolean;
+      requireReviewProfile?: boolean;
+      requiredApprovalActions?: string[];
+    };
+    summary?: {
+      outcome?: string;
+      fileChanges?: number;
+      patches?: number;
+      pendingApprovals?: number;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+    };
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+    reviewCommands?: { verify?: string; report?: string; bundle?: string };
+  };
+  assert.equal(webSessionVerify.status, 200);
+  assert.equal(webSessionVerifyJson.kind, "session_verification");
+  assert.equal(webSessionVerifyJson.status, "pass");
+  assert.equal(webSessionVerifyJson.options?.preset, "handoff");
+  assert.equal(webSessionVerifyJson.options?.requireCommand, false);
+  assert.equal(webSessionVerifyJson.options?.requireChange, true);
+  assert.equal(webSessionVerifyJson.options?.requirePatch, true);
+  assert.equal(webSessionVerifyJson.options?.requireDiffStat, true);
+  assert.equal(webSessionVerifyJson.options?.requireReviewProfile, true);
+  assert.deepEqual(webSessionVerifyJson.options?.requiredApprovalActions, ["workspace.write"]);
+  assert.equal(webSessionVerifyJson.summary?.outcome, "succeeded");
+  assert.equal(webSessionVerifyJson.summary?.fileChanges, 1);
+  assert.equal(webSessionVerifyJson.summary?.patches, 1);
+  assert.equal(webSessionVerifyJson.summary?.pendingApprovals, 1);
+  assert.equal(webSessionVerifyJson.summary?.diffStats?.files, 1);
+  assert.equal(webSessionVerifyJson.checks?.some((check) => check.id === "change-evidence" && check.status === "pass"), true);
+  assert.equal(webSessionVerifyJson.checks?.some((check) => check.id === "patch-evidence" && check.status === "pass"), true);
+  assert.equal(webSessionVerifyJson.checks?.some((check) => check.id === "approval-workspace-write" && check.status === "pass"), true);
+  assert.equal(webSessionVerifyJson.checks?.some((check) => check.id === "command-verified"), false);
+  assert.match(webSessionVerifyJson.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+  assert.match(webSessionVerifyJson.reviewCommands?.report ?? "", new RegExp(`agent session report ${webSession.id}`));
+  assert.match(webSessionVerifyJson.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${webSession.id} --json`));
+
+  const deniedBundle = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/bundle?preset=handoff`);
+  assert.equal(deniedBundle.status, 401);
+
+  const webSessionBundle = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/bundle?preset=handoff&limit=5&requireCommand=false&approvalAction=workspace.write`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionBundleJson = await webSessionBundle.json() as {
+    kind?: string;
+    summary?: {
+      verificationStatus?: string;
+      sections?: string[];
+      changedPaths?: string[];
+      fileChanges?: number;
+      patches?: number;
+      pendingApprovals?: number;
+      timelineItems?: number;
+      diffStats?: { files?: number; additions?: number; deletions?: number };
+    };
+    sections?: {
+      diff?: { summary?: { patches?: number } };
+      report?: { summary?: { fileChanges?: number } };
+      result?: { summary?: { handoffState?: string } };
+      verification?: {
+        options?: { preset?: string; requireCommand?: boolean };
+        checks?: Array<{ id?: string; status?: string }>;
+      };
+    };
+    reviewCommands?: { bundle?: string };
+  };
+  assert.equal(webSessionBundle.status, 200);
+  assert.equal(webSessionBundleJson.kind, "session_bundle");
+  assert.equal(webSessionBundleJson.summary?.verificationStatus, "pass");
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("diff"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("report"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("status"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("timeline"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("review"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("result"), true);
+  assert.equal(webSessionBundleJson.summary?.sections?.includes("verification"), true);
+  assert.deepEqual(webSessionBundleJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionBundleJson.summary?.fileChanges, 1);
+  assert.equal(webSessionBundleJson.summary?.patches, 1);
+  assert.equal(webSessionBundleJson.summary?.pendingApprovals, 1);
+  assert.equal(webSessionBundleJson.summary?.timelineItems, 3);
+  assert.equal(webSessionBundleJson.summary?.diffStats?.files, 1);
+  assert.equal(webSessionBundleJson.sections?.verification?.options?.preset, "handoff");
+  assert.equal(webSessionBundleJson.sections?.verification?.options?.requireCommand, false);
+  assert.equal(webSessionBundleJson.sections?.verification?.checks?.some((check) => check.id === "approval-workspace-write" && check.status === "pass"), true);
+  assert.equal(webSessionBundleJson.sections?.diff?.summary?.patches, 1);
+  assert.equal(webSessionBundleJson.sections?.report?.summary?.fileChanges, 1);
+  assert.equal(webSessionBundleJson.sections?.result?.summary?.handoffState, "blocked");
+  assert.match(webSessionBundleJson.reviewCommands?.bundle ?? "", new RegExp(`agent session bundle ${webSession.id} --json`));
+
+  const deniedTimeline = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/timeline?limit=5`);
+  assert.equal(deniedTimeline.status, 401);
+
+  const webSessionTimeline = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/timeline?limit=5`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionTimelineJson = await webSessionTimeline.json() as {
+    summary?: { totalItems?: number; returnedItems?: number; byKind?: Record<string, number> };
+    items?: Array<{ kind?: string; title?: string; path?: string; action?: string }>;
+  };
+  assert.equal(webSessionTimeline.status, 200);
+  assert.equal(webSessionTimelineJson.summary?.totalItems, 3);
+  assert.equal(webSessionTimelineJson.summary?.returnedItems, 3);
+  assert.equal(webSessionTimelineJson.summary?.byKind?.audit, 1);
+  assert.equal(webSessionTimelineJson.summary?.byKind?.file_change, 1);
+  assert.equal(webSessionTimelineJson.summary?.byKind?.approval, 1);
+  assert.equal(webSessionTimelineJson.items?.some((item) => item.kind === "file_change" && item.path === "src/web-target.ts"), true);
+  assert.equal(webSessionTimelineJson.items?.some((item) => item.kind === "approval" && item.action === "workspace.write"), true);
+
+  const deniedReview = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/review?limit=5`);
+  assert.equal(deniedReview.status, 401);
+
+  const webSessionReview = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/review?limit=5`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  const webSessionReviewJson = await webSessionReview.json() as {
+    summary?: {
+      reviewState?: string;
+      handoffState?: string;
+      checklistStatuses?: Record<string, number>;
+      timelineItems?: number;
+      returnedTimelineItems?: number;
+      changedPaths?: string[];
+      pendingApprovals?: number;
+    };
+    checklist?: Array<{ id?: string; status?: string; command?: string }>;
+    latestTimeline?: Array<{ kind?: string; title?: string; path?: string; action?: string }>;
+    reviewCommands?: { review?: string; timeline?: string; verify?: string };
+  };
+  assert.equal(webSessionReview.status, 200);
+  assert.equal(webSessionReviewJson.summary?.reviewState, "waiting_for_approval");
+  assert.equal(webSessionReviewJson.summary?.handoffState, "blocked");
+  assert.equal(webSessionReviewJson.summary?.pendingApprovals, 1);
+  assert.deepEqual(webSessionReviewJson.summary?.changedPaths, ["src/web-target.ts"]);
+  assert.equal(webSessionReviewJson.summary?.timelineItems, webSessionTimelineJson.summary?.totalItems);
+  assert.equal(webSessionReviewJson.summary?.returnedTimelineItems, 3);
+  assert.equal((webSessionReviewJson.summary?.checklistStatuses?.pass ?? 0) >= 1, true);
+  assert.equal(webSessionReviewJson.checklist?.some((item) => item.id === "approval-state" && item.status === "warn"), true);
+  assert.equal(webSessionReviewJson.checklist?.some((item) => item.id === "handoff-state" && item.status === "fail"), true);
+  assert.equal(webSessionReviewJson.latestTimeline?.some((item) => item.kind === "approval" && item.action === "workspace.write"), true);
+  assert.match(webSessionReviewJson.reviewCommands?.review ?? "", new RegExp(`agent session review ${webSession.id}`));
+  assert.match(webSessionReviewJson.reviewCommands?.timeline ?? "", new RegExp(`agent session timeline ${webSession.id}`));
+  assert.match(webSessionReviewJson.reviewCommands?.verify ?? "", new RegExp(`agent session verify ${webSession.id}`));
+
+  const invalidTimelineLimit = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/timeline?limit=101`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidTimelineLimit.status, 400);
+
+  const invalidStatusLimit = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/status?limit=101`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidStatusLimit.status, 400);
+
+  const invalidReviewLimit = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/review?limit=101`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidReviewLimit.status, 400);
+
+  const invalidBundleLimit = await fetch(`${server.baseUrl}/api/sessions/${encodeURIComponent(webSession.id)}/bundle?limit=101`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(invalidBundleLimit.status, 400);
+
   const missingInspection = await fetch(`${server.baseUrl}/api/sessions/missing-session/inspect`, {
     headers: { "x-agent-control-token": "test-control-token" },
   });
   assert.equal(missingInspection.status, 404);
+
+  const missingNext = await fetch(`${server.baseUrl}/api/sessions/missing-session/next`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingNext.status, 404);
+
+  const missingStatus = await fetch(`${server.baseUrl}/api/sessions/missing-session/status`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingStatus.status, 404);
+
+  const missingResult = await fetch(`${server.baseUrl}/api/sessions/missing-session/result`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingResult.status, 404);
+
+  const missingDiff = await fetch(`${server.baseUrl}/api/sessions/missing-session/diff`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingDiff.status, 404);
+
+  const missingReport = await fetch(`${server.baseUrl}/api/sessions/missing-session/report`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingReport.status, 404);
+
+  const missingVerify = await fetch(`${server.baseUrl}/api/sessions/missing-session/verify`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingVerify.status, 404);
+
+  const missingBundle = await fetch(`${server.baseUrl}/api/sessions/missing-session/bundle`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingBundle.status, 404);
+
+  const missingTimeline = await fetch(`${server.baseUrl}/api/sessions/missing-session/timeline`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingTimeline.status, 404);
+
+  const missingReview = await fetch(`${server.baseUrl}/api/sessions/missing-session/review`, {
+    headers: { "x-agent-control-token": "test-control-token" },
+  });
+  assert.equal(missingReview.status, 404);
 
   const webMcpRegistry = new LocalMcpRegistry(path.join(dir, ".agent"));
   await webMcpRegistry.register({

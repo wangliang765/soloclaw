@@ -119,9 +119,10 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
     if (!baseUrl) {
       continue;
     }
+    const apiKeySecretRef = provider === profile.name ? options.apiKeySecretRef ?? profile.apiKeySecretRef : profile.apiKeySecretRef;
     const apiKey = apiKeyResolver(
       secretBroker,
-      provider === profile.name ? options.apiKeySecretRef : undefined,
+      apiKeySecretRef,
       provider === profile.name && options.apiKeyEnv ? [options.apiKeyEnv] : profile.apiKeyEnvNames,
       {
         actor: platformActor,
@@ -578,5 +579,5 @@ function shouldRegisterModelProvider(profileName: ModelProviderName, selectedPro
     return true;
   }
   const profile = profiles[profileName] as ModelProviderProfile | undefined;
-  return Boolean(profile?.apiKeyEnvNames.some((envName) => process.env[envName]));
+  return Boolean(profile?.apiKeySecretRef || profile?.apiKeyEnvNames.some((envName) => process.env[envName]));
 }

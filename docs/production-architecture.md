@@ -48,7 +48,7 @@ Web UI / CLI
 
 Use this for organizations, shared projects, long-running tasks, PR automation, and auditability.
 
-Current local implementation note: `agent web` hosts a token-gated local control-plane API and room console on a configurable host/port. It reuses the same SQLite-backed platform services as the CLI and exposes local JSON endpoints for room state, sessions, focused session inspection, session lifecycle actions, approvals, artifacts, retention policies, audit events, and worker registration/heartbeat. This is a bridge toward the private-team control plane, not the production API boundary.
+Current local implementation note: `agent web` hosts a token-gated local control-plane API and room console on a configurable host/port. It reuses the same SQLite-backed platform services as the CLI and exposes local JSON endpoints for room state, the filterable on-demand session dashboard, lightweight session diff packages, consolidated session report packages, lightweight session status snapshots, focused session inspection, focused session next actions, safe session timelines, lightweight session review packages, lightweight session result packages, shared session verification packages, session lifecycle actions, approvals, artifacts, retention policies, audit events, and worker registration/heartbeat. This is a bridge toward the private-team control plane, not the production API boundary.
 
 ### Distributed Agent Mesh
 
@@ -453,7 +453,7 @@ permission denial: do not retry automatically
 destructive operation failure: do not retry automatically
 ```
 
-Current local model reliability implements the first provider step for HTTP models: OpenAI, Anthropic, Grok/xAI, MiniMax, DeepSeek, GLM, MiMo, OpenAI-compatible, and Anthropic-compatible endpoints are registered through provider profiles. Non-Anthropic commercial providers currently use the OpenAI-compatible chat adapter with provider-specific default base URLs, model names, and API key env aliases. Local `.agent/model-providers.json` overrides can edit protocol, base URL, default model, and API key env names without storing raw secrets. Transient network failures, 408/409/425/429, and 5xx responses can retry with bounded backoff and `Retry-After`; `FallbackModelClient` can route to configured backup providers only for transient provider errors. `GuardedModelClient` adds local in-process model call budgets, failure budgets, and consecutive-failure circuit breaking through CLI knobs. Authentication, authorization, malformed request, and other non-retryable provider failures must fail visibly and must not be hidden by fallback routing. Production should replace local profile files and in-process guards with a tenant-scoped provider registry, distributed quota service, shared circuit breaker state, and provider-specific clients where APIs diverge.
+Current local model reliability implements the first provider step for HTTP models: OpenAI, Anthropic, Gemini, Kimi/Moonshot, Grok/xAI, MiniMax, DeepSeek, GLM/Z.AI, Qwen/DashScope, MiMo, OpenAI-compatible, and Anthropic-compatible endpoints are registered through provider profiles. Non-Anthropic commercial providers currently use the OpenAI-compatible chat adapter with provider-specific default base URLs, model names, and API key env aliases. Local `.agent/model-providers.json` overrides can edit protocol, base URL, default model, API key env names, and encrypted local secret refs without storing raw secrets; TUI `/model setup` exposes the common provider/base URL/model/key flow. Transient network failures, 408/409/425/429, and 5xx responses can retry with bounded backoff and `Retry-After`; `FallbackModelClient` can route to configured backup providers only for transient provider errors. `GuardedModelClient` adds local in-process model call budgets, failure budgets, and consecutive-failure circuit breaking through CLI knobs. Authentication, authorization, malformed request, and other non-retryable provider failures must fail visibly and must not be hidden by fallback routing. Production should replace local profile files and in-process guards with a tenant-scoped provider registry, distributed quota service, shared circuit breaker state, and provider-specific clients where APIs diverge.
 
 ## Auditability
 
@@ -529,10 +529,10 @@ Audit records should include actor, org, project, session, timestamp, input summ
 
 ## Recommended Implementation Order
 
-The local TypeScript MVP has already advanced through many early protocol and domain slices. Treat the following order as the productionization sequence from the current state:
+The local TypeScript MVP has already advanced through many early protocol and domain slices. The first Rust handoff boundary is now explicit: `JsonRpcWorkspaceRuntime` can call a newline-delimited JSON-RPC 2.0 worker over stdio using the `workspace-runtime-jsonrpc.v1` schema, `crates/agent-runner` is the Rust scaffold for that worker shape, `crates/agent-diff` provides the initial guarded unified-diff patch path behind `workspace/applyPatch`, and the Rust-backed tools/policy/audit smoke proves that runner use still flows through TypeScript file-change, audit, and approval records. Treat the following order as the productionization sequence from the current state:
 
 1. Expand the adversarial/security test suite around prompt injection, secret exfiltration, poisoned RAG, forged room/agent messages, plugin isolation, MCP boundaries, and retention deletion/export.
-2. Freeze core interfaces that must survive production replacement: store, broker, migrations, object storage, policy, secret broker, workspace runtime, model provider, MCP runtime, Git provider, artifact store, event stream, and search adapter.
+2. Freeze core interfaces that must survive production replacement: store, broker, migrations, object storage, policy, secret broker, workspace runtime, `workspace-runtime-jsonrpc.v1`, model provider, MCP runtime, Git provider, artifact store, event stream, and search adapter.
 3. Wire the MCP stdio/HTTP runtime into policy, secret leases, sandboxed transports, per-tool/resource grants, Web/API diagnostics, and complete audit through one shared runtime boundary.
 4. Upgrade RAG to ACL-filtered hybrid retrieval with embeddings, full-text search adapters, reranking, citation precision checks, permission-leak eval, freshness checks, and CI trend gates.
 5. Promote worker, scheduler, and remote-agent runners into supervised-daemon-ready services with authenticated agent sessions, mandatory heartbeat/lease verification, key rotation, revocation, drain/shutdown, and health streaming.
@@ -547,6 +547,9 @@ The local TypeScript MVP has already advanced through many early protocol and do
 
 - Agent orchestration must not depend on local filesystem APIs directly.
 - Tool execution must go through policy checks.
+- Rust runner implementations must stay behind `WorkspaceRuntime` / JSON-RPC compatibility tests plus the tools/policy/audit smoke; they must not create a second orchestration, policy, approval, or audit path.
+- MCP is the external capability protocol, not the internal workspace-runner replacement protocol.
+- Protobuf can be introduced only as a versioned transport encoding beside the same semantic runner contract, not as a competing method set.
 - Long outputs and artifacts must not be stored inline in hot database tables.
 - Distributed agents must authenticate as agents, not as users.
 - Git provider tokens must be scoped, encrypted, and rotated.

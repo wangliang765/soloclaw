@@ -2,7 +2,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
-import { createInterface } from "node:readline/promises";
+import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 import type {
   ActorRef,
   AgentHeartbeatStatus,
@@ -55,7 +55,8 @@ import { createLocalPlatform } from "../platform/local-platform.js";
 import { RemoteRoomRunner } from "../remote/remote-room-runner.js";
 import type { SchedulerRunResult, SchedulerTickResult } from "../scheduler/local-scheduler-service.js";
 import type { PutSecretInput } from "../secrets/secret-store.js";
-import { buildSessionInspectView } from "../sessions/session-inspection-view.js";
+import { EncryptedFileSecretStore } from "../secrets/encrypted-file-secret-store.js";
+import { buildSessionInspectView, buildSessionNextView, buildSessionReportView, buildSessionVerificationView, type SessionVerificationOptions, type SessionVerificationPreset } from "../sessions/session-inspection-view.js";
 import type { KnowledgeEvalCase, KnowledgeEvalThresholds, KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { parseSpecificationClarificationStatus, parseSpecificationStatus, parseSpecificationTaskStatus } from "../specifications/specification-service.js";
 import type { SpecificationEvidenceConclusion, SpecificationEvidenceProvider, SpecificationVerificationStatus } from "../specifications/specification-service.js";
@@ -65,6 +66,18 @@ import type { WorkerPollResult, WorkerRunOnceResult } from "../workers/local-wor
 import { WorkerHealthService, type WorkerHealthSummary } from "../workers/worker-health-service.js";
 import { collectWorkspaceKeyFilePreviews, collectWorkspaceSnapshot, renderWorkspaceFilePreviews, renderWorkspaceSnapshot } from "../workspace/workspace-snapshot.js";
 import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
+import { runWorkspaceRuntimeJsonRpcRustSmoke, runWorkspaceRuntimeJsonRpcRustToolsSmoke } from "../workspace/workspace-runtime-jsonrpc-smoke.js";
+import { renderAppHtml } from "../web/local-room-web-server.js";
+import {
+  buildSessionTimelineView as buildSessionTimeline,
+  countTimelineKinds,
+  timelineItemFromApproval,
+  timelineItemFromApprovalDecision,
+  timelineItemFromAudit,
+  timelineItemFromFileChange,
+  timelineKindOrder,
+  type SessionTimelineItem,
+} from "../sessions/session-timeline-view.js";
 
 async function main() {
   const [, , command, ...rest] = process.argv;
@@ -356,7 +369,7 @@ async function main() {
           providerName = parseModelProviderName(promptedProvider);
         }
         if (!providerName) {
-          console.error("Usage: soloclaw model setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV] [--default]");
+          console.error("Usage: soloclaw model setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
           process.exitCode = 1;
           return;
         }
@@ -370,12 +383,13 @@ async function main() {
           defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(parsed.options.providerInput ?? providerInput) ?? current.defaultBaseUrl,
           defaultModel: parsed.options.model ?? current.defaultModel,
           apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, parsed.options.providerInput ?? providerInput, current.apiKeyEnvNames),
+          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
         });
         if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
           await profiles.setDefaultProvider(providerName);
         }
         const defaultProvider = await profiles.getDefaultProvider();
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tdefault=${defaultProvider ?? "-"}`);
+        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
         console.log(`config=${profiles.filePath}`);
         return;
       }
@@ -422,7 +436,7 @@ async function main() {
           console.log(`config=${profiles.filePath}`);
           console.log(`default=${defaultProvider ?? "-"}`);
           for (const profile of listed) {
-            console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}`);
+            console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
           }
         }
         return;
@@ -1832,7 +1846,7 @@ async function main() {
           providerName = parseModelProviderName(promptedProvider);
         }
         if (!providerName) {
-          console.error("Usage: soloclaw models setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV] [--default]");
+          console.error("Usage: soloclaw models setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
           process.exitCode = 1;
           return;
         }
@@ -1847,12 +1861,13 @@ async function main() {
           defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(parsed.options.providerInput ?? providerInput) ?? current.defaultBaseUrl,
           defaultModel: parsed.options.model ?? current.defaultModel,
           apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, parsed.options.providerInput ?? providerInput, current.apiKeyEnvNames),
+          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
         });
         if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
           await profiles.setDefaultProvider(providerName);
         }
         const defaultProvider = await profiles.getDefaultProvider();
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tdefault=${defaultProvider ?? "-"}`);
+        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
         console.log(`config=${profiles.filePath}`);
         return;
       }
@@ -1872,7 +1887,7 @@ async function main() {
         } else {
           for (const profile of listed) {
             console.log(
-              `${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}${profile.name === defaultProvider ? "\tdefault" : ""}`,
+              `${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}${profile.name === defaultProvider ? "\tdefault" : ""}`,
             );
           }
         }
@@ -1881,7 +1896,7 @@ async function main() {
       if (subcommand === "set") {
         const providerName = parsed.positionals[0];
         if (!providerName) {
-          console.error("Usage: agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV]");
+          console.error("Usage: agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id]");
           process.exitCode = 1;
           return;
         }
@@ -1896,11 +1911,12 @@ async function main() {
           defaultBaseUrl: parsed.options.baseUrl ?? current.defaultBaseUrl,
           defaultModel: parsed.options.model ?? current.defaultModel,
           apiKeyEnvNames: parsed.options.clearApiKeyEnvNames ? [] : parsed.options.apiKeyEnvNames ?? current.apiKeyEnvNames,
+          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
         });
         if (parsed.options.setDefault) {
           await profiles.setDefaultProvider(name);
         }
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}`);
+        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
         return;
       }
       if (subcommand === "remove" || subcommand === "delete") {
@@ -3921,6 +3937,7 @@ async function main() {
         const bundle = await buildSessionEvidenceBundle(store, sessionId, {
           workspace: process.cwd(),
           limit: parsed.options.limit,
+          preset: parsed.options.preset,
           requireChange: parsed.options.requireChange,
           requirePatch: parsed.options.requirePatch,
           requireRecovery: parsed.options.requireRecovery,
@@ -3957,14 +3974,30 @@ async function main() {
         }
         return;
       }
+      if (subcommand === "next") {
+        const parsed = parseLifecycleArgs(args);
+        if (!sessionId) {
+          console.error("Usage: agent session next <session-id> [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const next = await buildSessionNext(store, sessionId);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(next, null, 2));
+        } else {
+          printSessionNext(next);
+        }
+        return;
+      }
       if (subcommand === "verify") {
         const parsed = parseLifecycleArgs(args);
         if (!sessionId) {
-          console.error("Usage: agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
+          console.error("Usage: agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
           process.exitCode = 1;
           return;
         }
         const verification = await buildSessionVerification(store, sessionId, {
+          preset: parsed.options.preset,
           requireChange: parsed.options.requireChange,
           requirePatch: parsed.options.requirePatch,
           requireRecovery: parsed.options.requireRecovery,
@@ -4974,7 +5007,7 @@ type PhaseTwoEngineeringSmokeResult = {
   root: string;
   sampleWorkspace: string;
   status: "pass" | "fail";
-  phaseClosure: "partial";
+  phaseClosure: "local_alpha_deliverable";
   sessionId?: string;
   patch: string;
   checks: PhaseTwoEngineeringSmokeCheck[];
@@ -4992,6 +5025,13 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionDiffFileSummaries: UnifiedDiffFileSummary[];
     sessionDiffReviewProfile: UnifiedDiffReviewProfile;
     sessionDiffInspectionPlan: UnifiedDiffInspectionPlan;
+    controlPlaneSessionDiffPatches: number;
+    controlPlaneSessionDiffChangedPaths: string[];
+    controlPlaneSessionDiffStats: UnifiedDiffStats;
+    controlPlaneSessionDiffReviewProfile?: UnifiedDiffReviewProfile;
+    controlPlaneSessionDiffInspectionPlan?: UnifiedDiffInspectionPlan;
+    controlPlaneSessionDiffHasPatchText: boolean;
+    controlPlaneSessionDiffCommand?: string;
     sessionReportFileChanges: number;
     sessionReportToolResults: number;
     sessionReportCommandsFinished: number;
@@ -5002,6 +5042,33 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReportReviewProfile: UnifiedDiffReviewProfile;
     sessionReportInspectionPlan: UnifiedDiffInspectionPlan;
     sessionReportPendingApprovals: number;
+    controlPlaneSessionReportFileChanges: number;
+    controlPlaneSessionReportToolResults: number;
+    controlPlaneSessionReportCommandsFinished: number;
+    controlPlaneSessionReportTimedOutCommands: number;
+    controlPlaneSessionReportExecutionProfiles: Record<string, number>;
+    controlPlaneSessionReportDiffStats: UnifiedDiffStats;
+    controlPlaneSessionReportReviewProfile?: UnifiedDiffReviewProfile;
+    controlPlaneSessionReportInspectionPlan?: UnifiedDiffInspectionPlan;
+    controlPlaneSessionReportCommand?: string;
+    controlPlaneSessionVerificationStatus?: string;
+    controlPlaneSessionVerificationChecks: number;
+    controlPlaneSessionVerificationPreset?: string;
+    controlPlaneSessionVerificationCommand?: string;
+    controlPlaneSessionBundleVerificationStatus?: string;
+    controlPlaneSessionBundleSections: string[];
+    controlPlaneSessionBundleTimelineItems: number;
+    controlPlaneSessionBundleCommand?: string;
+    controlPlaneSessionRefreshViews: string[];
+    controlPlaneSessionRefreshButton: boolean;
+    controlPlaneSessionRefreshGenericLoader: boolean;
+    controlPlaneSessionMutationRefreshActions: string[];
+    controlPlaneSessionMutationRefreshesDashboard: boolean;
+    controlPlaneSessionMutationRefreshesInspection: boolean;
+    controlPlaneSessionLiveRefreshToggle: boolean;
+    controlPlaneSessionLiveRefreshPoller: boolean;
+    controlPlaneSessionLiveRefreshesDashboard: boolean;
+    controlPlaneSessionLiveRefreshesInspection: boolean;
     sessionResultOutcome?: string;
     sessionResultRecovered: boolean;
     sessionResultCommandsFinished: number;
@@ -5023,28 +5090,82 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionResultHandoffRequiredIssues: number;
     sessionResultHandoffRequiredActions: number;
     sessionResultHandoffNextCommand?: string;
+    sessionNextActions: number;
+    sessionNextActionStatuses: Record<string, number>;
+    sessionNextHandoffState?: string;
+    sessionNextHandoffRequiredActions: number;
+    sessionNextHandoffNextCommand?: string;
+    sessionNextInspectionState?: string;
+    sessionNextInspectionIssues: number;
+    sessionNextInspectionFocusPaths: string[];
+    sessionNextReviewCommand?: string;
+    sessionNextTimelineCommand?: string;
+    sessionNextVerifyCommand?: string;
     sessionInspectState?: string;
     sessionInspectIssues: number;
     sessionInspectIssueSeverities: Record<string, number>;
     sessionInspectFocusPaths: string[];
     sessionInspectNextActions: number;
+    sessionInspectHandoffState?: string;
+    sessionInspectHandoffRequiredActions: number;
+    sessionInspectHandoffNextCommand?: string;
     sessionInspectReviewCommand?: string;
     controlPlaneSessionInspectState?: string;
     controlPlaneSessionInspectIssues: number;
     controlPlaneSessionInspectNextActions: number;
+    controlPlaneSessionInspectHandoffState?: string;
+    controlPlaneSessionInspectHandoffRequiredActions: number;
+    controlPlaneSessionInspectHandoffNextCommand?: string;
     controlPlaneSessionInspectReviewCommand?: string;
+    controlPlaneSessionNextActions: number;
+    controlPlaneSessionNextHandoffState?: string;
+    controlPlaneSessionNextInspectionState?: string;
+    controlPlaneSessionNextReviewCommand?: string;
+    controlPlaneSessionNextTimelineCommand?: string;
+    controlPlaneSessionNextVerifyCommand?: string;
+    controlPlaneSessionDashboardReturned: number;
+    controlPlaneSessionDashboardHandoffState?: string;
+    controlPlaneSessionDashboardNextCommand?: string;
+    controlPlaneSessionDashboardReviewCommand?: string;
     sessionTimelineItems: number;
     sessionTimelineReturnedItems: number;
     sessionTimelineKinds: Record<string, number>;
+    controlPlaneSessionTimelineItems: number;
+    controlPlaneSessionTimelineReturnedItems: number;
+    controlPlaneSessionTimelineKinds: Record<string, number>;
+    controlPlaneSessionReviewState?: string;
+    controlPlaneSessionReviewChecklistStatuses: Record<string, number>;
+    controlPlaneSessionReviewTimelineItems: number;
+    controlPlaneSessionReviewReturnedTimelineItems: number;
+    controlPlaneSessionReviewHandoffState?: string;
+    controlPlaneSessionReviewCommand?: string;
     sessionStatusOutcome?: string;
     sessionStatusTimelineItems: number;
     sessionStatusNextActions: number;
     sessionStatusNextActionStatuses: Record<string, number>;
     sessionStatusInspectionState?: string;
     sessionStatusInspectionIssues: number;
+    controlPlaneSessionStatusOutcome?: string;
+    controlPlaneSessionStatusTimelineItems: number;
+    controlPlaneSessionStatusReturnedTimelineItems: number;
+    controlPlaneSessionStatusHandoffState?: string;
+    controlPlaneSessionStatusInspectionState?: string;
+    controlPlaneSessionStatusNextActions: number;
+    controlPlaneSessionStatusCommand?: string;
+    controlPlaneSessionResultOutcome?: string;
+    controlPlaneSessionResultRecovered?: boolean;
+    controlPlaneSessionResultCommandsFinished: number;
+    controlPlaneSessionResultPendingApprovals: number;
+    controlPlaneSessionResultChangedPaths?: string[];
+    controlPlaneSessionResultHandoffState?: string;
+    controlPlaneSessionResultInspectionState?: string;
+    controlPlaneSessionResultCommand?: string;
     sessionListReturned: number;
     sessionListOutcome?: string;
     sessionListPendingApprovals: number;
+    sessionListHandoffState?: string;
+    sessionListHandoffNextCommand?: string;
+    sessionListNextCommand?: string;
     localAgentState?: string;
     localAgentSessions: number;
     localAgentPendingApprovals: number;
@@ -5096,6 +5217,9 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionReviewHandoffRequiredActions: number;
     sessionVerificationStatus?: string;
     sessionVerificationChecks: number;
+    sessionHandoffPresetVerificationStatus?: string;
+    sessionHandoffPresetVerificationChecks: number;
+    sessionHandoffPresetVerificationPreset?: string;
     sessionNoPendingVerificationStatus?: string;
     sessionNoPendingVerificationChecks: number;
     sessionNoPendingVerificationPendingApprovals: number;
@@ -5186,6 +5310,24 @@ type PhaseTwoEngineeringSmokeResult = {
     tuiApprovalUsageShown: boolean;
     tuiApprovalNoPendingVerificationStatus?: string;
     tuiApprovalNoPendingVerificationChecks: number;
+    tuiOperatorSessionId?: string;
+    tuiOperatorApprovalId?: string;
+    tuiOperatorStatusOutputLines: number;
+    tuiOperatorRowsOutputLines: number;
+    tuiOperatorDetailOutputLines: number;
+    tuiOperatorQueueStatus?: string;
+    tuiOperatorApprovalRows: number;
+    tuiOperatorDetailItemId?: string;
+    tuiOperatorDetailSections: string[];
+    tuiSessionWatchSessionId?: string;
+    tuiSessionWatchKind?: TuiSessionWatchKind;
+    tuiSessionWatchTicks: number;
+    tuiSessionWatchOutputLines: number;
+    tuiSessionWatchLatestTimelineShown: boolean;
+    tuiSessionsWatchTicks: number;
+    tuiSessionsWatchOutputLines: number;
+    tuiSessionsWatchReturned: number;
+    tuiSessionsWatchDashboardShown: boolean;
     targetModeWorkspace?: string;
     targetModeSessions: Array<{
       mode: string;
@@ -5197,6 +5339,30 @@ type PhaseTwoEngineeringSmokeResult = {
       modelCalls: number;
       modelFailedCalls: number;
     }>;
+    rustRuntimeSmokeOk: boolean;
+    rustRuntimeSmokeSkipped: boolean;
+    rustRuntimeSmokeReason?: string;
+    rustRuntimeSmokeRunner?: string;
+    rustRuntimeSmokeMethods: string[];
+    rustRuntimeSmokePatchOperations: string[];
+    rustRuntimeSmokeProtectedPathRejections: string[];
+    rustRuntimeSmokeAgentTmpWriteAllowed: boolean;
+    rustRuntimeSmokeCommandExitCode?: number | null;
+    rustRuntimeSmokeCommandStdoutMatched: boolean;
+    rustRuntimeToolsSmokeOk: boolean;
+    rustRuntimeToolsSmokeSkipped: boolean;
+    rustRuntimeToolsSmokeReason?: string;
+    rustRuntimeToolsSmokeRunner?: string;
+    rustRuntimeToolsSmokeSessionId?: string;
+    rustRuntimeToolsSmokeToolAuditEvents: number;
+    rustRuntimeToolsSmokeCommandAuditEvents: number;
+    rustRuntimeToolsSmokeFileChanges: string[];
+    rustRuntimeToolsSmokePolicyActions: string[];
+    rustRuntimeToolsSmokeApprovalActions: string[];
+    rustRuntimeToolsSmokePatchFiles: string[];
+    rustRuntimeToolsSmokePolicyApprovalRequired: boolean;
+    rustRuntimeToolsSmokeCommandExitCode?: number | null;
+    rustRuntimeToolsSmokeCommandStdoutMatched: boolean;
     lifecycleAuditEvents: number;
     lifecycleSessionIds: string[];
     pauseStatus?: string;
@@ -5225,6 +5391,7 @@ type PhaseTwoEngineeringSmokeResult = {
     sessionTimeline?: string;
     sessionReview?: string;
     sessionResult?: string;
+    sessionNext?: string;
     sessionInspect?: string;
     sessionVerify?: string;
     sessionNoPendingVerify?: string;
@@ -5243,7 +5410,14 @@ type PhaseTwoEngineeringSmokeResult = {
     tuiApprove?: string;
     tuiDeny?: string;
     tuiApprovalVerify?: string;
+    tuiOperatorStatus?: string;
+    tuiOperatorRows?: string;
+    tuiOperatorShow?: string;
+    tuiSessionWatch?: string;
+    tuiSessionsWatch?: string;
     localDaemonRun?: string;
+    rustRuntimeSmoke?: string;
+    rustRuntimeToolsSmoke?: string;
   };
 };
 
@@ -5469,6 +5643,26 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       status: sessionDiffInspectionPlanPass ? "pass" : "fail",
       summary: sessionDiff.summary.inspectionPlan.summary,
     });
+    const controlPlaneSessionDiff = await new ControlPlaneService(platform).getSessionDiff(session.id);
+    const controlPlaneSessionDiffPass =
+      controlPlaneSessionDiff?.kind === "session_diff" &&
+      controlPlaneSessionDiff.session.id === session.id &&
+      controlPlaneSessionDiff.summary.patches === sessionDiff.summary.patches &&
+      controlPlaneSessionDiff.summary.changedPaths.includes("src/math.js") &&
+      controlPlaneSessionDiff.summary.diffStats.additions === sessionDiff.summary.diffStats.additions &&
+      controlPlaneSessionDiff.summary.diffStats.deletions === sessionDiff.summary.diffStats.deletions &&
+      controlPlaneSessionDiff.summary.fileSummaries.some((entry) => entry.path === "src/math.js" && entry.reviewSize === "small") &&
+      controlPlaneSessionDiff.summary.inspectionPlan.items.some((entry) => entry.path === "src/math.js" && entry.command.includes(`agent session diff ${session.id}`)) &&
+      controlPlaneSessionDiff.patches.some((entry) => entry.hasPatchText && entry.patch?.includes("return a + b")) &&
+      controlPlaneSessionDiff.reviewCommands.diff.includes(`agent session diff ${session.id}`);
+    checks.push({
+      id: "control-plane-session-diff-evidence",
+      label: "control plane session diff evidence",
+      status: controlPlaneSessionDiffPass ? "pass" : "fail",
+      summary:
+        `patches=${controlPlaneSessionDiff?.summary.patches ?? 0}, ` +
+        `diffStats=${formatDiffStats(controlPlaneSessionDiff?.summary.diffStats ?? emptyDiffStats())}`,
+    });
 
     const sessionReport = await buildSessionReport(platform.store, session.id);
     const requiredExecutionProfiles: CommandExecutionProfileName[] = ["local-safe"];
@@ -5490,6 +5684,28 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `session report shows ${sessionReport.summary.fileChanges} file change(s), ` +
         `${sessionReport.summary.toolResults} tool result(s), ${sessionReport.summary.commandsFinished} finished command(s), ` +
         `${sessionReport.summary.timedOutCommands} timeout(s), and ${sessionReport.summary.pendingApprovals} pending approval(s)`,
+    });
+    const controlPlaneSessionReport = await new ControlPlaneService(platform).getSessionReport(session.id);
+    const controlPlaneSessionReportPass =
+      controlPlaneSessionReport?.kind === "session_report" &&
+      controlPlaneSessionReport.session.id === session.id &&
+      controlPlaneSessionReport.summary.fileChanges === sessionReport.summary.fileChanges &&
+      controlPlaneSessionReport.summary.toolResults === sessionReport.summary.toolResults &&
+      controlPlaneSessionReport.summary.commandsFinished === sessionReport.summary.commandsFinished &&
+      controlPlaneSessionReport.summary.timedOutCommands === sessionReport.summary.timedOutCommands &&
+      controlPlaneSessionReport.summary.diffStats.additions === sessionReport.summary.diffStats.additions &&
+      controlPlaneSessionReport.summary.diffStats.deletions === sessionReport.summary.diffStats.deletions &&
+      controlPlaneSessionReport.summary.changedPaths.includes("src/math.js") &&
+      controlPlaneSessionReport.summary.inspectionPlan.items.some((entry) => entry.path === "src/math.js") &&
+      controlPlaneSessionReport.reviewCommands.report.includes(`agent session report ${session.id}`);
+    checks.push({
+      id: "control-plane-session-report-evidence",
+      label: "control plane session report evidence",
+      status: controlPlaneSessionReportPass ? "pass" : "fail",
+      summary:
+        `fileChanges=${controlPlaneSessionReport?.summary.fileChanges ?? 0}, ` +
+        `toolResults=${controlPlaneSessionReport?.summary.toolResults ?? 0}, ` +
+        `commandsFinished=${controlPlaneSessionReport?.summary.commandsFinished ?? 0}`,
     });
 
     const statusBeforeResult = checks.some((check) => check.status === "fail") ? "fail" : "pass";
@@ -5513,6 +5729,26 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `session result outcome=${sessionResult.summary.outcome}, recovered=${sessionResult.summary.recovered}, ` +
         `commands=${sessionResult.summary.commandsFinished}, timedOut=${sessionResult.summary.timedOutCommands}, pendingApprovals=${sessionResult.summary.pendingApprovals}`,
     });
+    const sessionNext = await buildSessionNext(platform.store, session.id);
+    const sessionNextPass =
+      sessionNext.summary.nextActions === sessionResult.summary.nextActions &&
+      sessionNext.summary.handoffState === sessionResult.handoff.state &&
+      sessionNext.summary.handoffRequiredActions === sessionResult.handoff.requiredActions &&
+      sessionNext.summary.handoffNextCommand === sessionResult.handoff.nextCommand &&
+      sessionNext.summary.inspectionState === sessionResult.inspection.state &&
+      sessionNext.summary.inspectionFocusPaths.includes("src/math.js") &&
+      sessionNext.nextActions.some((action) => action.id === "resolve-pending-approvals" && action.status === "required" && action.command.includes("agent approve")) &&
+      sessionNext.reviewCommands.review.includes(`agent session review ${session.id}`) &&
+      sessionNext.reviewCommands.timeline.includes(`agent session timeline ${session.id}`) &&
+      sessionNext.reviewCommands.verify.includes(`agent session verify ${session.id}`);
+    checks.push({
+      id: "session-next-evidence",
+      label: "session next evidence",
+      status: sessionNextPass ? "pass" : "fail",
+      summary:
+        `nextActions=${sessionNext.summary.nextActions}, handoff=${sessionNext.summary.handoffState}, ` +
+        `inspection=${sessionNext.summary.inspectionState}, statuses=${formatRecordCounts(sessionNext.summary.nextActionStatuses)}`,
+    });
     const sessionInspectionPass =
       sessionResult.inspection.state === "blocked" &&
       sessionResult.inspection.issues.some((issue) => issue.id === "pending-approvals" && issue.severity === "required") &&
@@ -5533,6 +5769,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       sessionInspect.inspection.issues.length === sessionResult.inspection.issues.length &&
       sessionInspect.summary.inspectionFocusPaths.includes("src/math.js") &&
       sessionInspect.summary.nextActions === sessionResult.summary.nextActions &&
+      sessionInspect.summary.handoffState === sessionResult.handoff.state &&
+      sessionInspect.summary.handoffRequiredActions === sessionResult.handoff.requiredActions &&
+      sessionInspect.summary.handoffNextCommand === sessionResult.handoff.nextCommand &&
       sessionInspect.reviewCommands.result.includes(`agent session result ${session.id}`);
     checks.push({
       id: "session-inspect-command-evidence",
@@ -5547,6 +5786,9 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       controlPlaneSessionInspect?.inspection.state === sessionInspect.inspection.state &&
       controlPlaneSessionInspect.inspection.issues.length === sessionInspect.inspection.issues.length &&
       controlPlaneSessionInspect.summary.nextActions === sessionInspect.summary.nextActions &&
+      controlPlaneSessionInspect.summary.handoffState === sessionInspect.summary.handoffState &&
+      controlPlaneSessionInspect.summary.handoffRequiredActions === sessionInspect.summary.handoffRequiredActions &&
+      controlPlaneSessionInspect.summary.handoffNextCommand === sessionInspect.summary.handoffNextCommand &&
       controlPlaneSessionInspect.reviewCommands.inspect.includes(`agent session inspect ${session.id}`);
     checks.push({
       id: "control-plane-session-inspection-evidence",
@@ -5556,6 +5798,38 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `inspect=${controlPlaneSessionInspect?.inspection.state ?? "-"}, ` +
         `issues=${controlPlaneSessionInspect?.inspection.issues.length ?? 0}, ` +
         `nextActions=${controlPlaneSessionInspect?.summary.nextActions ?? 0}`,
+    });
+    const controlPlaneSessionNext = await new ControlPlaneService(platform).getSessionNext(session.id);
+    const controlPlaneSessionNextPass =
+      controlPlaneSessionNext?.summary.nextActions === sessionNext.summary.nextActions &&
+      controlPlaneSessionNext.summary.handoffState === sessionNext.summary.handoffState &&
+      controlPlaneSessionNext.summary.inspectionState === sessionNext.summary.inspectionState &&
+      controlPlaneSessionNext.reviewCommands.review.includes(`agent session review ${session.id}`) &&
+      controlPlaneSessionNext.reviewCommands.timeline.includes(`agent session timeline ${session.id}`) &&
+      controlPlaneSessionNext.reviewCommands.verify.includes(`agent session verify ${session.id}`);
+    checks.push({
+      id: "control-plane-session-next-evidence",
+      label: "control plane session next evidence",
+      status: controlPlaneSessionNextPass ? "pass" : "fail",
+      summary:
+        `nextActions=${controlPlaneSessionNext?.summary.nextActions ?? 0}, ` +
+        `handoff=${controlPlaneSessionNext?.summary.handoffState ?? "-"}, ` +
+        `inspection=${controlPlaneSessionNext?.summary.inspectionState ?? "-"}`,
+    });
+    const controlPlaneSessionDashboard = await new ControlPlaneService(platform).getSessionDashboard({ limit: 5 });
+    const controlPlaneSessionDashboardEntry = controlPlaneSessionDashboard.sessions.find((entry) => entry.session.id === session.id);
+    const controlPlaneSessionDashboardPass =
+      controlPlaneSessionDashboardEntry?.summary.handoffState === sessionResult.handoff.state &&
+      controlPlaneSessionDashboardEntry.summary.handoffNextCommand === sessionResult.handoff.nextCommand &&
+      controlPlaneSessionDashboardEntry.reviewCommands.next.includes(`agent session next ${session.id}`);
+    checks.push({
+      id: "control-plane-session-dashboard-evidence",
+      label: "control plane session dashboard evidence",
+      status: controlPlaneSessionDashboardPass ? "pass" : "fail",
+      summary:
+        `sessions=${controlPlaneSessionDashboard.summary.returned}/${controlPlaneSessionDashboard.summary.scanned}, ` +
+        `handoff=${controlPlaneSessionDashboardEntry?.summary.handoffState ?? "-"}, ` +
+        `next=${controlPlaneSessionDashboardEntry?.summary.handoffNextCommand ?? "-"}`,
     });
 
     const executionProfilePass = requiredExecutionProfiles.every((profile) =>
@@ -5591,6 +5865,21 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `items=${sessionTimeline.summary.returnedItems}/${sessionTimeline.summary.totalItems}, ` +
         `byKind=${formatRecordCounts(sessionTimeline.summary.byKind)}`,
     });
+    const controlPlaneSessionTimeline = await new ControlPlaneService(platform).getSessionTimeline(session.id, { limit: 5 });
+    const controlPlaneSessionTimelinePass =
+      controlPlaneSessionTimeline?.session.id === session.id &&
+      controlPlaneSessionTimeline.summary.totalItems === sessionTimeline.summary.totalItems &&
+      controlPlaneSessionTimeline.summary.returnedItems <= 5 &&
+      (controlPlaneSessionTimeline.summary.byKind.audit ?? 0) === (sessionTimeline.summary.byKind.audit ?? 0) &&
+      controlPlaneSessionTimeline.items.some((item) => item.kind === "audit" || item.kind === "file_change" || item.kind === "approval");
+    checks.push({
+      id: "control-plane-session-timeline-evidence",
+      label: "control plane session timeline evidence",
+      status: controlPlaneSessionTimelinePass ? "pass" : "fail",
+      summary:
+        `items=${controlPlaneSessionTimeline?.summary.returnedItems ?? 0}/${controlPlaneSessionTimeline?.summary.totalItems ?? 0}, ` +
+        `byKind=${formatRecordCounts(controlPlaneSessionTimeline?.summary.byKind ?? {})}`,
+    });
 
     const sessionStatus = await buildSessionStatus(platform.store, session.id);
     checks.push({
@@ -5606,6 +5895,45 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `outcome=${sessionStatus.summary.outcome}, timelineItems=${sessionStatus.summary.timelineItems}, ` +
         `pendingApprovals=${sessionStatus.summary.pendingApprovals}`,
     });
+    const controlPlaneSessionStatus = await new ControlPlaneService(platform).getSessionStatus(session.id, { limit: 5 });
+    const controlPlaneSessionStatusPass =
+      controlPlaneSessionStatus?.session.id === session.id &&
+      controlPlaneSessionStatus.summary.outcome === sessionStatus.summary.outcome &&
+      controlPlaneSessionStatus.summary.timelineItems === sessionStatus.summary.timelineItems &&
+      controlPlaneSessionStatus.summary.returnedTimelineItems <= 5 &&
+      controlPlaneSessionStatus.summary.handoffState === sessionStatus.summary.handoffState &&
+      controlPlaneSessionStatus.summary.inspectionState === sessionStatus.summary.inspectionState &&
+      controlPlaneSessionStatus.summary.nextActions === sessionStatus.summary.nextActions &&
+      controlPlaneSessionStatus.reviewCommands.status.includes(`agent session status ${session.id}`);
+    checks.push({
+      id: "control-plane-session-status-evidence",
+      label: "control plane session status evidence",
+      status: controlPlaneSessionStatusPass ? "pass" : "fail",
+      summary:
+        `outcome=${controlPlaneSessionStatus?.summary.outcome ?? "-"}, ` +
+        `timeline=${controlPlaneSessionStatus?.summary.returnedTimelineItems ?? 0}/${controlPlaneSessionStatus?.summary.timelineItems ?? 0}, ` +
+        `handoff=${controlPlaneSessionStatus?.summary.handoffState ?? "-"}`,
+    });
+    const controlPlaneSessionResult = await new ControlPlaneService(platform).getSessionResult(session.id);
+    const controlPlaneSessionResultPass =
+      controlPlaneSessionResult?.kind === "session_result" &&
+      controlPlaneSessionResult.session.id === session.id &&
+      controlPlaneSessionResult.summary.outcome === sessionResult.summary.outcome &&
+      controlPlaneSessionResult.summary.recovered === sessionResult.summary.recovered &&
+      controlPlaneSessionResult.summary.commandsFinished === sessionResult.summary.commandsFinished &&
+      controlPlaneSessionResult.summary.pendingApprovals === sessionResult.summary.pendingApprovals &&
+      controlPlaneSessionResult.summary.handoffState === sessionResult.handoff.state &&
+      controlPlaneSessionResult.summary.inspectionState === sessionResult.inspection.state &&
+      controlPlaneSessionResult.reviewCommands.result.includes(`agent session result ${session.id}`);
+    checks.push({
+      id: "control-plane-session-result-evidence",
+      label: "control plane session result evidence",
+      status: controlPlaneSessionResultPass ? "pass" : "fail",
+      summary:
+        `outcome=${controlPlaneSessionResult?.summary.outcome ?? "-"}, ` +
+        `commands=${controlPlaneSessionResult?.summary.commandsFinished ?? 0}, ` +
+        `handoff=${controlPlaneSessionResult?.summary.handoffState ?? "-"}`,
+    });
     const sessionList = await buildSessionList(platform.store, { limit: 5 });
     const sessionListEntry = sessionList.sessions.find((entry) => entry.session.id === session.id);
     checks.push({
@@ -5614,7 +5942,10 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       status:
         sessionListEntry?.summary.outcome === "succeeded" &&
         sessionListEntry.summary.pendingApprovals >= requiredPolicyBoundaryActions.length &&
-        sessionListEntry.reviewCommands.result.includes(session.id)
+        sessionListEntry.summary.handoffState === sessionResult.handoff.state &&
+        sessionListEntry.summary.handoffNextCommand === sessionResult.handoff.nextCommand &&
+        sessionListEntry.reviewCommands.result.includes(session.id) &&
+        sessionListEntry.reviewCommands.next.includes(`agent session next ${session.id}`)
           ? "pass"
           : "fail",
       summary:
@@ -5775,6 +6106,28 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `reviewState=${sessionReview.summary.reviewState}, checklist=${sessionReview.checklist.map((item) => `${item.id}:${item.status}`).join(",")}, ` +
         `changedPaths=${sessionReview.changes.changedPaths.join(",") || "-"}, patches=${sessionReview.changes.patches.length}`,
     });
+    const controlPlaneSessionReview = await new ControlPlaneService(platform).getSessionReview(session.id, { limit: 5 });
+    const controlPlaneSessionReviewChecklist = Object.fromEntries((controlPlaneSessionReview?.checklist ?? []).map((item) => [item.id, item.status]));
+    const controlPlaneSessionReviewPass =
+      controlPlaneSessionReview?.session.id === session.id &&
+      controlPlaneSessionReview.summary.reviewState === "waiting_for_approval" &&
+      controlPlaneSessionReview.summary.handoffState === sessionResult.handoff.state &&
+      controlPlaneSessionReview.summary.timelineItems === sessionTimeline.summary.totalItems &&
+      controlPlaneSessionReview.summary.returnedTimelineItems <= 5 &&
+      controlPlaneSessionReviewChecklist["change-summary"] === "pass" &&
+      controlPlaneSessionReviewChecklist["patch-review"] === "pass" &&
+      controlPlaneSessionReviewChecklist["approval-state"] === "warn" &&
+      controlPlaneSessionReview.latestTimeline.length > 0 &&
+      controlPlaneSessionReview.reviewCommands.review.includes(`agent session review ${session.id}`);
+    checks.push({
+      id: "control-plane-session-review-evidence",
+      label: "control plane session review evidence",
+      status: controlPlaneSessionReviewPass ? "pass" : "fail",
+      summary:
+        `reviewState=${controlPlaneSessionReview?.summary.reviewState ?? "-"}, ` +
+        `checklist=${(controlPlaneSessionReview?.checklist ?? []).map((item) => `${item.id}:${item.status}`).join(",") || "-"}, ` +
+        `timeline=${controlPlaneSessionReview?.summary.returnedTimelineItems ?? 0}/${controlPlaneSessionReview?.summary.timelineItems ?? 0}`,
+    });
 
     const sessionVerification = await buildSessionVerification(platform.store, session.id, {
       requireChange: true,
@@ -5791,6 +6144,173 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       label: "session verification gate",
       status: sessionVerification.status,
       summary: `verification=${sessionVerification.status}, checks=${sessionVerification.checks.length}`,
+    });
+    const sessionHandoffPresetVerification = await buildSessionVerification(platform.store, session.id, {
+      preset: "handoff",
+      requiredExecutionProfiles,
+      requiredApprovalActions: requiredPolicyBoundaryActions,
+    });
+    const sessionHandoffPresetVerificationPass =
+      sessionHandoffPresetVerification.status === "pass" &&
+      sessionHandoffPresetVerification.options.preset === "handoff" &&
+      sessionHandoffPresetVerification.options.requireChange === true &&
+      sessionHandoffPresetVerification.options.requirePatch === true &&
+      sessionHandoffPresetVerification.options.requireRecovery === true &&
+      sessionHandoffPresetVerification.options.requireTimeout === true &&
+      sessionHandoffPresetVerification.options.requireDiffStat === true &&
+      sessionHandoffPresetVerification.options.requireReviewProfile === true &&
+      sessionHandoffPresetVerification.options.requiredExecutionProfiles.includes("local-safe") &&
+      requiredPolicyBoundaryActions.every((action) =>
+        sessionHandoffPresetVerification.checks.some((check) => check.id === `approval-${action.replace(/[^a-z0-9]+/gi, "-")}` && check.status === "pass")
+      );
+    checks.push({
+      id: "session-handoff-preset-verification-gate",
+      label: "session handoff preset verification gate",
+      status: sessionHandoffPresetVerificationPass ? "pass" : "fail",
+      summary:
+        `verification=${sessionHandoffPresetVerification.status}, ` +
+        `checks=${sessionHandoffPresetVerification.checks.length}, ` +
+        `preset=${sessionHandoffPresetVerification.options.preset ?? "-"}`,
+    });
+    const controlPlaneSessionVerification = await new ControlPlaneService(platform).getSessionVerification(session.id, {
+      preset: "handoff",
+      requiredExecutionProfiles,
+      requiredApprovalActions: requiredPolicyBoundaryActions,
+    });
+    const controlPlaneSessionVerificationPass =
+      controlPlaneSessionVerification?.kind === "session_verification" &&
+      controlPlaneSessionVerification.session.id === session.id &&
+      controlPlaneSessionVerification.status === "pass" &&
+      controlPlaneSessionVerification.options.preset === "handoff" &&
+      controlPlaneSessionVerification.options.requireChange === true &&
+      controlPlaneSessionVerification.options.requirePatch === true &&
+      controlPlaneSessionVerification.options.requireRecovery === true &&
+      controlPlaneSessionVerification.options.requireTimeout === true &&
+      controlPlaneSessionVerification.options.requireDiffStat === true &&
+      controlPlaneSessionVerification.options.requireReviewProfile === true &&
+      controlPlaneSessionVerification.options.requiredExecutionProfiles.includes("local-safe") &&
+      controlPlaneSessionVerification.checks.some((check) => check.id === "execution-profile-local-safe" && check.status === "pass") &&
+      requiredPolicyBoundaryActions.every((action) =>
+        controlPlaneSessionVerification.checks.some((check) => check.id === `approval-${action.replace(/[^a-z0-9]+/gi, "-")}` && check.status === "pass")
+      ) &&
+      controlPlaneSessionVerification.reviewCommands.verify.includes(`agent session verify ${session.id}`);
+    checks.push({
+      id: "control-plane-session-verification-evidence",
+      label: "control plane session verification evidence",
+      status: controlPlaneSessionVerificationPass ? "pass" : "fail",
+      summary:
+        `verification=${controlPlaneSessionVerification?.status ?? "-"}, ` +
+        `checks=${controlPlaneSessionVerification?.checks.length ?? 0}, ` +
+        `preset=${controlPlaneSessionVerification?.options.preset ?? "-"}`,
+    });
+    const controlPlaneSessionBundle = await new ControlPlaneService(platform).getSessionBundle(session.id, {
+      preset: "handoff",
+      limit: 5,
+      requiredExecutionProfiles,
+      requiredApprovalActions: requiredPolicyBoundaryActions,
+    });
+    const controlPlaneSessionBundleSections = controlPlaneSessionBundle?.summary.sections ?? [];
+    const controlPlaneSessionBundlePass =
+      controlPlaneSessionBundle?.kind === "session_bundle" &&
+      controlPlaneSessionBundle.session.id === session.id &&
+      controlPlaneSessionBundle.summary.verificationStatus === "pass" &&
+      controlPlaneSessionBundle.sections.verification.options.preset === "handoff" &&
+      controlPlaneSessionBundleSections.includes("diff") &&
+      controlPlaneSessionBundleSections.includes("report") &&
+      controlPlaneSessionBundleSections.includes("status") &&
+      controlPlaneSessionBundleSections.includes("timeline") &&
+      controlPlaneSessionBundleSections.includes("review") &&
+      controlPlaneSessionBundleSections.includes("result") &&
+      controlPlaneSessionBundleSections.includes("verification") &&
+      controlPlaneSessionBundle.summary.changedPaths.includes("src/math.js") &&
+      controlPlaneSessionBundle.summary.timelineItems >= 1 &&
+      controlPlaneSessionBundle.reviewCommands.bundle.includes(`agent session bundle ${session.id} --json`);
+    checks.push({
+      id: "control-plane-session-bundle-evidence",
+      label: "control plane session bundle evidence",
+      status: controlPlaneSessionBundlePass ? "pass" : "fail",
+      summary:
+        `verification=${controlPlaneSessionBundle?.summary.verificationStatus ?? "-"}, ` +
+        `sections=${controlPlaneSessionBundleSections.join(",") || "-"}, ` +
+        `timeline=${controlPlaneSessionBundle?.summary.returnedTimelineItems ?? 0}/${controlPlaneSessionBundle?.summary.timelineItems ?? 0}`,
+    });
+    const controlPlaneSessionRefreshHtml = renderAppHtml();
+    const controlPlaneSessionRefreshViews = [
+      "status",
+      "result",
+      "diff",
+      "report",
+      "verify",
+      "bundle",
+      "inspect",
+      "next",
+      "timeline",
+      "review",
+    ];
+    const controlPlaneSessionRefreshButton = controlPlaneSessionRefreshHtml.includes('id="session-inspection-refresh"');
+    const controlPlaneSessionRefreshGenericLoader =
+      controlPlaneSessionRefreshHtml.includes("function loadSessionInspectionView") &&
+      controlPlaneSessionRefreshHtml.includes("function refreshSelectedSessionInspection") &&
+      controlPlaneSessionRefreshHtml.includes("sessionInspectionPath");
+    const controlPlaneSessionRefreshPass =
+      controlPlaneSessionRefreshButton &&
+      controlPlaneSessionRefreshGenericLoader &&
+      controlPlaneSessionRefreshViews.every((view) => controlPlaneSessionRefreshHtml.includes(`${view}: (sessionId) =>`));
+    checks.push({
+      id: "control-plane-session-refresh-ui-evidence",
+      label: "control plane session refresh UI evidence",
+      status: controlPlaneSessionRefreshPass ? "pass" : "fail",
+      summary:
+        `button=${controlPlaneSessionRefreshButton}, genericLoader=${controlPlaneSessionRefreshGenericLoader}, ` +
+        `views=${controlPlaneSessionRefreshViews.join(",")}`,
+    });
+    const controlPlaneSessionMutationRefreshActions = ["changeSessionState", "decideApproval"];
+    const controlPlaneSessionMutationRefreshesDashboard =
+      controlPlaneSessionRefreshHtml.includes("function refreshAfterSessionMutation") &&
+      controlPlaneSessionRefreshHtml.includes("if (sessionDashboard)") &&
+      controlPlaneSessionRefreshHtml.includes("await loadSessionDashboard()");
+    const controlPlaneSessionMutationRefreshesInspection =
+      controlPlaneSessionRefreshHtml.includes("selectedSessionInspectionId === sessionId") &&
+      controlPlaneSessionRefreshHtml.includes("await loadSessionInspectionView(sessionId, inspectionKind)");
+    const controlPlaneSessionMutationRefreshPass =
+      controlPlaneSessionMutationRefreshesDashboard &&
+      controlPlaneSessionMutationRefreshesInspection &&
+      controlPlaneSessionRefreshHtml.includes("await refreshAfterSessionMutation(sessionId)") &&
+      controlPlaneSessionRefreshHtml.includes("decideApproval(approval.id, 'approve', true, approval.sessionId)") &&
+      controlPlaneSessionRefreshHtml.includes("decideApproval(approval.id, 'deny', false, approval.sessionId)");
+    checks.push({
+      id: "control-plane-session-mutation-refresh-ui-evidence",
+      label: "control plane session mutation refresh UI evidence",
+      status: controlPlaneSessionMutationRefreshPass ? "pass" : "fail",
+      summary:
+        `dashboard=${controlPlaneSessionMutationRefreshesDashboard}, ` +
+        `inspection=${controlPlaneSessionMutationRefreshesInspection}, ` +
+        `actions=${controlPlaneSessionMutationRefreshActions.join(",")}`,
+    });
+    const controlPlaneSessionLiveRefreshToggle = controlPlaneSessionRefreshHtml.includes('id="session-inspection-live"');
+    const controlPlaneSessionLiveRefreshPoller =
+      controlPlaneSessionRefreshHtml.includes("function isSessionInspectionLive") &&
+      controlPlaneSessionRefreshHtml.includes("function refreshOpenSessionViews") &&
+      controlPlaneSessionRefreshHtml.includes("setInterval(refreshOpenSessionViews, 5000)");
+    const controlPlaneSessionLiveRefreshesDashboard =
+      controlPlaneSessionRefreshHtml.includes("const shouldRefreshDashboard = Boolean(sessionDashboard)") &&
+      controlPlaneSessionRefreshHtml.includes("await loadSessionDashboard()");
+    const controlPlaneSessionLiveRefreshesInspection =
+      controlPlaneSessionRefreshHtml.includes("const inspectionId = selectedSessionInspectionId") &&
+      controlPlaneSessionRefreshHtml.includes("const inspectionKind = selectedSessionInspectionKind") &&
+      controlPlaneSessionRefreshHtml.includes("await loadSessionInspectionView(inspectionId, inspectionKind)");
+    const controlPlaneSessionLiveRefreshPass =
+      controlPlaneSessionLiveRefreshToggle &&
+      controlPlaneSessionLiveRefreshPoller &&
+      controlPlaneSessionLiveRefreshesDashboard &&
+      controlPlaneSessionLiveRefreshesInspection;
+    checks.push({
+      id: "control-plane-session-live-refresh-ui-evidence",
+      label: "control plane session live refresh UI evidence",
+      status: controlPlaneSessionLiveRefreshPass ? "pass" : "fail",
+      summary:
+        `toggle=${controlPlaneSessionLiveRefreshToggle}, poller=${controlPlaneSessionLiveRefreshPoller}, ` +
+        `dashboard=${controlPlaneSessionLiveRefreshesDashboard}, inspection=${controlPlaneSessionLiveRefreshesInspection}`,
     });
     const sessionNoPendingVerification = await buildSessionVerification(platform.store, session.id, {
       requireCommand: false,
@@ -5870,6 +6390,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       sessionResult.nextActions.some((action) => action.id === "resolve-pending-approvals" && action.status === "required" && action.command.includes("agent approve")) &&
       sessionResult.nextActions.some((action) => action.id === "review-diff" && action.command.includes("agent session diff")) &&
       sessionResult.nextActions.some((action) => action.id === "verify-session" && action.command.includes("--require-timeout")) &&
+      sessionNext.nextActions.length === sessionResult.nextActions.length &&
       sessionReview.nextActions.length === sessionResult.nextActions.length &&
       sessionStatus.nextActions.length === sessionResult.nextActions.length &&
       sessionBundle.summary.nextActions === sessionResult.nextActions.length &&
@@ -5879,7 +6400,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       label: "operator next actions evidence",
       status: nextActionEvidencePass ? "pass" : "fail",
       summary:
-        `result=${sessionResult.nextActions.length}, review=${sessionReview.nextActions.length}, ` +
+        `result=${sessionResult.nextActions.length}, next=${sessionNext.nextActions.length}, review=${sessionReview.nextActions.length}, ` +
         `status=${sessionStatus.nextActions.length}, bundle=${sessionBundle.summary.nextActions}, ` +
         `statuses=${formatRecordCounts(sessionResult.summary.nextActionStatuses)}`,
     });
@@ -6011,6 +6532,49 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         `noPendingGate=${tuiApproval.noPendingVerificationStatus ?? "-"}`,
     });
 
+    const tuiOperator = await runPhaseTwoTuiOperatorSmoke(platform, actor);
+    checks.push({
+      id: "tui-operator-view-evidence",
+      label: "TUI operator view evidence",
+      status: tuiOperator.ok ? "pass" : "fail",
+      summary:
+        `session=${tuiOperator.sessionId}, approval=${tuiOperator.approvalId}, ` +
+        `queue=${tuiOperator.queueStatus ?? "-"}, approvalRows=${tuiOperator.approvalRows}, ` +
+        `detail=${tuiOperator.detailItemId ?? "-"}, sections=${tuiOperator.detailSections.join(",") || "-"}`,
+    });
+
+    const tuiSessionWatch = await runPhaseTwoTuiSessionWatchSmoke(platform, session.id);
+    checks.push({
+      id: "tui-session-watch-evidence",
+      label: "TUI session watch evidence",
+      status:
+        tuiSessionWatch.ok &&
+        tuiSessionWatch.kind === "status" &&
+        tuiSessionWatch.ticks === 2 &&
+        tuiSessionWatch.latestTimelineShown
+          ? "pass"
+          : "fail",
+      summary:
+        `session=${tuiSessionWatch.sessionId ?? "-"}, kind=${tuiSessionWatch.kind}, ` +
+        `ticks=${tuiSessionWatch.ticks}, outputLines=${tuiSessionWatch.outputLines}`,
+    });
+
+    const tuiSessionsWatch = await runPhaseTwoTuiSessionsWatchSmoke(platform);
+    checks.push({
+      id: "tui-sessions-watch-evidence",
+      label: "TUI sessions watch evidence",
+      status:
+        tuiSessionsWatch.ok &&
+        tuiSessionsWatch.ticks === 2 &&
+        tuiSessionsWatch.returned >= 1 &&
+        tuiSessionsWatch.dashboardShown
+          ? "pass"
+          : "fail",
+      summary:
+        `ticks=${tuiSessionsWatch.ticks}, returned=${tuiSessionsWatch.returned}, ` +
+        `outputLines=${tuiSessionsWatch.outputLines}`,
+    });
+
     const targetModes = await runPhaseTwoTargetModeSmoke(cwd, { cleanup: options.cleanup });
     const targetModePass = targetModes.sessions.every((entry) =>
       entry.sessionId &&
@@ -6027,6 +6591,32 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       summary: targetModes.sessions
         .map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`)
         .join(", "),
+    });
+
+    const rustRuntimeSmoke = await runWorkspaceRuntimeJsonRpcRustSmoke();
+    checks.push({
+      id: "workspace-runtime-jsonrpc-rust-smoke",
+      label: "WorkspaceRuntime JSON-RPC Rust smoke",
+      status: rustRuntimeSmoke.ok || rustRuntimeSmoke.skipped ? "pass" : "fail",
+      summary: rustRuntimeSmoke.skipped
+        ? `skipped=${rustRuntimeSmoke.reason ?? "unknown"}`
+        : `ok=${rustRuntimeSmoke.ok}, methods=${rustRuntimeSmoke.methods.length}, ` +
+          `patchOps=${rustRuntimeSmoke.patchOperations.join(",") || "-"}, ` +
+          `protected=${rustRuntimeSmoke.protectedPathRejections.join(",") || "-"}, ` +
+          `agentTmp=${rustRuntimeSmoke.agentTmpWriteAllowed}, commandExit=${rustRuntimeSmoke.commandExitCode ?? "-"}`,
+    });
+
+    const rustRuntimeToolsSmoke = await runWorkspaceRuntimeJsonRpcRustToolsSmoke();
+    checks.push({
+      id: "workspace-runtime-jsonrpc-rust-tools-policy-audit",
+      label: "Rust WorkspaceRuntime tools/policy/audit smoke",
+      status: rustRuntimeToolsSmoke.ok || rustRuntimeToolsSmoke.skipped ? "pass" : "fail",
+      summary: rustRuntimeToolsSmoke.skipped
+        ? `skipped=${rustRuntimeToolsSmoke.reason ?? "unknown"}`
+        : `ok=${rustRuntimeToolsSmoke.ok}, toolAudits=${rustRuntimeToolsSmoke.toolAuditEvents}, ` +
+          `commandAudits=${rustRuntimeToolsSmoke.commandAuditEvents}, changes=${rustRuntimeToolsSmoke.fileChanges.join(",") || "-"}, ` +
+          `actions=${rustRuntimeToolsSmoke.policyActions.join(",") || "-"}, approvals=${rustRuntimeToolsSmoke.approvalActions.join(",") || "-"}, ` +
+          `approvalRequired=${rustRuntimeToolsSmoke.policyApprovalRequired}`,
     });
 
     const lifecycle = await runPhaseTwoLifecycleSmoke(platform, actor);
@@ -6055,7 +6645,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       root: cwd,
       sampleWorkspace,
       status,
-      phaseClosure: "partial",
+      phaseClosure: "local_alpha_deliverable",
       sessionId: session.id,
       patch,
       checks,
@@ -6073,6 +6663,13 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionDiffFileSummaries: sessionDiff.summary.fileSummaries,
         sessionDiffReviewProfile: sessionDiff.summary.reviewProfile,
         sessionDiffInspectionPlan: sessionDiff.summary.inspectionPlan,
+        controlPlaneSessionDiffPatches: controlPlaneSessionDiff?.summary.patches ?? 0,
+        controlPlaneSessionDiffChangedPaths: controlPlaneSessionDiff?.summary.changedPaths ?? [],
+        controlPlaneSessionDiffStats: controlPlaneSessionDiff?.summary.diffStats ?? emptyDiffStats(),
+        controlPlaneSessionDiffReviewProfile: controlPlaneSessionDiff?.summary.reviewProfile,
+        controlPlaneSessionDiffInspectionPlan: controlPlaneSessionDiff?.summary.inspectionPlan,
+        controlPlaneSessionDiffHasPatchText: controlPlaneSessionDiff?.patches.some((entry) => entry.hasPatchText && entry.patch?.includes("return a + b")) ?? false,
+        controlPlaneSessionDiffCommand: controlPlaneSessionDiff?.reviewCommands.diff,
         sessionReportFileChanges: sessionReport.summary.fileChanges,
         sessionReportToolResults: sessionReport.summary.toolResults,
         sessionReportCommandsFinished: sessionReport.summary.commandsFinished,
@@ -6083,6 +6680,36 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionReportReviewProfile: sessionReport.summary.reviewProfile,
         sessionReportInspectionPlan: sessionReport.summary.inspectionPlan,
         sessionReportPendingApprovals: sessionReport.summary.pendingApprovals,
+        controlPlaneSessionReportFileChanges: controlPlaneSessionReport?.summary.fileChanges ?? 0,
+        controlPlaneSessionReportToolResults: controlPlaneSessionReport?.summary.toolResults ?? 0,
+        controlPlaneSessionReportCommandsFinished: controlPlaneSessionReport?.summary.commandsFinished ?? 0,
+        controlPlaneSessionReportTimedOutCommands: controlPlaneSessionReport?.summary.timedOutCommands ?? 0,
+        controlPlaneSessionReportExecutionProfiles: controlPlaneSessionReport?.summary.executionProfiles ?? {},
+        controlPlaneSessionReportDiffStats: controlPlaneSessionReport?.summary.diffStats ?? emptyDiffStats(),
+        controlPlaneSessionReportReviewProfile: controlPlaneSessionReport?.summary.reviewProfile,
+        controlPlaneSessionReportInspectionPlan: controlPlaneSessionReport?.summary.inspectionPlan,
+        controlPlaneSessionReportCommand: controlPlaneSessionReport?.reviewCommands.report,
+        controlPlaneSessionVerificationStatus: controlPlaneSessionVerification?.status,
+        controlPlaneSessionVerificationChecks: controlPlaneSessionVerification?.checks.length ?? 0,
+        controlPlaneSessionVerificationPreset: controlPlaneSessionVerification?.options.preset,
+        controlPlaneSessionVerificationCommand: controlPlaneSessionVerification?.reviewCommands.verify,
+        controlPlaneSessionBundleVerificationStatus: controlPlaneSessionBundle?.summary.verificationStatus,
+        controlPlaneSessionBundleSections,
+        controlPlaneSessionBundleTimelineItems: controlPlaneSessionBundle?.summary.timelineItems ?? 0,
+        controlPlaneSessionBundleCommand: controlPlaneSessionBundle?.reviewCommands.bundle,
+        controlPlaneSessionRefreshViews,
+        controlPlaneSessionRefreshButton,
+        controlPlaneSessionRefreshGenericLoader,
+        controlPlaneSessionMutationRefreshActions,
+        controlPlaneSessionMutationRefreshesDashboard,
+        controlPlaneSessionMutationRefreshesInspection,
+        controlPlaneSessionLiveRefreshToggle,
+        controlPlaneSessionLiveRefreshPoller,
+        controlPlaneSessionLiveRefreshesDashboard,
+        controlPlaneSessionLiveRefreshesInspection,
+        sessionHandoffPresetVerificationStatus: sessionHandoffPresetVerification.status,
+        sessionHandoffPresetVerificationChecks: sessionHandoffPresetVerification.checks.length,
+        sessionHandoffPresetVerificationPreset: sessionHandoffPresetVerification.options.preset,
         sessionResultOutcome: sessionResult.summary.outcome,
         sessionResultRecovered: sessionResult.summary.recovered,
         sessionResultCommandsFinished: sessionResult.summary.commandsFinished,
@@ -6104,28 +6731,82 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionResultHandoffRequiredIssues: sessionResult.handoff.requiredIssues,
         sessionResultHandoffRequiredActions: sessionResult.handoff.requiredActions,
         sessionResultHandoffNextCommand: sessionResult.handoff.nextCommand,
+        sessionNextActions: sessionNext.summary.nextActions,
+        sessionNextActionStatuses: sessionNext.summary.nextActionStatuses,
+        sessionNextHandoffState: sessionNext.summary.handoffState,
+        sessionNextHandoffRequiredActions: sessionNext.summary.handoffRequiredActions,
+        sessionNextHandoffNextCommand: sessionNext.summary.handoffNextCommand,
+        sessionNextInspectionState: sessionNext.summary.inspectionState,
+        sessionNextInspectionIssues: sessionNext.summary.inspectionIssues,
+        sessionNextInspectionFocusPaths: sessionNext.summary.inspectionFocusPaths,
+        sessionNextReviewCommand: sessionNext.reviewCommands.review,
+        sessionNextTimelineCommand: sessionNext.reviewCommands.timeline,
+        sessionNextVerifyCommand: sessionNext.reviewCommands.verify,
         sessionInspectState: sessionInspect.inspection.state,
         sessionInspectIssues: sessionInspect.inspection.issues.length,
         sessionInspectIssueSeverities: sessionInspect.summary.inspectionIssueSeverities,
         sessionInspectFocusPaths: sessionInspect.summary.inspectionFocusPaths,
         sessionInspectNextActions: sessionInspect.summary.nextActions,
+        sessionInspectHandoffState: sessionInspect.summary.handoffState,
+        sessionInspectHandoffRequiredActions: sessionInspect.summary.handoffRequiredActions,
+        sessionInspectHandoffNextCommand: sessionInspect.summary.handoffNextCommand,
         sessionInspectReviewCommand: sessionInspect.reviewCommands.result,
         controlPlaneSessionInspectState: controlPlaneSessionInspect?.inspection.state,
         controlPlaneSessionInspectIssues: controlPlaneSessionInspect?.inspection.issues.length ?? 0,
         controlPlaneSessionInspectNextActions: controlPlaneSessionInspect?.summary.nextActions ?? 0,
+        controlPlaneSessionInspectHandoffState: controlPlaneSessionInspect?.summary.handoffState,
+        controlPlaneSessionInspectHandoffRequiredActions: controlPlaneSessionInspect?.summary.handoffRequiredActions ?? 0,
+        controlPlaneSessionInspectHandoffNextCommand: controlPlaneSessionInspect?.summary.handoffNextCommand,
         controlPlaneSessionInspectReviewCommand: controlPlaneSessionInspect?.reviewCommands.inspect,
+        controlPlaneSessionNextActions: controlPlaneSessionNext?.summary.nextActions ?? 0,
+        controlPlaneSessionNextHandoffState: controlPlaneSessionNext?.summary.handoffState,
+        controlPlaneSessionNextInspectionState: controlPlaneSessionNext?.summary.inspectionState,
+        controlPlaneSessionNextReviewCommand: controlPlaneSessionNext?.reviewCommands.review,
+        controlPlaneSessionNextTimelineCommand: controlPlaneSessionNext?.reviewCommands.timeline,
+        controlPlaneSessionNextVerifyCommand: controlPlaneSessionNext?.reviewCommands.verify,
+        controlPlaneSessionDashboardReturned: controlPlaneSessionDashboard.summary.returned,
+        controlPlaneSessionDashboardHandoffState: controlPlaneSessionDashboardEntry?.summary.handoffState,
+        controlPlaneSessionDashboardNextCommand: controlPlaneSessionDashboardEntry?.summary.handoffNextCommand,
+        controlPlaneSessionDashboardReviewCommand: controlPlaneSessionDashboardEntry?.reviewCommands.next,
         sessionTimelineItems: sessionTimeline.summary.totalItems,
         sessionTimelineReturnedItems: sessionTimeline.summary.returnedItems,
         sessionTimelineKinds: sessionTimeline.summary.byKind,
+        controlPlaneSessionTimelineItems: controlPlaneSessionTimeline?.summary.totalItems ?? 0,
+        controlPlaneSessionTimelineReturnedItems: controlPlaneSessionTimeline?.summary.returnedItems ?? 0,
+        controlPlaneSessionTimelineKinds: controlPlaneSessionTimeline?.summary.byKind ?? {},
+        controlPlaneSessionReviewState: controlPlaneSessionReview?.summary.reviewState,
+        controlPlaneSessionReviewChecklistStatuses: controlPlaneSessionReview?.summary.checklistStatuses ?? {},
+        controlPlaneSessionReviewTimelineItems: controlPlaneSessionReview?.summary.timelineItems ?? 0,
+        controlPlaneSessionReviewReturnedTimelineItems: controlPlaneSessionReview?.summary.returnedTimelineItems ?? 0,
+        controlPlaneSessionReviewHandoffState: controlPlaneSessionReview?.summary.handoffState,
+        controlPlaneSessionReviewCommand: controlPlaneSessionReview?.reviewCommands.review,
         sessionStatusOutcome: sessionStatus.summary.outcome,
         sessionStatusTimelineItems: sessionStatus.summary.timelineItems,
         sessionStatusNextActions: sessionStatus.summary.nextActions,
         sessionStatusNextActionStatuses: sessionStatus.summary.nextActionStatuses,
         sessionStatusInspectionState: sessionStatus.summary.inspectionState,
         sessionStatusInspectionIssues: sessionStatus.summary.inspectionIssues,
+        controlPlaneSessionStatusOutcome: controlPlaneSessionStatus?.summary.outcome,
+        controlPlaneSessionStatusTimelineItems: controlPlaneSessionStatus?.summary.timelineItems ?? 0,
+        controlPlaneSessionStatusReturnedTimelineItems: controlPlaneSessionStatus?.summary.returnedTimelineItems ?? 0,
+        controlPlaneSessionStatusHandoffState: controlPlaneSessionStatus?.summary.handoffState,
+        controlPlaneSessionStatusInspectionState: controlPlaneSessionStatus?.summary.inspectionState,
+        controlPlaneSessionStatusNextActions: controlPlaneSessionStatus?.summary.nextActions ?? 0,
+        controlPlaneSessionStatusCommand: controlPlaneSessionStatus?.reviewCommands.status,
+        controlPlaneSessionResultOutcome: controlPlaneSessionResult?.summary.outcome,
+        controlPlaneSessionResultRecovered: controlPlaneSessionResult?.summary.recovered,
+        controlPlaneSessionResultCommandsFinished: controlPlaneSessionResult?.summary.commandsFinished ?? 0,
+        controlPlaneSessionResultPendingApprovals: controlPlaneSessionResult?.summary.pendingApprovals ?? 0,
+        controlPlaneSessionResultChangedPaths: controlPlaneSessionResult?.summary.changedPaths,
+        controlPlaneSessionResultHandoffState: controlPlaneSessionResult?.summary.handoffState,
+        controlPlaneSessionResultInspectionState: controlPlaneSessionResult?.summary.inspectionState,
+        controlPlaneSessionResultCommand: controlPlaneSessionResult?.reviewCommands.result,
         sessionListReturned: sessionList.summary.returned,
         sessionListOutcome: sessionListEntry?.summary.outcome,
         sessionListPendingApprovals: sessionListEntry?.summary.pendingApprovals ?? 0,
+        sessionListHandoffState: sessionListEntry?.summary.handoffState,
+        sessionListHandoffNextCommand: sessionListEntry?.summary.handoffNextCommand,
+        sessionListNextCommand: sessionListEntry?.reviewCommands.next,
         localAgentState: localAgentStatus.summary.state,
         localAgentSessions: localAgentStatus.summary.sessions.returned,
         localAgentPendingApprovals: localAgentStatus.summary.pendingApprovals,
@@ -6267,6 +6948,24 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         tuiApprovalUsageShown: tuiApproval.usageShown,
         tuiApprovalNoPendingVerificationStatus: tuiApproval.noPendingVerificationStatus,
         tuiApprovalNoPendingVerificationChecks: tuiApproval.noPendingVerificationChecks,
+        tuiOperatorSessionId: tuiOperator.sessionId,
+        tuiOperatorApprovalId: tuiOperator.approvalId,
+        tuiOperatorStatusOutputLines: tuiOperator.statusOutputLines,
+        tuiOperatorRowsOutputLines: tuiOperator.rowsOutputLines,
+        tuiOperatorDetailOutputLines: tuiOperator.detailOutputLines,
+        tuiOperatorQueueStatus: tuiOperator.queueStatus,
+        tuiOperatorApprovalRows: tuiOperator.approvalRows,
+        tuiOperatorDetailItemId: tuiOperator.detailItemId,
+        tuiOperatorDetailSections: tuiOperator.detailSections,
+        tuiSessionWatchSessionId: tuiSessionWatch.sessionId,
+        tuiSessionWatchKind: tuiSessionWatch.kind,
+        tuiSessionWatchTicks: tuiSessionWatch.ticks,
+        tuiSessionWatchOutputLines: tuiSessionWatch.outputLines,
+        tuiSessionWatchLatestTimelineShown: tuiSessionWatch.latestTimelineShown,
+        tuiSessionsWatchTicks: tuiSessionsWatch.ticks,
+        tuiSessionsWatchOutputLines: tuiSessionsWatch.outputLines,
+        tuiSessionsWatchReturned: tuiSessionsWatch.returned,
+        tuiSessionsWatchDashboardShown: tuiSessionsWatch.dashboardShown,
         targetModeWorkspace: targetModes.workspace,
         targetModeSessions: targetModes.sessions.map((entry) => ({
           mode: entry.mode,
@@ -6278,6 +6977,30 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
           modelCalls: entry.modelCalls,
           modelFailedCalls: entry.modelFailedCalls,
         })),
+        rustRuntimeSmokeOk: rustRuntimeSmoke.ok,
+        rustRuntimeSmokeSkipped: rustRuntimeSmoke.skipped,
+        rustRuntimeSmokeReason: rustRuntimeSmoke.reason,
+        rustRuntimeSmokeRunner: rustRuntimeSmoke.runner,
+        rustRuntimeSmokeMethods: rustRuntimeSmoke.methods,
+        rustRuntimeSmokePatchOperations: rustRuntimeSmoke.patchOperations,
+        rustRuntimeSmokeProtectedPathRejections: rustRuntimeSmoke.protectedPathRejections,
+        rustRuntimeSmokeAgentTmpWriteAllowed: rustRuntimeSmoke.agentTmpWriteAllowed,
+        rustRuntimeSmokeCommandExitCode: rustRuntimeSmoke.commandExitCode,
+        rustRuntimeSmokeCommandStdoutMatched: rustRuntimeSmoke.commandStdoutMatched,
+        rustRuntimeToolsSmokeOk: rustRuntimeToolsSmoke.ok,
+        rustRuntimeToolsSmokeSkipped: rustRuntimeToolsSmoke.skipped,
+        rustRuntimeToolsSmokeReason: rustRuntimeToolsSmoke.reason,
+        rustRuntimeToolsSmokeRunner: rustRuntimeToolsSmoke.runner,
+        rustRuntimeToolsSmokeSessionId: rustRuntimeToolsSmoke.sessionId,
+        rustRuntimeToolsSmokeToolAuditEvents: rustRuntimeToolsSmoke.toolAuditEvents,
+        rustRuntimeToolsSmokeCommandAuditEvents: rustRuntimeToolsSmoke.commandAuditEvents,
+        rustRuntimeToolsSmokeFileChanges: rustRuntimeToolsSmoke.fileChanges,
+        rustRuntimeToolsSmokePolicyActions: rustRuntimeToolsSmoke.policyActions,
+        rustRuntimeToolsSmokeApprovalActions: rustRuntimeToolsSmoke.approvalActions,
+        rustRuntimeToolsSmokePatchFiles: rustRuntimeToolsSmoke.patchFiles,
+        rustRuntimeToolsSmokePolicyApprovalRequired: rustRuntimeToolsSmoke.policyApprovalRequired,
+        rustRuntimeToolsSmokeCommandExitCode: rustRuntimeToolsSmoke.commandExitCode,
+        rustRuntimeToolsSmokeCommandStdoutMatched: rustRuntimeToolsSmoke.commandStdoutMatched,
         lifecycleAuditEvents: lifecycle.auditEvents,
         lifecycleSessionIds: lifecycle.sessionIds,
         pauseStatus: lifecycle.pauseStatus,
@@ -6306,6 +7029,7 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         sessionTimeline: `cd ${sampleWorkspace} && agent session timeline ${session.id} --limit 20`,
         sessionReview: `cd ${sampleWorkspace} && agent session review ${session.id}`,
         sessionResult: `cd ${sampleWorkspace} && agent session result ${session.id}`,
+        sessionNext: `cd ${sampleWorkspace} && agent session next ${session.id}`,
         sessionInspect: `cd ${sampleWorkspace} && agent session inspect ${session.id}`,
         sessionVerify:
           `cd ${sampleWorkspace} && agent session verify ${session.id} --require-change --require-patch --require-recovery ` +
@@ -6328,7 +7052,14 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
         tuiApprove: `cd ${sampleWorkspace} && soloclaw # /approve <approval-id> [reason]`,
         tuiDeny: `cd ${sampleWorkspace} && soloclaw # /deny <approval-id> [reason]`,
         tuiApprovalVerify: `cd ${sampleWorkspace} && agent session verify ${tuiApproval.sessionId} --require-no-pending-approvals --allow-no-command`,
+        tuiOperatorStatus: `cd ${sampleWorkspace} && soloclaw # /operator status --kind queue --limit 3`,
+        tuiOperatorRows: `cd ${sampleWorkspace} && soloclaw # /operator status --kind approval --rows --json`,
+        tuiOperatorShow: `cd ${sampleWorkspace} && soloclaw # /operator show --kind queue --select 1`,
+        tuiSessionWatch: `cd ${sampleWorkspace} && soloclaw # /session watch ${session.id} status --ticks 2 --interval-ms 0 --limit 4`,
+        tuiSessionsWatch: `cd ${sampleWorkspace} && soloclaw # /sessions watch --ticks 2 --interval-ms 0 --limit 5`,
         localDaemonRun: `cd ${sampleWorkspace} && agent scheduler run --worker ${localStatusWorker.id} --interval-ms 0 --max-ticks 3 --stop-when-idle --idle-ticks 1 --runs-per-worker 1 --idle-limit 1`,
+        rustRuntimeSmoke: "cargo build -p agent-runner && node --test \"dist/__tests__/workspace-runtime-jsonrpc.test.js\"",
+        rustRuntimeToolsSmoke: "cargo build -p agent-runner && node --test --test-name-pattern \"Rust agent-runner stays behind workspace tools policy and audit\" \"dist/__tests__/workspace-runtime-jsonrpc.test.js\"",
       },
     };
   } finally {
@@ -6365,6 +7096,10 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionDiffFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionDiffFileSummaries)}`);
   console.log(`- sessionDiffReviewProfile=${formatDiffReviewProfile(result.evidence.sessionDiffReviewProfile)}`);
   console.log(`- sessionDiffInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionDiffInspectionPlan)}`);
+  console.log(`- controlPlaneSessionDiffPatches=${result.evidence.controlPlaneSessionDiffPatches}`);
+  console.log(`- controlPlaneSessionDiffChangedPaths=${result.evidence.controlPlaneSessionDiffChangedPaths.join(",") || "-"}`);
+  console.log(`- controlPlaneSessionDiffStats=${formatDiffStats(result.evidence.controlPlaneSessionDiffStats)}`);
+  console.log(`- controlPlaneSessionDiffHasPatchText=${result.evidence.controlPlaneSessionDiffHasPatchText}`);
   console.log(`- sessionReportFileChanges=${result.evidence.sessionReportFileChanges}`);
   console.log(`- sessionReportToolResults=${result.evidence.sessionReportToolResults}`);
   console.log(`- sessionReportCommandsFinished=${result.evidence.sessionReportCommandsFinished}`);
@@ -6374,6 +7109,38 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReportFileSummaries=${formatDiffFileSummaryList(result.evidence.sessionReportFileSummaries)}`);
   console.log(`- sessionReportReviewProfile=${formatDiffReviewProfile(result.evidence.sessionReportReviewProfile)}`);
   console.log(`- sessionReportInspectionPlan=${formatDiffInspectionPlan(result.evidence.sessionReportInspectionPlan)}`);
+  console.log(`- controlPlaneSessionReportFileChanges=${result.evidence.controlPlaneSessionReportFileChanges}`);
+  console.log(`- controlPlaneSessionReportToolResults=${result.evidence.controlPlaneSessionReportToolResults}`);
+  console.log(`- controlPlaneSessionReportCommandsFinished=${result.evidence.controlPlaneSessionReportCommandsFinished}`);
+  console.log(`- controlPlaneSessionReportTimedOutCommands=${result.evidence.controlPlaneSessionReportTimedOutCommands}`);
+  console.log(`- controlPlaneSessionReportExecutionProfiles=${formatRecordCounts(result.evidence.controlPlaneSessionReportExecutionProfiles)}`);
+  console.log(`- controlPlaneSessionReportDiffStats=${formatDiffStats(result.evidence.controlPlaneSessionReportDiffStats)}`);
+  console.log(
+    `- controlPlaneSessionVerification=${result.evidence.controlPlaneSessionVerificationStatus ?? "-"} ` +
+    `checks=${result.evidence.controlPlaneSessionVerificationChecks} ` +
+    `preset=${result.evidence.controlPlaneSessionVerificationPreset ?? "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionBundle=${result.evidence.controlPlaneSessionBundleVerificationStatus ?? "-"} ` +
+    `sections=${result.evidence.controlPlaneSessionBundleSections.join(",") || "-"} ` +
+    `timeline=${result.evidence.controlPlaneSessionBundleTimelineItems}`,
+  );
+  console.log(
+    `- controlPlaneSessionRefreshUI=button:${result.evidence.controlPlaneSessionRefreshButton} ` +
+    `genericLoader:${result.evidence.controlPlaneSessionRefreshGenericLoader} ` +
+    `views=${result.evidence.controlPlaneSessionRefreshViews.join(",") || "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionMutationRefreshUI=dashboard:${result.evidence.controlPlaneSessionMutationRefreshesDashboard} ` +
+      `inspection:${result.evidence.controlPlaneSessionMutationRefreshesInspection} ` +
+      `actions=${result.evidence.controlPlaneSessionMutationRefreshActions.join(",") || "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionLiveRefreshUI=toggle:${result.evidence.controlPlaneSessionLiveRefreshToggle} ` +
+      `poller:${result.evidence.controlPlaneSessionLiveRefreshPoller} ` +
+      `dashboard:${result.evidence.controlPlaneSessionLiveRefreshesDashboard} ` +
+      `inspection:${result.evidence.controlPlaneSessionLiveRefreshesInspection}`,
+  );
   console.log(`- sessionResultOutcome=${result.evidence.sessionResultOutcome ?? "-"}`);
   console.log(`- sessionResultRecovered=${result.evidence.sessionResultRecovered}`);
   console.log(`- sessionResultCommandsFinished=${result.evidence.sessionResultCommandsFinished}`);
@@ -6397,18 +7164,60 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(
     `- sessionInspect=${result.evidence.sessionInspectState ?? "-"} issues=${result.evidence.sessionInspectIssues} ` +
     `severities=${formatRecordCounts(result.evidence.sessionInspectIssueSeverities)} ` +
-    `focus=${result.evidence.sessionInspectFocusPaths.join(",") || "-"} nextActions=${result.evidence.sessionInspectNextActions}`,
+    `focus=${result.evidence.sessionInspectFocusPaths.join(",") || "-"} nextActions=${result.evidence.sessionInspectNextActions} ` +
+    `handoff=${result.evidence.sessionInspectHandoffState ?? "-"} next=${result.evidence.sessionInspectHandoffNextCommand ?? "-"}`,
   );
   console.log(`- sessionResultNextActions=${result.evidence.sessionResultNextActions} statuses=${formatRecordCounts(result.evidence.sessionResultNextActionStatuses)}`);
+  console.log(
+    `- sessionNextActions=${result.evidence.sessionNextActions} statuses=${formatRecordCounts(result.evidence.sessionNextActionStatuses)} ` +
+    `handoff=${result.evidence.sessionNextHandoffState ?? "-"} next=${result.evidence.sessionNextHandoffNextCommand ?? "-"} ` +
+    `inspection=${result.evidence.sessionNextInspectionState ?? "-"} issues=${result.evidence.sessionNextInspectionIssues} ` +
+    `focus=${result.evidence.sessionNextInspectionFocusPaths.join(",") || "-"}`,
+  );
+  console.log(
+    `- sessionNextCommands=timeline:${result.evidence.sessionNextTimelineCommand ?? "-"},` +
+    `verify:${result.evidence.sessionNextVerifyCommand ?? "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionNext=nextActions:${result.evidence.controlPlaneSessionNextActions},` +
+    `handoff:${result.evidence.controlPlaneSessionNextHandoffState ?? "-"},` +
+    `inspection:${result.evidence.controlPlaneSessionNextInspectionState ?? "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionDashboard=returned:${result.evidence.controlPlaneSessionDashboardReturned},` +
+    `handoff:${result.evidence.controlPlaneSessionDashboardHandoffState ?? "-"},` +
+    `next:${result.evidence.controlPlaneSessionDashboardNextCommand ?? "-"}`,
+  );
   console.log(`- sessionTimelineItems=${result.evidence.sessionTimelineReturnedItems}/${result.evidence.sessionTimelineItems}`);
   console.log(`- sessionTimelineKinds=${formatRecordCounts(result.evidence.sessionTimelineKinds)}`);
+  console.log(`- controlPlaneSessionTimelineItems=${result.evidence.controlPlaneSessionTimelineReturnedItems}/${result.evidence.controlPlaneSessionTimelineItems}`);
+  console.log(`- controlPlaneSessionTimelineKinds=${formatRecordCounts(result.evidence.controlPlaneSessionTimelineKinds)}`);
+  console.log(
+    `- controlPlaneSessionReview=state:${result.evidence.controlPlaneSessionReviewState ?? "-"},` +
+    `timeline:${result.evidence.controlPlaneSessionReviewReturnedTimelineItems}/${result.evidence.controlPlaneSessionReviewTimelineItems},` +
+    `checklist:${formatRecordCounts(result.evidence.controlPlaneSessionReviewChecklistStatuses)}`,
+  );
   console.log(`- sessionStatusOutcome=${result.evidence.sessionStatusOutcome ?? "-"}`);
   console.log(`- sessionStatusTimelineItems=${result.evidence.sessionStatusTimelineItems}`);
   console.log(`- sessionStatusInspection=${result.evidence.sessionStatusInspectionState ?? "-"} issues=${result.evidence.sessionStatusInspectionIssues}`);
   console.log(`- sessionStatusNextActions=${result.evidence.sessionStatusNextActions} statuses=${formatRecordCounts(result.evidence.sessionStatusNextActionStatuses)}`);
+  console.log(
+    `- controlPlaneSessionStatus=outcome:${result.evidence.controlPlaneSessionStatusOutcome ?? "-"},` +
+    `timeline:${result.evidence.controlPlaneSessionStatusReturnedTimelineItems}/${result.evidence.controlPlaneSessionStatusTimelineItems},` +
+    `handoff:${result.evidence.controlPlaneSessionStatusHandoffState ?? "-"},` +
+    `inspection:${result.evidence.controlPlaneSessionStatusInspectionState ?? "-"}`,
+  );
+  console.log(
+    `- controlPlaneSessionResult=outcome:${result.evidence.controlPlaneSessionResultOutcome ?? "-"},` +
+    `recovered:${result.evidence.controlPlaneSessionResultRecovered ?? false},` +
+    `commands:${result.evidence.controlPlaneSessionResultCommandsFinished},` +
+    `handoff:${result.evidence.controlPlaneSessionResultHandoffState ?? "-"}`,
+  );
   console.log(`- sessionListReturned=${result.evidence.sessionListReturned}`);
   console.log(`- sessionListOutcome=${result.evidence.sessionListOutcome ?? "-"}`);
   console.log(`- sessionListPendingApprovals=${result.evidence.sessionListPendingApprovals}`);
+  console.log(`- sessionListHandoff=${result.evidence.sessionListHandoffState ?? "-"} next=${result.evidence.sessionListHandoffNextCommand ?? "-"}`);
+  console.log(`- sessionListNextCommand=${result.evidence.sessionListNextCommand ?? "-"}`);
   console.log(`- localAgentState=${result.evidence.localAgentState ?? "-"}`);
   console.log(`- localAgentSessions=${result.evidence.localAgentSessions}`);
   console.log(`- localAgentPendingApprovals=${result.evidence.localAgentPendingApprovals}`);
@@ -6452,6 +7261,11 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
   console.log(`- sessionReviewNextActions=${result.evidence.sessionReviewNextActions} statuses=${formatRecordCounts(result.evidence.sessionReviewNextActionStatuses)}`);
   console.log(`- sessionVerificationStatus=${result.evidence.sessionVerificationStatus ?? "-"}`);
   console.log(`- sessionVerificationChecks=${result.evidence.sessionVerificationChecks}`);
+  console.log(
+    `- sessionHandoffPresetVerification=status:${result.evidence.sessionHandoffPresetVerificationStatus ?? "-"},` +
+    `checks:${result.evidence.sessionHandoffPresetVerificationChecks},` +
+    `preset:${result.evidence.sessionHandoffPresetVerificationPreset ?? "-"}`,
+  );
   console.log(
     `- sessionNoPendingVerification=status:${result.evidence.sessionNoPendingVerificationStatus ?? "-"},` +
     `checks:${result.evidence.sessionNoPendingVerificationChecks},` +
@@ -6527,8 +7341,38 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     `noPendingGate:${result.evidence.tuiApprovalNoPendingVerificationStatus ?? "-"},` +
     `checks:${result.evidence.tuiApprovalNoPendingVerificationChecks}`,
   );
+  console.log(
+    `- tuiOperator=session:${result.evidence.tuiOperatorSessionId ?? "-"},approval:${result.evidence.tuiOperatorApprovalId ?? "-"},` +
+    `queue:${result.evidence.tuiOperatorQueueStatus ?? "-"},approvalRows:${result.evidence.tuiOperatorApprovalRows},` +
+    `detail:${result.evidence.tuiOperatorDetailItemId ?? "-"},sections:${result.evidence.tuiOperatorDetailSections.join(",") || "-"},` +
+    `outputLines:${result.evidence.tuiOperatorStatusOutputLines}/${result.evidence.tuiOperatorRowsOutputLines}/${result.evidence.tuiOperatorDetailOutputLines}`,
+  );
+  console.log(
+    `- tuiSessionWatch=session:${result.evidence.tuiSessionWatchSessionId ?? "-"},kind:${result.evidence.tuiSessionWatchKind ?? "-"},` +
+    `ticks:${result.evidence.tuiSessionWatchTicks},outputLines:${result.evidence.tuiSessionWatchOutputLines},` +
+    `timeline:${result.evidence.tuiSessionWatchLatestTimelineShown}`,
+  );
+  console.log(
+    `- tuiSessionsWatch=ticks:${result.evidence.tuiSessionsWatchTicks},returned:${result.evidence.tuiSessionsWatchReturned},` +
+    `outputLines:${result.evidence.tuiSessionsWatchOutputLines},dashboard:${result.evidence.tuiSessionsWatchDashboardShown}`,
+  );
   console.log(`- targetModeWorkspace=${result.evidence.targetModeWorkspace ?? "-"}`);
   console.log(`- targetModeSessions=${result.evidence.targetModeSessions.map((entry) => `${entry.mode}:${entry.outcome ?? "-"}:${entry.verificationStatus ?? "-"}:modelCalls=${entry.modelCalls}`).join(",") || "-"}`);
+  console.log(
+    `- rustRuntimeSmoke=ok:${result.evidence.rustRuntimeSmokeOk},skipped:${result.evidence.rustRuntimeSmokeSkipped},` +
+    `methods:${result.evidence.rustRuntimeSmokeMethods.length},patchOps:${result.evidence.rustRuntimeSmokePatchOperations.join(",") || "-"},` +
+    `protected:${result.evidence.rustRuntimeSmokeProtectedPathRejections.join(",") || "-"},agentTmp:${result.evidence.rustRuntimeSmokeAgentTmpWriteAllowed},` +
+    `commandExit:${result.evidence.rustRuntimeSmokeCommandExitCode ?? "-"},stdout:${result.evidence.rustRuntimeSmokeCommandStdoutMatched},` +
+    `reason:${result.evidence.rustRuntimeSmokeReason ?? "-"}`,
+  );
+  console.log(
+    `- rustRuntimeToolsSmoke=ok:${result.evidence.rustRuntimeToolsSmokeOk},skipped:${result.evidence.rustRuntimeToolsSmokeSkipped},` +
+    `toolAudits:${result.evidence.rustRuntimeToolsSmokeToolAuditEvents},commandAudits:${result.evidence.rustRuntimeToolsSmokeCommandAuditEvents},` +
+    `changes:${result.evidence.rustRuntimeToolsSmokeFileChanges.join(",") || "-"},actions:${result.evidence.rustRuntimeToolsSmokePolicyActions.join(",") || "-"},` +
+    `approvals:${result.evidence.rustRuntimeToolsSmokeApprovalActions.join(",") || "-"},patchFiles:${result.evidence.rustRuntimeToolsSmokePatchFiles.join(",") || "-"},` +
+    `approvalRequired:${result.evidence.rustRuntimeToolsSmokePolicyApprovalRequired},commandExit:${result.evidence.rustRuntimeToolsSmokeCommandExitCode ?? "-"},` +
+    `stdout:${result.evidence.rustRuntimeToolsSmokeCommandStdoutMatched},reason:${result.evidence.rustRuntimeToolsSmokeReason ?? "-"}`,
+  );
   console.log(`- lifecycleAuditEvents=${result.evidence.lifecycleAuditEvents}`);
   console.log(`- lifecycleStatuses=pause:${result.evidence.pauseStatus ?? "-"},resume:${result.evidence.resumeStatus ?? "-"},cancel:${result.evidence.cancelStatus ?? "-"}`);
   console.log(
@@ -6550,6 +7394,7 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     console.log(`- ${result.commands.sessionTimeline}`);
     console.log(`- ${result.commands.sessionReview}`);
     console.log(`- ${result.commands.sessionResult}`);
+    console.log(`- ${result.commands.sessionNext}`);
     console.log(`- ${result.commands.sessionVerify}`);
     if (result.commands.sessionNoPendingVerify) {
       console.log(`- ${result.commands.sessionNoPendingVerify}`);
@@ -6588,8 +7433,29 @@ function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): 
     if (result.commands.tuiApprovalVerify) {
       console.log(`- ${result.commands.tuiApprovalVerify}`);
     }
+    if (result.commands.tuiOperatorStatus) {
+      console.log(`- ${result.commands.tuiOperatorStatus}`);
+    }
+    if (result.commands.tuiOperatorRows) {
+      console.log(`- ${result.commands.tuiOperatorRows}`);
+    }
+    if (result.commands.tuiOperatorShow) {
+      console.log(`- ${result.commands.tuiOperatorShow}`);
+    }
+    if (result.commands.tuiSessionWatch) {
+      console.log(`- ${result.commands.tuiSessionWatch}`);
+    }
+    if (result.commands.tuiSessionsWatch) {
+      console.log(`- ${result.commands.tuiSessionsWatch}`);
+    }
     if (result.commands.localDaemonRun) {
       console.log(`- ${result.commands.localDaemonRun}`);
+    }
+    if (result.commands.rustRuntimeSmoke) {
+      console.log(`- ${result.commands.rustRuntimeSmoke}`);
+    }
+    if (result.commands.rustRuntimeToolsSmoke) {
+      console.log(`- ${result.commands.rustRuntimeToolsSmoke}`);
     }
   }
 }
@@ -7071,6 +7937,105 @@ async function runPhaseTwoTuiApprovalSmoke(platform: LocalPlatform, actor: Retur
   };
 }
 
+async function runPhaseTwoTuiOperatorSmoke(platform: LocalPlatform, actor: ReturnType<typeof localUserActor>) {
+  const session = await platform.store.createSession({
+    objective: "Phase 2 TUI operator smoke: inspect shared operator rows and detail through the interactive command path.",
+    targetMode: "build",
+    status: "paused",
+    risk: "medium",
+    createdBy: actor,
+  });
+  const approvalId = makeId<"ArtifactId">("appr");
+  await platform.store.createApprovalRequest({
+    id: approvalId,
+    status: "pending",
+    requestedBy: actor,
+    action: "workspace.write",
+    reason: "Phase 2 TUI operator view should surface pending approvals.",
+    sessionId: session.id,
+    toolName: "apply_patch",
+    createdAt: new Date().toISOString(),
+  });
+
+  const statusOutput = await runTuiOperatorCommandWithPlatform(platform, "/operator status --kind queue --limit 3");
+  const rowsOutput = await runTuiOperatorCommandWithPlatform(platform, "/operator status --kind approval --rows --json");
+  const detailOutput = await runTuiOperatorCommandWithPlatform(platform, "/operator show --kind queue --select 1");
+
+  const queueLine = statusOutput.output.find((line) => /\[\d+\]\tqueue\t/.test(line));
+  const queueStatus = queueLine?.split("\t")[2];
+  const rowsPayload = rowsOutput.output.length > 0 ? JSON.parse(rowsOutput.output.join("\n")) as {
+    rows?: Array<{ item?: { id?: string; kind?: string; status?: string } }>;
+  } : {};
+  const approvalRows = rowsPayload.rows?.filter((row) => row.item?.kind === "approval") ?? [];
+  const approvalListed = approvalRows.some((row) => row.item?.id === approvalId && row.item.status === "waiting_for_approval");
+  const detailLine = detailOutput.output.find((line) => /^queue\t/.test(line));
+  const detailItemId = detailLine?.split("\t")[3];
+  const detailSections = detailOutput.output
+    .map((line) => line.match(/\[detail:([^\]]+)\]/)?.[1])
+    .filter((section): section is string => Boolean(section));
+
+  return {
+    sessionId: session.id,
+    approvalId,
+    ok:
+      statusOutput.handled &&
+      rowsOutput.handled &&
+      detailOutput.handled &&
+      queueStatus !== undefined &&
+      approvalListed &&
+      detailItemId === "queue:local" &&
+      detailSections.includes("Overview"),
+    statusOutputLines: statusOutput.output.length,
+    rowsOutputLines: rowsOutput.output.length,
+    detailOutputLines: detailOutput.output.length,
+    queueStatus,
+    approvalRows: approvalRows.length,
+    detailItemId,
+    detailSections,
+  };
+}
+
+async function runPhaseTwoTuiSessionWatchSmoke(platform: LocalPlatform, sessionId: string) {
+  const kind: TuiSessionWatchKind = "status";
+  const result = await runTuiSessionWatchCommandWithPlatform(platform, `/session watch ${sessionId} ${kind} --ticks 2 --interval-ms 0 --limit 4`);
+  const tickLines = result.output.filter((line) => line.startsWith("[watch:"));
+  const statusLines = result.output.filter((line) => line === `Session status: ${sessionId}`);
+  const latestTimelineShown = result.output.some((line) => line === "Latest timeline:");
+  return {
+    sessionId,
+    kind,
+    ticks: tickLines.length,
+    outputLines: result.output.length,
+    latestTimelineShown,
+    ok:
+      result.handled &&
+      tickLines.length === 2 &&
+      tickLines.every((line) => line.includes(`\t${kind}\t${sessionId}\t`)) &&
+      statusLines.length === 2 &&
+      latestTimelineShown,
+  };
+}
+
+async function runPhaseTwoTuiSessionsWatchSmoke(platform: LocalPlatform) {
+  const result = await runTuiSessionsWatchCommandWithPlatform(platform, "/sessions watch --ticks 2 --interval-ms 0 --limit 5");
+  const tickLines = result.output.filter((line) => line.startsWith("[watch:"));
+  const dashboardLines = result.output.filter((line) => line === "Session dashboard:");
+  const returnedLine = result.output.find((line) => line.startsWith("returned="));
+  const returned = Number(returnedLine?.match(/returned=(\d+)\//)?.[1] ?? 0);
+  return {
+    ticks: tickLines.length,
+    returned,
+    outputLines: result.output.length,
+    dashboardShown: dashboardLines.length === 2,
+    ok:
+      result.handled &&
+      tickLines.length === 2 &&
+      tickLines.every((line) => line.includes("\tsessions\t")) &&
+      dashboardLines.length === 2 &&
+      returned >= 1,
+  };
+}
+
 async function runPhaseTwoTargetModeSmoke(cwd: string, options: { cleanup?: boolean } = {}) {
   const workspace = path.join(cwd, ".agent", "tmp", `phase2-target-modes-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   await fs.mkdir(workspace, { recursive: true });
@@ -7254,116 +8219,7 @@ function toolOutputExcerpt(output?: string): string | undefined {
 }
 
 async function buildSessionReport(store: AgentStore, sessionId: string) {
-  const session = await store.getSession(sessionId);
-  if (!session) {
-    throw new Error(`Session not found: ${sessionId}`);
-  }
-  const messages = await store.getMessages(sessionId);
-  const toolResults = await store.getToolResults(sessionId);
-  const fileChanges = await store.listFileChanges(sessionId);
-  const auditEvents = await store.listAuditEvents({ sessionId, limit: 100 });
-  const modelUsage = await new ModelUsageService(store).summarize({ filters: { sessionId, limit: 1000 } });
-  const approvals = (await store.listApprovalRequests())
-    .filter((approval) => approval.sessionId === sessionId)
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  const commandEvents = auditEvents
-    .filter((event) => event.type === "command.started" || event.type === "command.finished")
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  const finishedCommands = commandEvents.filter((event) => event.type === "command.finished");
-  const failedCommands = finishedCommands.filter((event) =>
-    commandTimedOut(event.metadata) ||
-    (commandExitCode(event.metadata) !== undefined && commandExitCode(event.metadata) !== 0)
-  );
-  const timedOutCommands = finishedCommands.filter((event) => commandTimedOut(event.metadata));
-  const executionProfiles = commandExecutionProfileCounts(finishedCommands);
-  const failedToolResults = toolResults.filter((result) => !result.ok);
-  const changedPaths = [...new Set(fileChanges.map((change) => change.path))].sort();
-  const patchDiffs = sessionPatchAuditEvents(auditEvents).map((event, index) => {
-    const patch = auditPatchInput(event.metadata);
-    return {
-      ordinal: index + 1,
-      patch,
-      stats: summarizeUnifiedDiffPatch(patch),
-    };
-  });
-  const diffStats = mergeDiffStats(patchDiffs.map((patch) => patch.stats));
-  const fileSummaries = summarizeDiffFileSummaries(patchDiffs);
-  const reviewProfile = buildDiffReviewProfile({ patches: patchDiffs.length, diffStats, fileSummaries });
-  const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
-  const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
-  const approvedApprovals = approvals.filter((approval) => approval.status === "approved");
-  const deniedApprovals = approvals.filter((approval) => approval.status === "denied");
-
-  return {
-    generatedAt: new Date().toISOString(),
-    session,
-    summary: {
-      messages: messages.length,
-      toolResults: toolResults.length,
-      failedToolResults: failedToolResults.length,
-      fileChanges: fileChanges.length,
-      changedPaths,
-      commandEvents: commandEvents.length,
-      commandsFinished: finishedCommands.length,
-      failedCommands: failedCommands.length,
-      timedOutCommands: timedOutCommands.length,
-      executionProfiles,
-      diffStats,
-      fileSummaries,
-      reviewProfile,
-      inspectionPlan,
-      approvals: approvals.length,
-      pendingApprovals: pendingApprovals.length,
-      approvedApprovals: approvedApprovals.length,
-      deniedApprovals: deniedApprovals.length,
-      modelCalls: modelUsage.totals.calls,
-      modelSuccessfulCalls: modelUsage.totals.successfulCalls,
-      modelFailedCalls: modelUsage.totals.failedCalls,
-      modelCallsWithUsage: modelUsage.totals.callsWithUsage,
-      modelPromptTokens: modelUsage.totals.promptTokens,
-      modelCompletionTokens: modelUsage.totals.completionTokens,
-      modelTotalTokens: modelUsage.totals.totalTokens,
-      modelDurationMs: modelUsage.totals.durationMs,
-      auditEvents: auditEvents.length,
-    },
-    modelUsage,
-    approvals: approvals.map((approval) => ({
-      id: approval.id,
-      status: approval.status,
-      action: approval.action,
-      toolName: approval.toolName,
-      approverHint: approval.approverHint,
-      reason: approval.reason,
-      createdAt: approval.createdAt,
-      decidedAt: approval.decidedAt,
-    })),
-    fileChanges,
-    commandEvents: commandEvents.map((event) => ({
-      type: event.type,
-      createdAt: event.createdAt,
-      summary: event.summary,
-      command: typeof event.metadata?.command === "string" ? event.metadata.command : undefined,
-      exitCode: commandExitCode(event.metadata),
-      timedOut: commandTimedOut(event.metadata),
-      durationMs: commandDurationMs(event.metadata),
-      executionProfile: commandExecutionProfileName(event.metadata),
-      stdoutBytes: typeof event.metadata?.stdoutBytes === "number" ? event.metadata.stdoutBytes : undefined,
-      stderrBytes: typeof event.metadata?.stderrBytes === "number" ? event.metadata.stderrBytes : undefined,
-    })),
-    toolResults: toolResults.map((result) => ({
-      callId: result.callId,
-      ok: result.ok,
-      error: result.error,
-      outputExcerpt: toolOutputExcerpt(result.output),
-      truncated: result.truncated,
-    })),
-    recentAuditEvents: auditEvents.slice(0, 20).map((event) => ({
-      type: event.type,
-      actor: event.actor,
-      summary: event.summary,
-      createdAt: event.createdAt,
-    })),
-  };
+  return buildSessionReportView(store, sessionId);
 }
 
 function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport>>): void {
@@ -7439,80 +8295,6 @@ function printSessionReport(report: Awaited<ReturnType<typeof buildSessionReport
   }
 }
 
-type SessionTimelineItemKind = "audit" | "file_change" | "approval" | "approval_decision";
-
-type SessionTimelineItem = {
-  ordinal: number;
-  kind: SessionTimelineItemKind;
-  createdAt: string;
-  sourceId: string;
-  actor?: string;
-  title: string;
-  summary: string;
-  status?: string;
-  action?: string;
-  toolName?: string;
-  command?: string;
-  exitCode?: number | null;
-  timedOut?: boolean;
-  durationMs?: number;
-  executionProfile?: string;
-  path?: string;
-  metadata?: Record<string, unknown>;
-};
-
-async function buildSessionTimeline(store: AgentStore, sessionId: string, options: { limit?: number } = {}) {
-  const session = await store.getSession(sessionId);
-  if (!session) {
-    throw new Error(`Session not found: ${sessionId}`);
-  }
-  const messages = await store.getMessages(sessionId);
-  const toolResults = await store.getToolResults(sessionId);
-  const fileChanges = await store.listFileChanges(sessionId);
-  const auditEvents = await store.listAuditEvents({ sessionId, limit: 1000 });
-  const approvals = (await store.listApprovalRequests())
-    .filter((approval) => approval.sessionId === sessionId);
-
-  const unnumbered: Omit<SessionTimelineItem, "ordinal">[] = [];
-  for (const event of auditEvents) {
-    unnumbered.push(timelineItemFromAudit(event));
-  }
-  for (const change of fileChanges) {
-    unnumbered.push(timelineItemFromFileChange(change));
-  }
-  for (const approval of approvals) {
-    unnumbered.push(timelineItemFromApproval(approval));
-    if (approval.decidedAt) {
-      unnumbered.push(timelineItemFromApprovalDecision(approval));
-    }
-  }
-
-  const allItems = unnumbered
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || timelineKindOrder(left.kind) - timelineKindOrder(right.kind) || left.sourceId.localeCompare(right.sourceId))
-    .map((item, index) => ({ ordinal: index + 1, ...item }));
-  const limit = options.limit ?? allItems.length;
-  const items = allItems.slice(Math.max(0, allItems.length - limit));
-  const byKind = countTimelineKinds(allItems);
-
-  return {
-    generatedAt: new Date().toISOString(),
-    session,
-    summary: {
-      totalItems: allItems.length,
-      returnedItems: items.length,
-      messages: messages.length,
-      toolResults: toolResults.length,
-      auditEvents: auditEvents.length,
-      fileChanges: fileChanges.length,
-      approvals: approvals.length,
-      byKind,
-      earliestAt: allItems.at(0)?.createdAt,
-      latestAt: allItems.at(-1)?.createdAt,
-    },
-    items,
-  };
-}
-
 async function buildSessionStatus(store: AgentStore, sessionId: string, options: { limit?: number } = {}) {
   const result = await buildSessionResult(store, sessionId);
   const timeline = await buildSessionTimeline(store, sessionId, { limit: options.limit ?? 8 });
@@ -7567,6 +8349,7 @@ async function buildSessionStatus(store: AgentStore, sessionId: string, options:
       timeline: `agent session timeline ${sessionId}`,
       review: `agent session review ${sessionId}`,
       inspect: `agent session inspect ${sessionId}`,
+      next: `agent session next ${sessionId}`,
       result: `agent session result ${sessionId}`,
       report: `agent session report ${sessionId} --json`,
       verify: `agent session verify ${sessionId}`,
@@ -7674,7 +8457,9 @@ function printSessionList(list: Awaited<ReturnType<typeof buildSessionList>>): v
       `changes=${changed}\tupdated=${entry.session.updatedAt}`,
     );
     console.log(`objective: ${entry.session.objective}`);
+    console.log(`handoff: ${entry.summary.handoffState ?? "-"} next=${entry.summary.handoffNextCommand ?? "-"}`);
     console.log(`review: ${entry.reviewCommands.review}`);
+    console.log(`next: ${entry.reviewCommands.next}`);
     console.log(`result: ${entry.reviewCommands.result}`);
   }
 }
@@ -8685,6 +9470,7 @@ function printSessionStatus(status: Awaited<ReturnType<typeof buildSessionStatus
   console.log(`- ${status.reviewCommands.timeline}`);
   console.log(`- ${status.reviewCommands.review}`);
   console.log(`- ${status.reviewCommands.inspect}`);
+  console.log(`- ${status.reviewCommands.next}`);
   console.log(`- ${status.reviewCommands.result}`);
   console.log(`- ${status.reviewCommands.report}`);
 }
@@ -8705,6 +9491,10 @@ function printSessionInspect(inspection: Awaited<ReturnType<typeof buildSessionI
   );
   console.log(`- focusPaths=${inspection.summary.inspectionFocusPaths.join(",") || "-"}`);
   console.log(`- reviewProfile=${formatDiffReviewProfile(inspection.summary.reviewProfile)}`);
+  console.log(
+    `- handoff=${inspection.summary.handoffState ?? "-"} requiredIssues=${inspection.summary.handoffRequiredIssues} ` +
+    `requiredActions=${inspection.summary.handoffRequiredActions} next=${inspection.summary.handoffNextCommand ?? "-"}`,
+  );
   console.log(
     `- signals=outcome:${inspection.inspection.signals.outcome}, recovered:${inspection.inspection.signals.recovered}, ` +
     `pendingApprovals:${inspection.inspection.signals.pendingApprovals}, failedCommands:${inspection.inspection.signals.failedCommands}, ` +
@@ -9000,119 +9790,6 @@ function printSessionReview(review: Awaited<ReturnType<typeof buildSessionReview
   console.log(`- ${review.reviewCommands.timeline}`);
   console.log(`- ${review.reviewCommands.result}`);
   console.log(`- ${review.reviewCommands.verify}`);
-}
-
-function timelineItemFromAudit(event: AuditEvent): Omit<SessionTimelineItem, "ordinal"> {
-  return {
-    kind: "audit",
-    createdAt: event.createdAt,
-    sourceId: event.id,
-    actor: actorLabel(event.actor),
-    title: event.type,
-    summary: event.summary,
-    action: typeof event.metadata?.action === "string" ? event.metadata.action : undefined,
-    toolName: typeof event.metadata?.tool === "string" ? event.metadata.tool : undefined,
-    command: typeof event.metadata?.command === "string" ? event.metadata.command : undefined,
-    exitCode: commandExitCode(event.metadata),
-    timedOut: commandTimedOut(event.metadata),
-    durationMs: commandDurationMs(event.metadata),
-    executionProfile: commandExecutionProfileName(event.metadata),
-    metadata: safeTimelineMetadata(event.metadata),
-  };
-}
-
-function timelineItemFromFileChange(change: FileChange): Omit<SessionTimelineItem, "ordinal"> {
-  return {
-    kind: "file_change",
-    createdAt: change.createdAt,
-    sourceId: change.id,
-    actor: actorLabel(change.actor),
-    title: `${change.kind} ${change.path}`,
-    summary: change.summary,
-    path: change.path,
-    metadata: {
-      beforeHash: change.beforeHash,
-      afterHash: change.afterHash,
-    },
-  };
-}
-
-function timelineItemFromApproval(approval: ApprovalRequest): Omit<SessionTimelineItem, "ordinal"> {
-  return {
-    kind: "approval",
-    createdAt: approval.createdAt,
-    sourceId: approval.id,
-    actor: actorLabel(approval.requestedBy),
-    title: `approval requested ${approval.action}`,
-    summary: approval.reason,
-    status: approval.status,
-    action: approval.action,
-    toolName: approval.toolName,
-    metadata: {
-      approverHint: approval.approverHint,
-    },
-  };
-}
-
-function timelineItemFromApprovalDecision(approval: ApprovalRequest): Omit<SessionTimelineItem, "ordinal"> {
-  return {
-    kind: "approval_decision",
-    createdAt: approval.decidedAt ?? approval.createdAt,
-    sourceId: `${approval.id}:decision`,
-    actor: approval.decisionBy ? actorLabel(approval.decisionBy) : undefined,
-    title: `approval ${approval.status} ${approval.action}`,
-    summary: approval.decisionReason ?? approval.reason,
-    status: approval.status,
-    action: approval.action,
-    toolName: approval.toolName,
-  };
-}
-
-function timelineKindOrder(kind: SessionTimelineItemKind): number {
-  switch (kind) {
-    case "audit":
-      return 0;
-    case "approval":
-      return 1;
-    case "approval_decision":
-      return 2;
-    case "file_change":
-      return 3;
-  }
-}
-
-function countTimelineKinds(items: Array<{ kind: SessionTimelineItemKind }>): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const item of items) {
-    counts[item.kind] = (counts[item.kind] ?? 0) + 1;
-  }
-  return counts;
-}
-
-function safeTimelineMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  if (!metadata) {
-    return undefined;
-  }
-  const safe: Record<string, unknown> = {};
-  for (const key of ["action", "tool", "ok", "exitCode", "timedOut", "durationMs", "executionProfile", "stdoutBytes", "stderrBytes", "approvalId"]) {
-    const value = metadata[key];
-    if (value !== undefined) {
-      safe[key] = value;
-    }
-  }
-  const error = metadata.error;
-  if (typeof error === "object" && error !== null) {
-    const maybe = error as { code?: unknown; message?: unknown };
-    safe.error = {
-      code: typeof maybe.code === "string" ? maybe.code : undefined,
-      message: typeof maybe.message === "string" ? singleLine(maybe.message) : undefined,
-    };
-  }
-  return Object.keys(safe).length > 0 ? safe : undefined;
-}
-
-function actorLabel(actor: { type: string; id: string }): string {
-  return `${actor.type}:${actor.id}`;
 }
 
 type SessionOperatorNextActionStatus = "required" | "recommended" | "optional";
@@ -9618,6 +10295,10 @@ async function buildSessionResult(store: AgentStore, sessionId: string) {
   };
 }
 
+async function buildSessionNext(store: AgentStore, sessionId: string) {
+  return buildSessionNextView(store, sessionId);
+}
+
 function sessionResultOutcome(sessionStatus: string, lastCommandExitCode: number | null | undefined, lastCommandTimedOut?: boolean): "succeeded" | "failed" | "paused" | "cancelled" | "in_progress" | "unknown" {
   if (sessionStatus === "completed") {
     return !lastCommandTimedOut && (lastCommandExitCode === undefined || lastCommandExitCode === null || lastCommandExitCode === 0) ? "succeeded" : "failed";
@@ -9635,6 +10316,36 @@ function sessionResultOutcome(sessionStatus: string, lastCommandExitCode: number
     return "in_progress";
   }
   return "unknown";
+}
+
+function printSessionNext(next: Awaited<ReturnType<typeof buildSessionNext>>): void {
+  console.log(`Session next actions: ${next.session.id}`);
+  console.log(`outcome=${next.summary.outcome}\tstatus=${next.summary.status}\ttarget=${next.summary.targetMode}`);
+  console.log(`objective: ${next.session.objective}`);
+  console.log(
+    `handoff=${next.handoff.state}\trequiredIssues=${next.handoff.requiredIssues}\t` +
+    `requiredActions=${next.handoff.requiredActions}\tnext=${next.handoff.nextCommand ?? "-"}`,
+  );
+  console.log(
+    `inspection=${next.inspection.state}\tissues=${next.inspection.issues.length}\t` +
+    `focus=${next.inspection.focusPaths.join(",") || "-"}`,
+  );
+  console.log(`nextActions=${next.summary.nextActions}\tstatuses=${formatRecordCounts(next.summary.nextActionStatuses)}`);
+  if (next.nextActions.length > 0) {
+    console.log("");
+    console.log("Next actions:");
+    for (const action of next.nextActions) {
+      console.log(`- [${action.status}] ${action.label}: ${action.command}`);
+      console.log(`  ${action.reason}`);
+    }
+  }
+  console.log("");
+  console.log("Review:");
+  console.log(`- ${next.reviewCommands.review}`);
+  console.log(`- ${next.reviewCommands.status}`);
+  console.log(`- ${next.reviewCommands.inspect}`);
+  console.log(`- ${next.reviewCommands.timeline}`);
+  console.log(`- ${next.reviewCommands.verify}`);
 }
 
 function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult>>): void {
@@ -9741,160 +10452,8 @@ function printSessionResult(result: Awaited<ReturnType<typeof buildSessionResult
   console.log(`- ${result.reviewCommands.audit}`);
 }
 
-type SessionVerificationOptions = {
-  requireChange?: boolean;
-  requirePatch?: boolean;
-  requireRecovery?: boolean;
-  requireTimeout?: boolean;
-  requireDiffStat?: boolean;
-  requireReviewProfile?: boolean;
-  requireModelCall?: boolean;
-  requireNoPendingApprovals?: boolean;
-  requiredExecutionProfiles?: CommandExecutionProfileName[];
-  requiredApprovalActions?: PolicyAction[];
-  requireCommand?: boolean;
-};
-
-type SessionVerificationCheck = {
-  id: string;
-  label: string;
-  status: "pass" | "fail";
-  summary: string;
-};
-
 async function buildSessionVerification(store: AgentStore, sessionId: string, options: SessionVerificationOptions = {}) {
-  const result = await buildSessionResult(store, sessionId);
-  const checks: SessionVerificationCheck[] = [];
-  const requireCommand = options.requireCommand !== false;
-
-  checks.push({
-    id: "session-succeeded",
-    label: "session succeeded",
-    status: result.summary.outcome === "succeeded" ? "pass" : "fail",
-    summary: `outcome=${result.summary.outcome}, status=${result.summary.status}`,
-  });
-  checks.push({
-    id: "tools-clean",
-    label: "tools clean",
-    status: result.summary.failedToolResults === 0 ? "pass" : "fail",
-    summary: `${result.summary.failedToolResults} failed tool result(s) out of ${result.summary.toolResults}`,
-  });
-  if (requireCommand) {
-    const lastCommand = result.summary.lastCommand;
-    checks.push({
-      id: "command-verified",
-      label: "command verified",
-      status: result.summary.commandsFinished > 0 && lastCommand?.exitCode === 0 && !lastCommand.timedOut ? "pass" : "fail",
-      summary: `commandsFinished=${result.summary.commandsFinished}, lastExit=${lastCommand?.exitCode ?? "-"}, timedOut=${lastCommand?.timedOut ?? false}`,
-    });
-  }
-  if (options.requireChange) {
-    checks.push({
-      id: "change-evidence",
-      label: "change evidence",
-      status: result.summary.fileChanges > 0 && result.summary.changedPaths.length > 0 ? "pass" : "fail",
-      summary: `${result.summary.fileChanges} file change(s), ${result.summary.changedPaths.length} changed path(s)`,
-    });
-  }
-  if (options.requirePatch) {
-    checks.push({
-      id: "patch-evidence",
-      label: "patch evidence",
-      status: result.summary.patches > 0 ? "pass" : "fail",
-      summary: `${result.summary.patches} persisted patch(es)`,
-    });
-  }
-  if (options.requireDiffStat) {
-    checks.push({
-      id: "diff-stat-evidence",
-      label: "diff stat evidence",
-      status: result.summary.diffStats.files > 0 && (result.summary.diffStats.additions > 0 || result.summary.diffStats.deletions > 0) ? "pass" : "fail",
-      summary: formatDiffStats(result.summary.diffStats),
-    });
-  }
-  if (options.requireReviewProfile) {
-    checks.push({
-      id: "review-profile-evidence",
-      label: "review profile evidence",
-      status: result.summary.reviewProfile.reviewSize !== "none" && result.summary.reviewProfile.files > 0 && result.summary.reviewProfile.largestFile ? "pass" : "fail",
-      summary: formatDiffReviewProfile(result.summary.reviewProfile),
-    });
-  }
-  if (options.requireRecovery) {
-    checks.push({
-      id: "recovery-evidence",
-      label: "recovery evidence",
-      status: result.recovery.observedFailure && result.recovery.recovered ? "pass" : "fail",
-      summary: `observedFailure=${result.recovery.observedFailure}, recovered=${result.recovery.recovered}`,
-    });
-  }
-  if (options.requireTimeout) {
-    checks.push({
-      id: "timeout-evidence",
-      label: "timeout evidence",
-      status: result.summary.timedOutCommands > 0 ? "pass" : "fail",
-      summary: `${result.summary.timedOutCommands} timed-out command(s)`,
-    });
-  }
-  if (options.requireModelCall) {
-    checks.push({
-      id: "model-call-evidence",
-      label: "model call evidence",
-      status: result.summary.modelSuccessfulCalls > 0 ? "pass" : "fail",
-      summary:
-        `modelCalls=${result.summary.modelCalls}, successful=${result.summary.modelSuccessfulCalls}, ` +
-        `failed=${result.summary.modelFailedCalls}, withUsage=${result.summary.modelCallsWithUsage}, totalTokens=${result.summary.modelTotalTokens}`,
-    });
-  }
-  if (options.requireNoPendingApprovals) {
-    checks.push({
-      id: "no-pending-approvals",
-      label: "no pending approvals",
-      status: result.summary.pendingApprovals === 0 ? "pass" : "fail",
-      summary: `${result.summary.pendingApprovals} pending approval request(s)`,
-    });
-  }
-  for (const profile of [...new Set(options.requiredExecutionProfiles ?? [])]) {
-    const count = result.summary.executionProfiles[profile] ?? 0;
-    checks.push({
-      id: `execution-profile-${profile.replace(/[^a-z0-9]+/gi, "-")}`,
-      label: `execution profile ${profile}`,
-      status: count > 0 ? "pass" : "fail",
-      summary: `${count} finished command(s) recorded with ${profile}`,
-    });
-  }
-  for (const action of [...new Set(options.requiredApprovalActions ?? [])]) {
-    const approvals = result.approvals.filter((approval) => approval.action === action);
-    checks.push({
-      id: `approval-${action.replace(/[^a-z0-9]+/gi, "-")}`,
-      label: `approval ${action}`,
-      status: approvals.length > 0 ? "pass" : "fail",
-      summary: `${approvals.length} approval request(s) for ${action}`,
-    });
-  }
-
-  const status: "pass" | "fail" = checks.some((check) => check.status === "fail") ? "fail" : "pass";
-  return {
-    generatedAt: new Date().toISOString(),
-    session: result.session,
-    status,
-    options: {
-      requireCommand,
-      requireChange: Boolean(options.requireChange),
-      requirePatch: Boolean(options.requirePatch),
-      requireRecovery: Boolean(options.requireRecovery),
-      requireTimeout: Boolean(options.requireTimeout),
-      requireDiffStat: Boolean(options.requireDiffStat),
-      requireReviewProfile: Boolean(options.requireReviewProfile),
-      requireModelCall: Boolean(options.requireModelCall),
-      requireNoPendingApprovals: Boolean(options.requireNoPendingApprovals),
-      requiredExecutionProfiles: [...new Set(options.requiredExecutionProfiles ?? [])],
-      requiredApprovalActions: [...new Set(options.requiredApprovalActions ?? [])],
-    },
-    summary: result.summary,
-    checks,
-    reviewCommands: result.reviewCommands,
-  };
+  return buildSessionVerificationView(store, sessionId, options);
 }
 
 function printSessionVerification(verification: Awaited<ReturnType<typeof buildSessionVerification>>): void {
@@ -10678,7 +11237,7 @@ function printSoloclawQuickstart(view: SoloclawQuickstartView): void {
 function printModelProviderProfiles(profiles: ModelProviderProfileView[], defaultProvider: ModelProviderName | undefined): void {
   for (const profile of profiles) {
     console.log(
-      `${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}${profile.name === defaultProvider ? "\tdefault" : ""}`,
+      `${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}${profile.name === defaultProvider ? "\tdefault" : ""}`,
     );
   }
 }
@@ -10907,6 +11466,7 @@ async function initializeSoloclawWorkspace(historyRoot: string, workspaceRoot: s
       defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? current.defaultBaseUrl,
       defaultModel: parsed.options.model ?? current.defaultModel,
       apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, providerInput, current.apiKeyEnvNames),
+      apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
     });
     await profiles.setDefaultProvider(providerName);
     configuredProvider = providerName;
@@ -10944,7 +11504,7 @@ async function buildModelCheckView(
   const apiKeyEnvNames = resolveModelApiKeyEnvNames(parsed.options, providerInput, profile.apiKeyEnvNames);
   const baseUrl = parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? profile.defaultBaseUrl;
   const presentApiKeyEnvNames = apiKeyEnvNames.filter((envName) => Boolean(process.env[envName]));
-  const usesApiKeySecretRef = Boolean(options.apiKeySecretRef);
+  const usesApiKeySecretRef = Boolean(options.apiKeySecretRef ?? parsed.options.apiKeySecretRef ?? profile.apiKeySecretRef);
   const missingApiKeyEnvNames = profile.protocol === "mock" || usesApiKeySecretRef || apiKeyEnvNames.length === 0 || presentApiKeyEnvNames.length > 0 ? [] : apiKeyEnvNames;
   const status: ModelCheckStatus =
     profile.protocol !== "mock" && !baseUrl
@@ -11065,10 +11625,15 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent service, /agent logs, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session status <id>, /session inspect <id>, /session timeline <id>, /session review <id>, /session result <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent service, /agent logs, /operator status, /sessions, /sessions watch, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session report <id>, /session status <id>, /session inspect <id>, /session watch <id>, /session timeline <id>, /session review <id>, /session result <id>, /session next <id>, /session verify <id>, /session bundle <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
   try {
+    const tuiInput = createTuiLineReader(rl);
     stdout.write("soloclaw> ");
-    for await (const rawLine of rl) {
+    while (true) {
+      const rawLine = await tuiInput.readLine();
+      if (rawLine === undefined) {
+        return;
+      }
       const line = rawLine.trim();
       if (!line) {
         stdout.write("soloclaw> ");
@@ -11097,16 +11662,25 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /agent status        Show sessions, approvals, workers, and assignments");
         console.log("  /agent service       Show daemon service supervision plan");
         console.log("  /agent logs          Show merged local execution logs");
+        console.log("  /operator status     Show shared operator rows and status");
+        console.log("  /operator show <item-id> Show shared operator item detail");
+        console.log("  /sessions            Show recent session dashboard");
+        console.log("  /sessions watch      Repeat a bounded session dashboard view");
         console.log("  /approvals [status]  List approval requests");
         console.log("  /approve <approval-id> [reason] Approve an approval request");
         console.log("  /deny <approval-id> [reason] Deny an approval request");
         console.log("  /session diff <session-id> Show persisted patch diff");
+        console.log("  /session report <session-id> Show consolidated session evidence");
         console.log("  /session status <session-id> Show session status snapshot");
         console.log("  /session inspect <session-id> Show focused session inspection");
+        console.log("  /session watch <session-id> [view] Repeat a bounded session status/inspect/next/review/timeline view");
         console.log("  /session timeline <session-id> Show safe session timeline");
         console.log("  /session logs <session-id> Show safe session timeline");
         console.log("  /session review <session-id> Show operator review package");
         console.log("  /session result <session-id> Show session result summary");
+        console.log("  /session next <session-id> Show next operator actions");
+        console.log("  /session verify <session-id> Run session evidence gate");
+        console.log("  /session bundle <session-id> Export session evidence bundle");
         console.log("  /check               Run the local readiness check");
         console.log("  /doctor              Run the local readiness check");
         console.log("  /inspect             Print the current workspace snapshot");
@@ -11120,7 +11694,8 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /model <provider>    Select and persist a default provider");
         console.log("  /model use <provider> Select and persist a default provider");
         console.log("  /model setup local [--model name]");
-        console.log("  /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV]");
+        console.log("  /model setup          Open menu-style model setup");
+        console.log("  /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
         console.log("  /workspace           List recent workspaces");
         console.log("  /workspace recent    List recent workspaces");
         console.log("  /workspace <n>       Switch to the numbered recent workspace");
@@ -11208,9 +11783,50 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
+      const tuiOperatorCommand = await runTuiOperatorCommand(workspace, line);
+      if (tuiOperatorCommand.handled) {
+        for (const outputLine of tuiOperatorCommand.output) {
+          console.log(outputLine);
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      const tuiSessionsWatchCommand = await runTuiSessionsWatchCommand(workspace, line);
+      if (tuiSessionsWatchCommand.handled) {
+        for (const outputLine of tuiSessionsWatchCommand.output) {
+          console.log(outputLine);
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/sessions" || line.startsWith("/sessions ")) {
+        const parsed = parseSessionListArgs(splitCliWords(line.slice("/sessions".length).trim()));
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const list = await buildSessionList(platform.store, parsed.options);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(list, null, 2));
+          } else {
+            printSessionList(list);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
       const tuiApprovalCommand = await runTuiApprovalCommand(workspace, line);
       if (tuiApprovalCommand.handled) {
         for (const outputLine of tuiApprovalCommand.output) {
+          console.log(outputLine);
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      const tuiSessionWatchCommand = await runTuiSessionWatchCommand(workspace, line);
+      if (tuiSessionWatchCommand.handled) {
+        for (const outputLine of tuiSessionWatchCommand.output) {
           console.log(outputLine);
         }
         stdout.write("soloclaw> ");
@@ -11231,6 +11847,29 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
             console.log(JSON.stringify(diff, null, 2));
           } else {
             printSessionDiff(diff);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session report" || line.startsWith("/session report ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session report".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session report <session-id> [--json]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const report = await buildSessionReport(platform.store, sessionId);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(report, null, 2));
+          } else {
+            printSessionReport(report);
           }
         } finally {
           platform.locks.close?.();
@@ -11355,6 +11994,105 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
+      if (line === "/session next" || line.startsWith("/session next ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session next".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session next <session-id> [--json]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const next = await buildSessionNext(platform.store, sessionId);
+          if (parsed.options.json) {
+            console.log(JSON.stringify(next, null, 2));
+          } else {
+            printSessionNext(next);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session verify" || line.startsWith("/session verify ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session verify".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const verification = await buildSessionVerification(platform.store, sessionId, {
+            preset: parsed.options.preset,
+            requireChange: parsed.options.requireChange,
+            requirePatch: parsed.options.requirePatch,
+            requireRecovery: parsed.options.requireRecovery,
+            requireTimeout: parsed.options.requireTimeout,
+            requireDiffStat: parsed.options.requireDiffStat,
+            requireReviewProfile: parsed.options.requireReviewProfile,
+            requireModelCall: parsed.options.requireModelCall,
+            requireNoPendingApprovals: parsed.options.requireNoPendingApprovals,
+            requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
+            requiredApprovalActions: parsed.options.requiredApprovalActions,
+            requireCommand: parsed.options.allowNoCommand !== true,
+          });
+          if (parsed.options.json) {
+            console.log(JSON.stringify(verification, null, 2));
+          } else {
+            printSessionVerification(verification);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line === "/session bundle" || line.startsWith("/session bundle ")) {
+        const parsed = parseLifecycleArgs(splitCliWords(line.slice("/session bundle".length).trim()));
+        const sessionId = parsed.positionals[0];
+        if (!sessionId) {
+          console.log("Usage: /session bundle <session-id> [--json] [--output path] [--limit n] [verification options]");
+          stdout.write("soloclaw> ");
+          continue;
+        }
+        const platform = await createLocalPlatform(workspace);
+        try {
+          const bundle = await buildSessionEvidenceBundle(platform.store, sessionId, {
+            workspace,
+            limit: parsed.options.limit,
+            preset: parsed.options.preset,
+            requireChange: parsed.options.requireChange,
+            requirePatch: parsed.options.requirePatch,
+            requireRecovery: parsed.options.requireRecovery,
+            requireTimeout: parsed.options.requireTimeout,
+            requireDiffStat: parsed.options.requireDiffStat,
+            requireReviewProfile: parsed.options.requireReviewProfile,
+            requireModelCall: parsed.options.requireModelCall,
+            requireNoPendingApprovals: parsed.options.requireNoPendingApprovals,
+            requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
+            requiredApprovalActions: parsed.options.requiredApprovalActions,
+            requireCommand: parsed.options.allowNoCommand !== true,
+          });
+          const output = parsed.options.output ? await writeJsonOutputInsideWorkspace(workspace, parsed.options.output, bundle) : undefined;
+          const printable = output ? { ...bundle, output } : bundle;
+          if (parsed.options.json) {
+            console.log(JSON.stringify(printable, null, 2));
+          } else {
+            printSessionEvidenceBundle(printable);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+        stdout.write("soloclaw> ");
+        continue;
+      }
       if (line === "/doctor" || line === "/check") {
         const readiness = await verifyPhaseOneReadiness(workspace);
         printPhaseOneReadiness(readiness);
@@ -11379,7 +12117,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log(`active=${provider}`);
         console.log(`default=${defaultProvider ?? "-"}`);
         for (const profile of profiles) {
-          console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}`);
+          console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
         }
         stdout.write("soloclaw> ");
         continue;
@@ -11409,39 +12147,59 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         const profiles = await profileStore.list();
         const defaultProvider = await profileStore.getDefaultProvider();
         for (const profile of profiles) {
-          console.log(`${profile.name}${profile.name === defaultProvider ? " *" : ""}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}`);
+          console.log(`${profile.name}${profile.name === defaultProvider ? " *" : ""}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
         }
         stdout.write("soloclaw> ");
         continue;
       }
-      if (line === "/model setup" || line.startsWith("/model setup ")) {
-        const parsed = parseModelProfileArgs(splitCliWords(line.slice("/model setup".length).trim()));
-        const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-        const providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
-        if (!providerName) {
-          console.log("Usage: /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV]");
-          stdout.write("soloclaw> ");
-          continue;
+      if (line === "/model setup") {
+        try {
+          const result = await promptTuiModelSetupMenu(tuiInput, workspace, profileStore);
+          provider = result.provider;
+          const defaultProvider = await profileStore.getDefaultProvider();
+          console.log(`${result.profile.name}\t${result.profile.source}\t${result.profile.protocol}\tmodel=${result.profile.defaultModel}\tbaseUrl=${result.profile.defaultBaseUrl ?? "-"}\tenv=${result.profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${result.profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
+          console.log(`config=${profileStore.filePath}`);
+          console.log(`Model: ${provider}`);
+        } catch (error) {
+          console.log(`Error: ${formatTuiModelSetupError(error)}`);
         }
-        const current = (await profileStore.list()).find((profile) => profile.name === providerName);
-        if (!current) {
-          throw new Error(`Unknown model provider: ${providerName}`);
+        stdout.write("soloclaw> ");
+        continue;
+      }
+      if (line.startsWith("/model setup ")) {
+        try {
+          const parsed = parseModelProfileArgs(splitCliWords(line.slice("/model setup".length).trim()));
+          const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
+          const providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
+          if (!providerName) {
+            console.log("Usage: /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
+            stdout.write("soloclaw> ");
+            continue;
+          }
+          const current = (await profileStore.list()).find((profile) => profile.name === providerName);
+          if (!current) {
+            throw new Error(`Unknown model provider: ${providerName}`);
+          }
+          const profile = await profileStore.set({
+            name: providerName,
+            protocol: parsed.options.protocol ?? current.protocol,
+            defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? current.defaultBaseUrl,
+            defaultModel: parsed.options.model ?? current.defaultModel,
+            apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, providerInput, current.apiKeyEnvNames),
+            apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
+          });
+          if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
+            await profileStore.setDefaultProvider(providerName);
+            provider = providerName;
+          }
+          const defaultProvider = await profileStore.getDefaultProvider();
+          console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
+          console.log(`config=${profileStore.filePath}`);
+          console.log(`Model: ${provider}`);
+        } catch (error) {
+          console.log(`Error: ${formatTuiModelSetupError(error)}`);
+          console.log("Usage: /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
         }
-        const profile = await profileStore.set({
-          name: providerName,
-          protocol: parsed.options.protocol ?? current.protocol,
-          defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? current.defaultBaseUrl,
-          defaultModel: parsed.options.model ?? current.defaultModel,
-          apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, providerInput, current.apiKeyEnvNames),
-        });
-        if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
-          await profileStore.setDefaultProvider(providerName);
-          provider = providerName;
-        }
-        const defaultProvider = await profileStore.getDefaultProvider();
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tdefault=${defaultProvider ?? "-"}`);
-        console.log(`config=${profileStore.filePath}`);
-        console.log(`Model: ${provider}`);
         stdout.write("soloclaw> ");
         continue;
       }
@@ -11499,6 +12257,7 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
+      await ensureTuiModelSecretReady(tuiInput, profileStore, provider);
       const platform = await createLocalPlatform(workspace, { provider, knowledgeQuery: task });
       try {
         const answer = await platform.agent.run(task);
@@ -11521,6 +12280,208 @@ async function promptLine(question: string): Promise<string> {
   } finally {
     rl.close();
   }
+}
+
+type TuiQuestionReader = {
+  question(question: string): Promise<string>;
+};
+
+type TuiLineReader = TuiQuestionReader & {
+  readLine(): Promise<string | undefined>;
+};
+
+function createTuiLineReader(rl: ReadlineInterface): TuiLineReader {
+  const iterator = rl[Symbol.asyncIterator]();
+  const reader: TuiLineReader = {
+    async readLine() {
+      const next = await iterator.next();
+      return next.done ? undefined : String(next.value);
+    },
+    async question(question: string) {
+      stdout.write(question);
+      const line = await reader.readLine();
+      if (line === undefined) {
+        throw new Error("Input ended before setup completed.");
+      }
+      return line;
+    },
+  };
+  return reader;
+}
+
+const MODEL_SETUP_PROVIDER_ORDER: ModelProviderName[] = [
+  "openai",
+  "anthropic",
+  "gemini",
+  "kimi",
+  "deepseek",
+  "glm",
+  "qwen",
+  "minimax",
+  "grok",
+  "mimo",
+  "openai_compatible",
+  "anthropic_compatible",
+  "mock",
+];
+
+type TuiModelSetupResult = {
+  provider: ModelProviderName;
+  profile: ModelProviderProfileView;
+};
+
+async function promptTuiModelSetupMenu(
+  rl: TuiQuestionReader,
+  workspace: string,
+  profileStore: LocalProviderProfileStore,
+): Promise<TuiModelSetupResult> {
+  const profiles = await profileStore.list();
+  const orderedProfiles = MODEL_SETUP_PROVIDER_ORDER
+    .map((name) => profiles.find((profile) => profile.name === name))
+    .filter((profile): profile is ModelProviderProfileView => Boolean(profile));
+  stdout.write("Model setup\n");
+  stdout.write("Choose a provider:\n");
+  orderedProfiles.forEach((profile, index) => {
+    stdout.write(`${index + 1}. ${modelProviderMenuLine(profile)}\n`);
+  });
+  const providerIndex = await promptChoiceIndex(rl, "Provider [1]: ", orderedProfiles.length, 1);
+  const current = orderedProfiles[providerIndex];
+  const providerName = current.name;
+
+  const baseUrl = await promptTuiModelBaseUrl(rl, current);
+  const model = await promptTuiModelId(rl, current);
+  const keyConfig = await promptTuiModelApiKeyConfig(rl, workspace, current);
+  const profile = await profileStore.set({
+    name: providerName,
+    protocol: current.protocol,
+    defaultBaseUrl: baseUrl,
+    defaultModel: model,
+    apiKeyEnvNames: keyConfig.apiKeyEnvNames,
+    apiKeySecretRef: keyConfig.apiKeySecretRef,
+  });
+  await profileStore.setDefaultProvider(providerName);
+  return { provider: providerName, profile };
+}
+
+function modelProviderMenuLine(profile: ModelProviderProfileView): string {
+  const models = modelChoicesForProfile(profile).slice(0, 3).join(",") || profile.defaultModel;
+  const baseUrl = profile.defaultBaseUrl ?? "-";
+  const links = [
+    profile.apiKeysUrl ? `keys=${profile.apiKeysUrl}` : undefined,
+    profile.pricingUrl ? `pricing=${profile.pricingUrl}` : undefined,
+  ].filter(Boolean).join(" ");
+  return `${profile.displayName ?? profile.name} (${profile.name}) base=${baseUrl} models=${models}${links ? ` ${links}` : ""}`;
+}
+
+async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string | undefined> {
+  if (profile.protocol === "mock") {
+    return undefined;
+  }
+  const defaultBaseUrl = profile.defaultBaseUrl ?? "";
+  stdout.write("Base URL:\n");
+  stdout.write(`1. ${defaultBaseUrl || "provider default"}\n`);
+  stdout.write("2. Custom URL\n");
+  const choice = await promptChoiceIndex(rl, "Base URL [1]: ", 2, 1);
+  if (choice === 0) {
+    return defaultBaseUrl;
+  }
+  const custom = (await rl.question("Custom base URL: ")).trim();
+  return custom || defaultBaseUrl;
+}
+
+async function promptTuiModelId(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string> {
+  const modelIds = modelChoicesForProfile(profile);
+  stdout.write("Model ID:\n");
+  modelIds.forEach((modelId, index) => {
+    stdout.write(`${index + 1}. ${modelId}\n`);
+  });
+  stdout.write(`${modelIds.length + 1}. Custom model ID\n`);
+  const choice = await promptChoiceIndex(rl, "Model [1]: ", modelIds.length + 1, 1);
+  if (choice < modelIds.length) {
+    return modelIds[choice];
+  }
+  return (await rl.question("Custom model ID: ")).trim() || profile.defaultModel;
+}
+
+function modelChoicesForProfile(profile: ModelProviderProfileView): string[] {
+  return [...new Set([profile.defaultModel, ...(profile.modelIds ?? [])].filter(Boolean))];
+}
+
+async function promptTuiModelApiKeyConfig(
+  rl: TuiQuestionReader,
+  workspace: string,
+  profile: ModelProviderProfileView,
+): Promise<{ apiKeyEnvNames: string[]; apiKeySecretRef?: string }> {
+  if (profile.protocol === "mock") {
+    return { apiKeyEnvNames: [] };
+  }
+  stdout.write("API key:\n");
+  stdout.write("1. Paste now and save to encrypted local vault\n");
+  stdout.write("2. Use environment variable name\n");
+  stdout.write("3. Keep current/default key setting\n");
+  stdout.write("4. No API key required\n");
+  const choice = await promptChoiceIndex(rl, "API key [1]: ", 4, 1);
+  if (choice === 0) {
+    await ensureSecretVaultPassphrase(rl);
+    const apiKey = (await rl.question("API key: ")).trim();
+    if (!apiKey) {
+      throw new Error("API key was empty.");
+    }
+    const secretRef = await storeModelApiKeySecret(workspace, profile.name, apiKey);
+    return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: secretRef };
+  }
+  if (choice === 1) {
+    const defaultEnv = profile.apiKeyEnvNames[0] ?? "MODEL_API_KEY";
+    const envName = (await rl.question(`API key env [${defaultEnv}]: `)).trim() || defaultEnv;
+    return { apiKeyEnvNames: [envName] };
+  }
+  if (choice === 2) {
+    return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: profile.apiKeySecretRef };
+  }
+  return { apiKeyEnvNames: [] };
+}
+
+async function promptChoiceIndex(rl: TuiQuestionReader, question: string, count: number, defaultOneBased: number): Promise<number> {
+  const raw = (await rl.question(question)).trim();
+  if (!raw) {
+    return defaultOneBased - 1;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > count) {
+    throw new Error(`Choose a number from 1 to ${count}.`);
+  }
+  return parsed - 1;
+}
+
+async function ensureSecretVaultPassphrase(rl: TuiQuestionReader): Promise<void> {
+  if (process.env.AGENT_SECRETS_PASSPHRASE) {
+    return;
+  }
+  stdout.write("Encrypted vault needs AGENT_SECRETS_PASSPHRASE for future runs.\n");
+  const passphrase = (await rl.question("Vault passphrase (12+ chars): ")).trim();
+  if (passphrase.length < 12) {
+    throw new Error("Vault passphrase must be at least 12 characters.");
+  }
+  process.env.AGENT_SECRETS_PASSPHRASE = passphrase;
+}
+
+async function ensureTuiModelSecretReady(rl: TuiQuestionReader, profileStore: LocalProviderProfileStore, provider: ModelProviderName): Promise<void> {
+  const profile = (await profileStore.list()).find((entry) => entry.name === provider);
+  if (profile?.apiKeySecretRef && !process.env.AGENT_SECRETS_PASSPHRASE) {
+    await ensureSecretVaultPassphrase(rl);
+  }
+}
+
+async function storeModelApiKeySecret(workspace: string, provider: ModelProviderName, apiKey: string): Promise<string> {
+  const secrets = new EncryptedFileSecretStore(path.join(workspace, ".agent", "secrets.vault.json"));
+  const ref = await secrets.putSecret({
+    name: `model:${provider}`,
+    class: "model_api_key",
+    scopeType: "workspace",
+    scopeId: "local",
+    value: apiKey,
+  });
+  return ref.id;
 }
 
 async function promptSoloclawSetupWizardArgs(options: { json?: boolean }): Promise<string[]> {
@@ -11587,6 +12548,7 @@ type ModelProfileCliOptions = {
   baseUrl?: string;
   model?: string;
   apiKeyEnvNames?: string[];
+  apiKeySecretRef?: string;
   clearApiKeyEnvNames?: boolean;
   setDefault?: boolean;
 };
@@ -11668,6 +12630,11 @@ function parseModelProfileArgs(args: string[]): { options: ModelProfileCliOption
     }
     if (arg === "--api-key-env" && next) {
       options.apiKeyEnvNames = [...(options.apiKeyEnvNames ?? []), next];
+      index += 1;
+      continue;
+    }
+    if (arg === "--api-key-secret" && next) {
+      options.apiKeySecretRef = next;
       index += 1;
       continue;
     }
@@ -12020,9 +12987,12 @@ function parseModelProviderName(value: string): ModelProviderName {
     value === "openai" ||
     value === "grok" ||
     value === "anthropic" ||
+    value === "gemini" ||
+    value === "kimi" ||
     value === "minimax" ||
     value === "deepseek" ||
     value === "glm" ||
+    value === "qwen" ||
     value === "mimo" ||
     value === "openai_compatible" ||
     value === "anthropic_compatible" ||
@@ -12039,6 +13009,20 @@ function tryParseModelProviderName(value: string): ModelProviderName | undefined
   } catch {
     return undefined;
   }
+}
+
+function formatTuiModelSetupError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith("Invalid apiKeyEnvNames")) {
+    return "--api-key-env must be an environment variable name like DEEPSEEK_API_KEY, not the API key value.";
+  }
+  if (message.startsWith("Invalid apiKeySecretRef")) {
+    return "--api-key-secret must be a stored secret id like sec_xxxxxxxx, not the API key value.";
+  }
+  if (message.startsWith("Unknown model provider")) {
+    return "Unknown model provider. Use openai, anthropic, gemini, kimi, grok, minimax, deepseek, glm, qwen, mimo, openai_compatible, anthropic_compatible, mock, local, ollama, or custom.";
+  }
+  return message;
 }
 
 function localModelAliasBaseUrl(value: string | undefined): string | undefined {
@@ -12112,8 +13096,8 @@ Usage:
   soloclaw
   soloclaw quickstart [--workspace path] [--json]
   soloclaw setup --wizard [--workspace path]
-  soloclaw setup [--workspace path] [--local|--ollama|--mock|--custom|--provider provider] [--base-url url] [--model model] [--api-key-env ENV] [--json]
-  soloclaw init [--workspace path] [--local|--ollama|--mock|--custom|--provider provider] [--base-url url] [--model model] [--api-key-env ENV] [--json]
+  soloclaw setup [--workspace path] [--local|--ollama|--mock|--custom|--provider provider] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--json]
+  soloclaw init [--workspace path] [--local|--ollama|--mock|--custom|--provider provider] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--json]
   soloclaw tui [--workspace path]
   soloclaw status [--workspace path] [--json]
   soloclaw smoke [--workspace path]
@@ -12130,7 +13114,7 @@ Usage:
   soloclaw model check [--workspace path] [--json] [--provider provider]
   soloclaw model provider
   soloclaw model use provider
-  soloclaw model setup [--workspace path] --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
+  soloclaw model setup [--workspace path] --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   soloclaw model setup [--workspace path] local --model model
   soloclaw model setup [--workspace path] custom --base-url url --model model --api-key-env ENV
   soloclaw config path [--workspace path]
@@ -12138,9 +13122,9 @@ Usage:
   soloclaw agent status [--workspace path] [--json] [--limit n]
   soloclaw agent service [--workspace path] [--json] [--limit n]
   soloclaw agent logs [--workspace path] [--json] [--limit n]
-  soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
+  soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|grok|minimax|deepseek|glm|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|gemini|kimi|grok|minimax|deepseek|glm|qwen|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -12156,11 +13140,13 @@ Usage:
   agent session report <session-id> [--json]
   agent session status <session-id> [--json] [--limit n]
   agent session inspect <session-id> [--json]
+  soloclaw # /sessions watch [--ticks n] [--interval-ms n] [--limit n] [--status status] [--target-mode mode]
+  soloclaw # /session watch <session-id> [status|inspect|next|review|timeline] [--ticks n] [--interval-ms n]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent pause <session-id> [reason]
   agent cancel <session-id> [reason]
@@ -12215,12 +13201,12 @@ Usage:
   agent models usage [--provider provider] [--model model] [--project id] [--session id] [--room id] [--from iso] [--to iso] [--limit n] [--input-cost-per-mtok n] [--output-cost-per-mtok n] [--json]
   agent model list [--json]
   agent model use <provider>
-  agent model setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
+  agent model setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   agent config path
   agent config show [--json]
-  agent models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV] [--default]
+  agent models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   agent models profiles list [--json]
-  agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV] [--default]
+  agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   agent models profiles remove <provider>
   agent mcp list [--json]
   agent mcp register <server-id> --transport stdio|http [--name name] [--command cmd|--url url] [--arg value] [--env-var NAME] [--cap tools|resources|prompts|sampling] [--risk low|medium|high|critical] [--no-approval] [--disabled] [--project id] [--room id]
@@ -12298,11 +13284,13 @@ Usage:
   agent session report <session-id> [--json]
   agent session status <session-id> [--json] [--limit n]
   agent session inspect <session-id> [--json]
+  soloclaw # /sessions watch [--ticks n] [--interval-ms n] [--limit n] [--status status] [--target-mode mode]
+  soloclaw # /session watch <session-id> [status|inspect|next|review|timeline] [--ticks n] [--interval-ms n]
   agent session timeline|logs <session-id> [--json] [--limit n]
   agent session review <session-id> [--json] [--limit n]
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
-  agent session verify <session-id> [--json] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent local status [--workspace path] [--json] [--limit n]
   agent local logs [--workspace path] [--json] [--limit n]
   agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id]
@@ -12470,6 +13458,254 @@ async function appendApprovalDecisionRoomMessage(
 }
 
 type LocalPlatform = Awaited<ReturnType<typeof createLocalPlatform>>;
+
+type TuiOperatorCommandResult = {
+  handled: boolean;
+  output: string[];
+};
+
+type TuiSessionWatchKind = "status" | "inspect" | "next" | "review" | "timeline";
+
+type TuiSessionWatchOptions = {
+  kind: TuiSessionWatchKind;
+  ticks: number;
+  intervalMs: number;
+  limit?: number;
+  json?: boolean;
+};
+
+type TuiSessionsWatchOptions = SessionListOptions & {
+  ticks: number;
+  intervalMs: number;
+};
+
+async function runTuiOperatorCommand(workspace: string, line: string): Promise<TuiOperatorCommandResult> {
+  if (!isTuiOperatorCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  const platform = await createLocalPlatform(workspace);
+  try {
+    return await runTuiOperatorCommandWithPlatform(platform, line);
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runTuiOperatorCommandWithPlatform(platform: LocalPlatform, line: string): Promise<TuiOperatorCommandResult> {
+  if (!isTuiOperatorCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  try {
+    const tokens = splitCliWords(line.slice("/operator".length).trim());
+    const first = tokens[0];
+    const subcommand = !first || first.startsWith("-") ? "status" : first;
+    const args = !first || first.startsWith("-") ? tokens : tokens.slice(1);
+    if (subcommand !== "status" && subcommand !== "view" && subcommand !== "show") {
+      return { handled: true, output: [`Unknown operator command: ${subcommand}`] };
+    }
+
+    const options = parseOperatorArgs(args);
+    const control = new ControlPlaneService(platform);
+    const projectionRequest = { operatorProjection: options.publicView ? "public" as const : "diagnostic" as const, operatorActor: options.actor };
+    const state = await control.getState(projectionRequest);
+    const operatorView = state.operator;
+    if (subcommand === "show") {
+      const selectedItem = options.select === undefined ? undefined : selectOperatorItem(operatorView, options);
+      const itemId = selectedItem?.id ?? options.id ?? options.positionals[0];
+      if (!itemId) {
+        return { handled: true, output: ["Usage: /operator show <item-id-or-ref-id> [--select n] [--json]"] };
+      }
+      const detail = await control.getOperatorDetail(itemId, projectionRequest);
+      if (!detail.item) {
+        return { handled: true, output: [`Operator item not found: ${itemId}`] };
+      }
+      return {
+        handled: true,
+        output: options.json ? [JSON.stringify(detail, null, 2)] : await captureConsoleOutput(() => printOperatorDetail(detail)),
+      };
+    }
+
+    return {
+      handled: true,
+      output: options.json
+        ? [JSON.stringify(operatorJsonView(operatorView, options), null, 2)]
+        : await captureConsoleOutput(() => printOperatorView(operatorView, options)),
+    };
+  } catch (error) {
+    return { handled: true, output: [error instanceof Error ? error.message : String(error)] };
+  }
+}
+
+function isTuiOperatorCommand(line: string): boolean {
+  return line === "/operator" || line.startsWith("/operator ");
+}
+
+type TuiSessionWatchCommandResult = {
+  handled: boolean;
+  output: string[];
+};
+
+async function runTuiSessionsWatchCommand(workspace: string, line: string): Promise<TuiSessionWatchCommandResult> {
+  if (!isTuiSessionsWatchCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  const platform = await createLocalPlatform(workspace);
+  try {
+    return await runTuiSessionsWatchCommandWithPlatform(platform, line);
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runTuiSessionsWatchCommandWithPlatform(platform: LocalPlatform, line: string): Promise<TuiSessionWatchCommandResult> {
+  if (!isTuiSessionsWatchCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  try {
+    const parsed = parseTuiSessionsWatchArgs(splitCliWords(line.slice("/sessions watch".length).trim()));
+    const ticks: Array<{ tick: number; generatedAt: string; view: unknown }> = [];
+    const output: string[] = [];
+    for (let tick = 1; tick <= parsed.options.ticks; tick += 1) {
+      const view = await buildSessionList(platform.store, parsed.options);
+      const generatedAt = new Date().toISOString();
+      if (parsed.options.json) {
+        ticks.push({ tick, generatedAt, view });
+      } else {
+        output.push(`[watch:${tick}/${parsed.options.ticks}]\tsessions\t${generatedAt}`);
+        output.push(...await captureConsoleOutput(() => printSessionList(view)));
+      }
+      if (tick < parsed.options.ticks && parsed.options.intervalMs > 0) {
+        await sleepMilliseconds(parsed.options.intervalMs);
+      }
+    }
+    if (parsed.options.json) {
+      return {
+        handled: true,
+        output: [JSON.stringify({
+          ticks,
+          intervalMs: parsed.options.intervalMs,
+          limit: parsed.options.limit,
+          status: parsed.options.status,
+          targetMode: parsed.options.targetMode,
+        }, null, 2)],
+      };
+    }
+    return { handled: true, output };
+  } catch (error) {
+    return { handled: true, output: [error instanceof Error ? error.message : String(error)] };
+  }
+}
+
+function isTuiSessionsWatchCommand(line: string): boolean {
+  return line === "/sessions watch" || line.startsWith("/sessions watch ");
+}
+
+async function runTuiSessionWatchCommand(workspace: string, line: string): Promise<TuiSessionWatchCommandResult> {
+  if (!isTuiSessionWatchCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  const platform = await createLocalPlatform(workspace);
+  try {
+    return await runTuiSessionWatchCommandWithPlatform(platform, line);
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runTuiSessionWatchCommandWithPlatform(platform: LocalPlatform, line: string): Promise<TuiSessionWatchCommandResult> {
+  if (!isTuiSessionWatchCommand(line)) {
+    return { handled: false, output: [] };
+  }
+  try {
+    const parsed = parseTuiSessionWatchArgs(splitCliWords(line.slice("/session watch".length).trim()));
+    const sessionId = parsed.positionals[0];
+    if (!sessionId) {
+      return { handled: true, output: ["Usage: /session watch <session-id> [status|inspect|next|review|timeline] [--ticks n] [--interval-ms n] [--limit n] [--json]"] };
+    }
+    const kind = parsed.positionals[1] ? parseTuiSessionWatchKind(parsed.positionals[1]) : parsed.options.kind;
+    const ticks: Array<{ tick: number; generatedAt: string; kind: TuiSessionWatchKind; view: unknown }> = [];
+    const output: string[] = [];
+    for (let tick = 1; tick <= parsed.options.ticks; tick += 1) {
+      const view = await buildTuiSessionWatchView(platform.store, sessionId, kind, parsed.options.limit);
+      const generatedAt = new Date().toISOString();
+      if (parsed.options.json) {
+        ticks.push({ tick, generatedAt, kind, view });
+      } else {
+        output.push(`[watch:${tick}/${parsed.options.ticks}]\t${kind}\t${sessionId}\t${generatedAt}`);
+        output.push(...await captureConsoleOutput(() => printTuiSessionWatchView(kind, view)));
+      }
+      if (tick < parsed.options.ticks && parsed.options.intervalMs > 0) {
+        await sleepMilliseconds(parsed.options.intervalMs);
+      }
+    }
+    if (parsed.options.json) {
+      return {
+        handled: true,
+        output: [JSON.stringify({ sessionId, kind, ticks, intervalMs: parsed.options.intervalMs, limit: parsed.options.limit }, null, 2)],
+      };
+    }
+    return { handled: true, output };
+  } catch (error) {
+    return { handled: true, output: [error instanceof Error ? error.message : String(error)] };
+  }
+}
+
+function isTuiSessionWatchCommand(line: string): boolean {
+  return line === "/session watch" || line.startsWith("/session watch ");
+}
+
+async function buildTuiSessionWatchView(store: AgentStore, sessionId: string, kind: TuiSessionWatchKind, limit?: number): Promise<unknown> {
+  if (kind === "status") {
+    return buildSessionStatus(store, sessionId, { limit });
+  }
+  if (kind === "inspect") {
+    return buildSessionInspect(store, sessionId);
+  }
+  if (kind === "next") {
+    return buildSessionNext(store, sessionId);
+  }
+  if (kind === "review") {
+    return buildSessionReview(store, sessionId, { limit });
+  }
+  return buildSessionTimeline(store, sessionId, { limit });
+}
+
+function printTuiSessionWatchView(kind: TuiSessionWatchKind, view: unknown): void {
+  if (kind === "status") {
+    printSessionStatus(view as Awaited<ReturnType<typeof buildSessionStatus>>);
+    return;
+  }
+  if (kind === "inspect") {
+    printSessionInspect(view as Awaited<ReturnType<typeof buildSessionInspect>>);
+    return;
+  }
+  if (kind === "next") {
+    printSessionNext(view as Awaited<ReturnType<typeof buildSessionNext>>);
+    return;
+  }
+  if (kind === "review") {
+    printSessionReview(view as Awaited<ReturnType<typeof buildSessionReview>>);
+    return;
+  }
+  printSessionTimeline(view as Awaited<ReturnType<typeof buildSessionTimeline>>);
+}
+
+async function captureConsoleOutput(action: () => void | Promise<void>): Promise<string[]> {
+  const output: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    output.push(args.map((arg) => typeof arg === "string" ? arg : String(arg)).join(" "));
+  };
+  try {
+    await action();
+  } finally {
+    console.log = originalLog;
+  }
+  return output;
+}
 
 type TuiApprovalCommandResult = {
   handled: boolean;
@@ -13537,6 +14773,10 @@ function parsePositiveInteger(value: string, name: string): number {
   return parsed;
 }
 
+function sleepMilliseconds(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseRatio(value: string, name: string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
@@ -14221,6 +15461,7 @@ type LifecycleCliOptions = {
   json?: boolean;
   output?: string;
   limit?: number;
+  preset?: SessionVerificationPreset;
   requireChange?: boolean;
   requirePatch?: boolean;
   requireRecovery?: boolean;
@@ -14242,6 +15483,46 @@ function parseSessionListArgs(args: string[]): { options: SessionListOptions; po
     const next = args[index + 1];
     if (arg === "--json") {
       options.json = true;
+      continue;
+    }
+    if (arg === "--limit" && next) {
+      options.limit = parsePositiveInteger(next, "--limit");
+      index += 1;
+      continue;
+    }
+    if (arg === "--status" && next) {
+      options.status = parseSessionStatus(next);
+      index += 1;
+      continue;
+    }
+    if ((arg === "--target-mode" || arg === "--mode") && next) {
+      options.targetMode = parseSessionTargetMode(next);
+      index += 1;
+      continue;
+    }
+    positionals.push(arg);
+  }
+  return { options, positionals };
+}
+
+function parseTuiSessionsWatchArgs(args: string[]): { options: TuiSessionsWatchOptions; positionals: string[] } {
+  const options: TuiSessionsWatchOptions = { ticks: 3, intervalMs: 1000 };
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const next = args[index + 1];
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    if (arg === "--ticks" && next) {
+      options.ticks = parsePositiveInteger(next, "--ticks");
+      index += 1;
+      continue;
+    }
+    if (arg === "--interval-ms" && next) {
+      options.intervalMs = parseNonNegativeInteger(next, "--interval-ms");
+      index += 1;
       continue;
     }
     if (arg === "--limit" && next) {
@@ -14298,6 +15579,48 @@ function parseSessionTargetMode(value: string): NonNullable<SessionListOptions["
   throw new Error(`Invalid session target mode: ${value}.`);
 }
 
+function parseTuiSessionWatchArgs(args: string[]): { options: TuiSessionWatchOptions; positionals: string[] } {
+  const options: TuiSessionWatchOptions = { kind: "status", ticks: 3, intervalMs: 1000 };
+  const positionals: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    const next = args[index + 1];
+    if (arg === "--json") {
+      options.json = true;
+      continue;
+    }
+    if (arg === "--ticks" && next) {
+      options.ticks = parsePositiveInteger(next, "--ticks");
+      index += 1;
+      continue;
+    }
+    if (arg === "--interval-ms" && next) {
+      options.intervalMs = parseNonNegativeInteger(next, "--interval-ms");
+      index += 1;
+      continue;
+    }
+    if (arg === "--limit" && next) {
+      options.limit = parsePositiveInteger(next, "--limit");
+      index += 1;
+      continue;
+    }
+    if ((arg === "--kind" || arg === "--view") && next) {
+      options.kind = parseTuiSessionWatchKind(next);
+      index += 1;
+      continue;
+    }
+    positionals.push(arg);
+  }
+  return { options, positionals };
+}
+
+function parseTuiSessionWatchKind(value: string): TuiSessionWatchKind {
+  if (value === "status" || value === "inspect" || value === "next" || value === "review" || value === "timeline") {
+    return value;
+  }
+  throw new Error(`Invalid session watch view: ${value}.`);
+}
+
 function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; positionals: string[] } {
   const options: LifecycleCliOptions = {};
   const positionals: string[] = [];
@@ -14324,6 +15647,16 @@ function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; pos
     }
     if (arg === "--limit" && next) {
       options.limit = parsePositiveInteger(next, "--limit");
+      index += 1;
+      continue;
+    }
+    const presetValue = inlineOptionValue(arg, "--preset");
+    if (presetValue !== undefined) {
+      options.preset = parseSessionVerificationPreset(presetValue);
+      continue;
+    }
+    if (arg === "--preset" && next) {
+      options.preset = parseSessionVerificationPreset(next);
       index += 1;
       continue;
     }
@@ -14386,6 +15719,13 @@ function parseLifecycleArgs(args: string[]): { options: LifecycleCliOptions; pos
     positionals.push(arg);
   }
   return { options, positionals };
+}
+
+function parseSessionVerificationPreset(value: string): SessionVerificationPreset {
+  if (value === "handoff") {
+    return value;
+  }
+  throw new Error(`Invalid session verification preset: ${value}.`);
 }
 
 function parseRoomArgs(args: string[]): { options: RoomCliOptions; positionals: string[] } {

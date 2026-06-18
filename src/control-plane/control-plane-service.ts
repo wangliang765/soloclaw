@@ -13,7 +13,8 @@ import type { OperatorRowsOptions } from "../operator/operator-rows.js";
 import { collectOperatorRows } from "../operator/operator-rows.js";
 import { buildOperatorDetail } from "../operator/operator-detail.js";
 import { projectOperatorDetail, projectOperatorView, type OperatorProjectionMode } from "../operator/operator-access.js";
-import { buildSessionInspectView } from "../sessions/session-inspection-view.js";
+import { buildSessionBundleView, buildSessionDashboardView, buildSessionDiffView, buildSessionInspectView, buildSessionNextView, buildSessionReportView, buildSessionResultView, buildSessionReviewView, buildSessionStatusView, buildSessionVerificationView, type SessionBundleOptions, type SessionDashboardOptions, type SessionVerificationOptions } from "../sessions/session-inspection-view.js";
+import { buildSessionTimelineView } from "../sessions/session-timeline-view.js";
 import { replayApprovedTool } from "../tools/tool-replay.js";
 import { createWorkspaceTools } from "../tools/workspace-tools.js";
 
@@ -648,6 +649,82 @@ export class ControlPlaneService {
       return undefined;
     }
     return buildSessionInspectView(this.platform.store, sessionId);
+  }
+
+  async getSessionNext(sessionId: string) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionNextView(this.platform.store, sessionId);
+  }
+
+  async getSessionStatus(sessionId: string, options: { limit?: number } = {}) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionStatusView(this.platform.store, sessionId, options);
+  }
+
+  async getSessionResult(sessionId: string) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionResultView(this.platform.store, sessionId);
+  }
+
+  async getSessionDiff(sessionId: string) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionDiffView(this.platform.store, sessionId);
+  }
+
+  async getSessionReport(sessionId: string) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionReportView(this.platform.store, sessionId);
+  }
+
+  async getSessionVerification(sessionId: string, options: SessionVerificationOptions = {}) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionVerificationView(this.platform.store, sessionId, options);
+  }
+
+  async getSessionBundle(sessionId: string, options: SessionBundleOptions = {}) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionBundleView(this.platform.store, sessionId, options);
+  }
+
+  async getSessionTimeline(sessionId: string, options: { limit?: number } = {}) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionTimelineView(this.platform.store, sessionId, options);
+  }
+
+  async getSessionReview(sessionId: string, options: { limit?: number } = {}) {
+    const session = await this.platform.store.getSession(sessionId);
+    if (!session) {
+      return undefined;
+    }
+    return buildSessionReviewView(this.platform.store, sessionId, options);
+  }
+
+  async getSessionDashboard(options: SessionDashboardOptions = {}) {
+    return buildSessionDashboardView(this.platform.store, options);
   }
 
   async pauseSession(input: { sessionId: string; actor: ActorRef; reason?: string }) {
