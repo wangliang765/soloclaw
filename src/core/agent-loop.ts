@@ -4,12 +4,19 @@ import type { ActorRef, ExecutionTargetMode, Session } from "../domain/index.js"
 import { makeId } from "../domain/common.js";
 import type { AgentStore } from "../store/agent-store.js";
 import { TaskOperationsService } from "../tasks/task-operations-service.js";
+import { redactAgentEventText, summarizeToolInput } from "./agent-event-redaction.js";
+import type { AgentRunEvent, AgentRunEventSink } from "./agent-events.js";
+import { withEventDefaults } from "./agent-events.js";
 import { ContextManager } from "./context-manager.js";
 
 export type AgentContextAttachment = {
   label: string;
   content: string;
 };
+
+export type AgentLoopProgressEvent = AgentRunEvent;
+type WithoutRunDefaults<T> = T extends unknown ? Omit<T, "runId" | "createdAt"> & { runId?: string; createdAt?: string } : never;
+type AgentRunEventInput = WithoutRunDefaults<AgentRunEvent>;
 
 export type AgentLoopOptions = {
   model: ModelClient;
@@ -28,6 +35,7 @@ export type AgentLoopOptions = {
   targetMode?: ExecutionTargetMode;
   sessionScope?: Pick<Session, "orgId" | "projectId" | "roomId">;
   onSessionActivated?: (session: Session) => void;
+  onProgress?: AgentRunEventSink;
 };
 
 export class AgentLoop {
@@ -43,6 +51,8 @@ export class AgentLoop {
   private readonly targetMode: ExecutionTargetMode;
   private readonly sessionScope: Pick<Session, "orgId" | "projectId" | "roomId">;
   private readonly onSessionActivated?: (session: Session) => void;
+  private readonly onProgress?: AgentRunEventSink;
+  private readonly runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
   constructor(options: AgentLoopOptions) {
     this.model = options.model;
@@ -57,6 +67,7 @@ export class AgentLoop {
     this.selectedSkillIds = options.selectedSkillIds ?? [];
     this.sessionScope = options.sessionScope ?? {};
     this.onSessionActivated = options.onSessionActivated;
+    this.onProgress = options.onProgress;
   }
 
   async run(userTask: string): Promise<string> {
@@ -124,14 +135,21 @@ export class AgentLoop {
       this.onSessionActivated?.(session);
     }
 
-    const response = await this.completeModel({
-      messages: context.snapshot(),
-      tools: [],
-    }, session);
-    const content =
-      response.type === "message"
-        ? response.content
-        : response.content?.trim() || "Plan mode produced tool calls, but tools are disabled in plan mode. Please revise the plan without executing tools.";
+    let content = "";
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await this.completeModel({
+        messages: context.snapshot(),
+        tools: [],
+      }, session);
+      content =
+        response.type === "message"
+          ? response.content
+          : response.content?.trim() || "Plan mode produced tool calls, but tools are disabled in plan mode. Please revise the plan without executing tools.";
+      if (content.trim()) {
+        break;
+      }
+      await this.requestVisibleFinalAnswer(context, session);
+    }
 
     if (session) {
       await this.store?.appendMessage({ sessionId: session.id, message: { role: "assistant", content } });
@@ -151,12 +169,51 @@ export class AgentLoop {
       this.onSessionActivated?.(session);
     }
     for (let step = 0; step < this.maxSteps; step += 1) {
-      const response = await this.completeModel({
+      const stepNumber = step + 1;
+      const request = {
         messages: context.snapshot(),
         tools: [...this.tools.values()].map(({ handler: _handler, ...definition }) => definition),
-      }, session);
+      };
+      await this.emitProgress({
+        type: "step_started",
+        step: stepNumber,
+        sessionId: session?.id,
+      });
+      const modelStartedAt = Date.now();
+      let response: ModelResponse;
+      try {
+        response = await this.completeModel(request, session, stepNumber);
+      } catch (error) {
+        await this.emitProgress({
+          type: "model_failed",
+          step: stepNumber,
+          durationMs: Date.now() - modelStartedAt,
+          sessionId: session?.id,
+        });
+        throw error;
+      }
+      await this.emitProgress({
+        type: "model_finished",
+        step: stepNumber,
+        sessionId: session?.id,
+        responseType: response.type,
+        toolCallCount: response.type === "tool_calls" ? response.toolCalls.length : 0,
+        durationMs: Date.now() - modelStartedAt,
+        usage: response.metadata?.usage,
+      });
 
       if (response.type === "message") {
+        if (!response.content.trim()) {
+          await this.requestVisibleFinalAnswer(context, session, stepNumber);
+          continue;
+        }
+        await this.emitProgress({
+          type: "assistant_text",
+          step: stepNumber,
+          sessionId: session?.id,
+          text: response.content,
+          final: true,
+        });
         if (session) {
           await this.store?.appendMessage({ sessionId: session.id, message: { role: "assistant", content: response.content } });
           await this.store?.addSessionSummary({
@@ -179,9 +236,46 @@ export class AgentLoop {
       if (session) {
         await this.store?.appendMessage({ sessionId: session.id, message: assistantMessage });
       }
+      if (assistantMessage.content.trim()) {
+        await this.emitProgress({
+          type: "assistant_note",
+          step: stepNumber,
+          sessionId: session?.id,
+          text: assistantMessage.content,
+        });
+      }
 
       for (const toolCall of response.toolCalls) {
+        const display = summarizeToolInput(toolCall.name, toolCall.input);
+        await this.emitProgress({
+          type: "tool_started",
+          step: stepNumber,
+          sessionId: session?.id,
+          toolName: toolCall.name,
+          callId: toolCall.id,
+          title: display.title,
+          detailsHidden: display.detailsHidden ?? true,
+          paths: display.paths,
+        });
         const result = await this.runTool(toolCall);
+        const resultDisplay = result.display ?? display;
+        await this.emitProgress({
+          type: "tool_finished",
+          step: stepNumber,
+          sessionId: session?.id,
+          toolName: toolCall.name,
+          callId: toolCall.id,
+          title: resultDisplay.title,
+          status: result.ok ? "ok" : "failed",
+          detailsHidden: resultDisplay.detailsHidden ?? true,
+          errorCode: result.error?.code,
+          paths: resultDisplay.paths,
+          exitCode: resultDisplay.exitCode,
+          timedOut: resultDisplay.timedOut,
+          durationMs: resultDisplay.durationMs,
+          stdoutBytes: resultDisplay.stdoutBytes,
+          stderrBytes: resultDisplay.stderrBytes,
+        });
         const approvalId = approvalIdFromResult(result);
         const isWaitingForApproval = result.error?.code === "approval_required";
         if (!isWaitingForApproval) {
@@ -215,7 +309,21 @@ export class AgentLoop {
     if (session) {
       await this.store?.updateSessionStatus(session.id, "failed");
     }
-    return `Stopped after ${this.maxSteps} steps without a final answer.`;
+    await this.emitProgress({ type: "step_limit_reached", maxSteps: this.maxSteps, sessionId: session?.id });
+    return this.formatStepLimitStop(session);
+  }
+
+  private async requestVisibleFinalAnswer(context: ContextManager, session?: Session, step?: number): Promise<void> {
+    context.addUser(EMPTY_FINAL_RESPONSE_REPAIR_PROMPT);
+    if (session) {
+      await this.store?.appendMessage({ sessionId: session.id, message: { role: "user", content: EMPTY_FINAL_RESPONSE_REPAIR_PROMPT } });
+    }
+    const note = {
+      type: "assistant_note" as const,
+      sessionId: session?.id,
+      text: "Model returned an empty visible answer; requesting a concise final answer.",
+    };
+    await this.emitProgress({ ...note, step: step ?? 0 });
   }
 
   private async createSession(userTask: string): Promise<Session | undefined> {
@@ -234,7 +342,47 @@ export class AgentLoop {
       createdBy: this.actor,
     });
     this.onSessionActivated?.(session);
+    await this.emitProgress({ type: "session_started", sessionId: session.id, objective: userTask, targetMode: this.targetMode });
     return session;
+  }
+
+  private async emitProgress(event: AgentRunEventInput): Promise<void> {
+    const fullEvent = withEventDefaults({ runId: this.runId, ...event } as AgentRunEvent);
+    await this.onProgress?.(fullEvent);
+    await this.recordAgentRunEvent(fullEvent);
+  }
+
+  private async recordAgentRunEvent(event: AgentRunEvent): Promise<void> {
+    if (!this.store || !event.sessionId || event.type === "assistant_text" || event.type === "assistant_note") {
+      return;
+    }
+    const actor = this.actor ?? { type: "system" as const, id: "agent-loop" };
+    await this.store.recordAuditEvent({
+      id: makeId<"ArtifactId">("audit"),
+      type: "agent.event",
+      actor,
+      orgId: this.sessionScope.orgId,
+      projectId: this.sessionScope.projectId,
+      roomId: this.sessionScope.roomId,
+      sessionId: event.sessionId,
+      summary: `agent.event.${event.type}`,
+      metadata: safeAgentRunEventMetadata(event),
+      artifactRefs: [],
+      createdAt: event.createdAt ?? new Date().toISOString(),
+    });
+  }
+
+  private formatStepLimitStop(session?: Session): string {
+    const lines = [
+      `Stopped after ${this.maxSteps} steps without a final answer.`,
+      "The agent reached its step budget before the model returned a final response.",
+    ];
+    if (session) {
+      lines.push(`session: ${session.id}`);
+      lines.push(`timeline: agent session timeline ${session.id}`);
+      lines.push(`review: agent session review ${session.id}`);
+    }
+    return lines.join("\n");
   }
 
   private enrichUserTask(userTask: string): string {
@@ -286,10 +434,12 @@ export class AgentLoop {
     };
   }
 
-  private async completeModel(request: { messages: AgentMessage[]; tools: ToolDefinition[] }, session?: Session): Promise<ModelResponse> {
+  private async completeModel(request: { messages: AgentMessage[]; tools: ToolDefinition[] }, session?: Session, progressStep?: number): Promise<ModelResponse> {
     const startedAt = Date.now();
     try {
-      const response = await this.model.complete(request);
+      const response = this.model.streamComplete
+        ? await this.completeStreamingModel(request, session, progressStep)
+        : await this.model.complete(request);
       await this.auditModelCall({
         session,
         request,
@@ -308,6 +458,77 @@ export class AgentLoop {
       });
       throw error;
     }
+  }
+
+  private async completeStreamingModel(request: { messages: AgentMessage[]; tools: ToolDefinition[] }, session?: Session, progressStep?: number): Promise<ModelResponse> {
+    let finalResponse: ModelResponse | undefined;
+    let bufferedText = "";
+    let reasoningStartedAt: number | undefined;
+    let reasoningDeltaCount = 0;
+    for await (const event of this.model.streamComplete?.(request) ?? []) {
+      if (event.type === "text_delta") {
+        bufferedText += event.text;
+        if (reasoningStartedAt !== undefined && progressStep !== undefined) {
+          await this.emitProgress({
+            type: "reasoning_finished",
+            step: progressStep,
+            sessionId: session?.id,
+            publicSummary: "Thinking",
+            deltaCount: reasoningDeltaCount,
+            durationMs: Date.now() - reasoningStartedAt,
+          });
+          reasoningStartedAt = undefined;
+          reasoningDeltaCount = 0;
+        }
+        if (progressStep !== undefined && event.text) {
+          await this.emitProgress({
+            type: "assistant_text",
+            step: progressStep,
+            sessionId: session?.id,
+            text: event.text,
+          });
+        }
+        continue;
+      }
+      if (event.type === "reasoning_delta") {
+        if (progressStep !== undefined) {
+          if (reasoningStartedAt === undefined) {
+            reasoningStartedAt = Date.now();
+            await this.emitProgress({
+              type: "reasoning_started",
+              step: progressStep,
+              sessionId: session?.id,
+              publicSummary: "Thinking",
+            });
+          }
+          reasoningDeltaCount += 1;
+          await this.emitProgress({
+            type: "reasoning_delta",
+            step: progressStep,
+            sessionId: session?.id,
+            publicSummary: "Thinking",
+            deltaCount: reasoningDeltaCount,
+            elapsedMs: Date.now() - reasoningStartedAt,
+          });
+        }
+        continue;
+      }
+      if (event.type === "tool_call_delta") {
+        continue;
+      }
+      finalResponse = event;
+    }
+    if (reasoningStartedAt !== undefined && progressStep !== undefined) {
+      await this.emitProgress({
+        type: "reasoning_finished",
+        step: progressStep,
+        sessionId: session?.id,
+        publicSummary: "Thinking",
+        deltaCount: reasoningDeltaCount,
+        durationMs: Date.now() - reasoningStartedAt,
+      });
+    }
+    return finalResponse ?? { type: "message", content: bufferedText };
   }
 
   private async auditModelCall(input: {
@@ -360,6 +581,117 @@ function approvalIdFromResult(result: { data?: unknown }): string | undefined {
   return typeof result.data === "object" && result.data !== null && "approvalId" in result.data ? String(result.data.approvalId) : undefined;
 }
 
+function safeAgentRunEventMetadata(event: AgentRunEvent): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    eventType: event.type,
+    runId: event.runId,
+    sessionId: event.sessionId,
+    createdAt: event.createdAt,
+  };
+  switch (event.type) {
+    case "session_started":
+      return {
+        ...base,
+        objective: redactAgentEventText(event.objective),
+        targetMode: event.targetMode,
+      };
+    case "step_started":
+      return {
+        ...base,
+        step: event.step,
+        provider: event.provider,
+        model: event.model,
+      };
+    case "model_finished":
+      return {
+        ...base,
+        step: event.step,
+        responseType: event.responseType,
+        toolCallCount: event.toolCallCount,
+        durationMs: event.durationMs,
+        usage: event.usage,
+      };
+    case "model_failed":
+      return {
+        ...base,
+        step: event.step,
+        durationMs: event.durationMs,
+      };
+    case "reasoning_started":
+      return {
+        ...base,
+        step: event.step,
+        publicSummary: redactAgentEventText(event.publicSummary),
+      };
+    case "reasoning_delta":
+      return {
+        ...base,
+        step: event.step,
+        publicSummary: redactAgentEventText(event.publicSummary),
+        deltaCount: event.deltaCount,
+        elapsedMs: event.elapsedMs,
+      };
+    case "reasoning_finished":
+      return {
+        ...base,
+        step: event.step,
+        publicSummary: redactAgentEventText(event.publicSummary),
+        deltaCount: event.deltaCount,
+        durationMs: event.durationMs,
+      };
+    case "tool_started":
+      return {
+        ...base,
+        step: event.step,
+        callId: event.callId,
+        toolName: event.toolName,
+        tool: event.toolName,
+        title: redactAgentEventText(event.title),
+        detailsHidden: event.detailsHidden,
+        paths: event.paths?.map(redactAgentEventText),
+      };
+    case "tool_finished":
+      return {
+        ...base,
+        step: event.step,
+        callId: event.callId,
+        toolName: event.toolName,
+        tool: event.toolName,
+        title: redactAgentEventText(event.title),
+        status: event.status,
+        ok: event.status === "ok",
+        detailsHidden: event.detailsHidden,
+        errorCode: event.errorCode,
+        paths: event.paths?.map(redactAgentEventText),
+        exitCode: event.exitCode,
+        timedOut: event.timedOut,
+        durationMs: event.durationMs,
+        stdoutBytes: event.stdoutBytes,
+        stderrBytes: event.stderrBytes,
+      };
+    case "file_changed":
+      return {
+        ...base,
+        step: event.step,
+        path: redactAgentEventText(event.path),
+        change: event.change,
+      };
+    case "step_limit_reached":
+      return {
+        ...base,
+        maxSteps: event.maxSteps,
+      };
+    case "run_failed":
+      return {
+        ...base,
+        message: redactAgentEventText(event.message),
+      };
+    case "assistant_text":
+    case "assistant_note":
+      return base;
+  }
+}
+
 function safeModelError(error: unknown): Record<string, unknown> {
   const record = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
   return {
@@ -372,11 +704,18 @@ function safeModelError(error: unknown): Record<string, unknown> {
 const PLAN_MODE_PROMPT = `Target mode: plan.
 Do not execute tools. Do not modify files. Produce a concrete implementation plan, call out risks and verification steps, and stop.`;
 
+const EMPTY_FINAL_RESPONSE_REPAIR_PROMPT =
+  "Your previous response had no visible final answer. Return a concise visible final answer now. Do not call tools.";
+
 const BUILD_MODE_TASK_PREFIX = `Target mode: build.
-Execute the user's current request using available tools when needed. Keep the scope tied to the current prompt.`;
+Execute the user's current request using available tools when needed. Keep the scope tied to the current prompt.
+Use file tools such as create_file, replace_range, and apply_patch for workspace file changes; reserve run_command for verification or commands that cannot be expressed with file tools.
+When you verify work with a command, choose a command that must exit 0 when the intended condition is satisfied; for absence checks, wrap the check so expected absence exits 0.`;
 
 const GOAL_MODE_TASK_PREFIX = `Target mode: goal.
-Work toward the stated objective persistently. First form a concise plan, then execute it step by step with available tools. Update the plan as evidence changes, verify progress before claiming success, and continue until the objective is genuinely completed, blocked by required input, or stopped by policy.`;
+Work toward the stated objective persistently. First form a concise plan, then execute it step by step with available tools. Update the plan as evidence changes, verify progress before claiming success, and continue until the objective is genuinely completed, blocked by required input, or stopped by policy.
+Use file tools such as create_file, replace_range, and apply_patch for workspace file changes; reserve run_command for verification or commands that cannot be expressed with file tools. Use .agent/tmp for temporary evidence files when the task needs local scratch output.
+When you verify work with a command, choose a command that must exit 0 when the intended condition is satisfied; for absence checks, wrap the check so expected absence exits 0.`;
 
 function formatPlanTask(userTask: string): string {
   return `Create an implementation plan for this objective. Do not execute tools or make changes.\n\nObjective:\n${userTask}`;

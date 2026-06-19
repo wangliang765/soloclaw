@@ -76,15 +76,16 @@ export async function buildSessionTimelineView(store: AgentStore, sessionId: str
 }
 
 export function timelineItemFromAudit(event: AuditEvent): Omit<SessionTimelineItem, "ordinal"> {
+  const agentEventType = typeof event.metadata?.eventType === "string" ? event.metadata.eventType : undefined;
   return {
     kind: "audit",
     createdAt: event.createdAt,
     sourceId: event.id,
     actor: actorLabel(event.actor),
-    title: event.type,
+    title: event.type === "agent.event" && agentEventType ? `agent.event.${agentEventType}` : event.type,
     summary: event.summary,
     action: typeof event.metadata?.action === "string" ? event.metadata.action : undefined,
-    toolName: typeof event.metadata?.tool === "string" ? event.metadata.tool : undefined,
+    toolName: typeof event.metadata?.toolName === "string" ? event.metadata.toolName : typeof event.metadata?.tool === "string" ? event.metadata.tool : undefined,
     command: typeof event.metadata?.command === "string" ? event.metadata.command : undefined,
     exitCode: commandExitCode(event.metadata),
     timedOut: commandTimedOut(event.metadata),
@@ -167,7 +168,35 @@ function safeTimelineMetadata(metadata: Record<string, unknown> | undefined): Re
     return undefined;
   }
   const safe: Record<string, unknown> = {};
-  for (const key of ["action", "tool", "ok", "exitCode", "timedOut", "durationMs", "executionProfile", "stdoutBytes", "stderrBytes", "approvalId"]) {
+  for (const key of [
+    "action",
+    "tool",
+    "toolName",
+    "eventType",
+    "runId",
+    "sessionId",
+    "step",
+    "title",
+    "status",
+    "detailsHidden",
+    "paths",
+    "path",
+    "change",
+    "ok",
+    "errorCode",
+    "exitCode",
+    "timedOut",
+    "durationMs",
+    "responseType",
+    "toolCallCount",
+    "maxSteps",
+    "provider",
+    "model",
+    "executionProfile",
+    "stdoutBytes",
+    "stderrBytes",
+    "approvalId",
+  ]) {
     const value = metadata[key];
     if (value !== undefined) {
       safe[key] = value;

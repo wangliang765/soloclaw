@@ -13,6 +13,7 @@ import {
   requiredString,
 } from "../control-plane/control-plane-service.js";
 import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, PolicyAction, RoomDeliveryAckEnvelope, RoomMemberStatus, RoomRole, Session } from "../domain/index.js";
+import type { LocalEventBus } from "../events/local-event-bus.js";
 import type { OperatorItemKind, OperatorSeverity, OperatorStatus } from "../operator/operator-view-models.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
 import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
@@ -21,14 +22,17 @@ export type LocalRoomWebServerOptions = {
   host?: string;
   port?: number;
   token?: string;
+  eventBus?: LocalEventBus;
 };
 
 export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWebServerOptions = {}) {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 4317;
   const token = options.token ?? process.env.AGENT_WEB_TOKEN ?? randomBytes(24).toString("base64url");
-  const platform = await createLocalPlatform(cwd);
+  const eventBus = options.eventBus;
+  const platform = await createLocalPlatform(cwd, { eventBus });
   const control = new ControlPlaneService(platform);
+  const eventUnsubscribers = new Set<() => void>();
 
   const server = createServer(async (request, response) => {
     try {
@@ -48,6 +52,12 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
       }
       if (request.method === "GET" && url.pathname === "/api/health") {
         sendJson(response, await control.getHealth());
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/api/events") {
+        sendEventStream(response, eventBus, eventUnsubscribers, {
+          sessionId: url.searchParams.get("session") ?? undefined,
+        });
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/state") {
@@ -738,6 +748,10 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
   const actualPort = address.port;
   const baseUrl = `http://${host}:${actualPort}`;
   const close = async () => {
+    for (const unsubscribe of eventUnsubscribers) {
+      unsubscribe();
+    }
+    eventUnsubscribers.clear();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => {
         if (error) {
@@ -781,6 +795,35 @@ function sendNoContent(response: ServerResponse): void {
     "cache-control": "no-store",
   });
   response.end();
+}
+
+function sendEventStream(
+  response: ServerResponse,
+  eventBus: LocalEventBus | undefined,
+  unsubscribers: Set<() => void>,
+  filters: { sessionId?: string } = {},
+): void {
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store",
+    connection: "keep-alive",
+  });
+  response.write(": connected\n\n");
+  if (!eventBus) {
+    return;
+  }
+  const unsubscribe = eventBus.subscribe((event) => {
+    if (filters.sessionId && event.sessionId !== filters.sessionId) {
+      return;
+    }
+    response.write("event: message\n");
+    response.write(`data: ${JSON.stringify(event)}\n\n`);
+  });
+  unsubscribers.add(unsubscribe);
+  response.on("close", () => {
+    unsubscribe();
+    unsubscribers.delete(unsubscribe);
+  });
 }
 
 function httpErrorStatus(error: unknown): number {
@@ -1154,6 +1197,14 @@ export function renderAppHtml(): string {
     .operator-card { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: grid; gap: 6px; }
     .operator-card.warning { border-color: #e8c873; background: #fffdf4; }
     .operator-card.critical { border-color: #efb4ad; background: #fff8f7; }
+    .agent-event-stream { display: grid; gap: 7px; }
+    .agent-event-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
+    .agent-event-row { border-left: 3px solid var(--line); background: #fff; padding: 7px 8px; display: grid; gap: 3px; min-width: 0; }
+    .agent-event-row.tool, .agent-event-row.file { border-left-color: var(--accent); }
+    .agent-event-row.error { border-left-color: var(--danger); }
+    .agent-event-row.reasoning, .agent-event-row.status { border-left-color: #9fb3bf; }
+    .agent-event-title { font-weight: 700; overflow-wrap: anywhere; }
+    .agent-event-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .operator-detail { margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 10px; display: grid; gap: 7px; }
     .operator-detail-head { display: grid; gap: 4px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
     .operator-detail-title { font-weight: 700; overflow-wrap: anywhere; }
@@ -1295,6 +1346,13 @@ export function renderAppHtml(): string {
         <div class="queue" id="audit"></div>
       </section>
       <section class="section">
+        <div class="section-heading">
+          <h2>Agent Event Stream</h2>
+          <span class="meta" id="agent-event-stream-status">connecting</span>
+        </div>
+        <div class="agent-event-stream" id="agent-event-stream"></div>
+      </section>
+      <section class="section">
         <h2>Approvals</h2>
         <div class="queue" id="approvals"></div>
       </section>
@@ -1343,6 +1401,7 @@ export function renderAppHtml(): string {
     let selectedSessionInspectionId = null;
     let selectedSessionInspectionKind = null;
     let sessionDashboard = null;
+    const agentEventRows = [];
     const controlToken = new URLSearchParams(window.location.search).get('token') || '';
 
     function apiFetch(path, options = {}) {
@@ -1371,6 +1430,7 @@ export function renderAppHtml(): string {
       renderArtifacts();
       renderRetention();
       renderAudit();
+      renderAgentEventStream();
       renderApprovals();
       renderSessions();
       renderSessionInspection();
@@ -1688,6 +1748,88 @@ export function renderAppHtml(): string {
       for (const event of events.slice(0, 8)) {
         root.append(operatorItem(event));
       }
+    }
+
+    function connectAgentEventStream() {
+      const status = document.getElementById('agent-event-stream-status');
+      if (!window.EventSource || !controlToken) {
+        status.textContent = 'unavailable';
+        renderAgentEventStream();
+        return;
+      }
+      const stream = new EventSource('/api/events?token=' + encodeURIComponent(controlToken));
+      stream.onopen = () => { status.textContent = 'live'; };
+      stream.onerror = () => { status.textContent = 'reconnecting'; };
+      stream.onmessage = (message) => {
+        try {
+          const event = JSON.parse(message.data);
+          agentEventRows.unshift(projectAgentEventForWeb(event));
+          agentEventRows.splice(12);
+          renderAgentEventStream();
+        } catch {
+          status.textContent = 'parse error';
+        }
+      };
+    }
+
+    function renderAgentEventStream() {
+      const root = document.getElementById('agent-event-stream');
+      root.textContent = '';
+      if (agentEventRows.length === 0) {
+        root.append(empty('No agent events yet'));
+        return;
+      }
+      for (const event of agentEventRows) {
+        const item = document.createElement('div');
+        item.className = 'agent-event-row ' + event.kind;
+        item.append(text('div', event.title, 'agent-event-title'));
+        item.append(text('div', event.meta, 'agent-event-meta'));
+        root.append(item);
+      }
+    }
+
+    function projectAgentEventForWeb(event) {
+      const step = event.step !== undefined ? 'step=' + event.step : null;
+      const session = event.sessionId ? 'session=' + event.sessionId : null;
+      const duration = event.durationMs !== undefined ? event.durationMs + 'ms' : event.elapsedMs !== undefined ? event.elapsedMs + 'ms' : null;
+      const safePaths = Array.isArray(event.paths) && event.paths.length > 0 ? 'paths=' + event.paths.join(',') : event.path ? 'path=' + event.path : null;
+      switch (event.type) {
+        case 'tool_started':
+          return safeAgentEventRow('tool', event.title || event.toolName || 'Tool started', [step, event.toolName, safePaths, 'details hidden', session]);
+        case 'tool_finished':
+          return safeAgentEventRow('tool', event.title || event.toolName || 'Tool finished', [step, event.status, event.exitCode !== undefined ? 'exit=' + (event.exitCode ?? '-') : null, duration, safePaths, 'details hidden', session]);
+        case 'file_changed':
+          return safeAgentEventRow('file', event.change + ' ' + event.path, [step, session]);
+        case 'assistant_text':
+          return safeAgentEventRow('status', event.final ? 'Assistant answer' : 'Assistant writing', [step, session]);
+        case 'reasoning_started':
+        case 'reasoning_delta':
+        case 'reasoning_finished':
+          return safeAgentEventRow('reasoning', event.publicSummary || 'Thinking', [step, event.deltaCount !== undefined ? 'parts=' + event.deltaCount : null, duration, session]);
+        case 'model_finished':
+          return safeAgentEventRow('status', 'Model ' + event.responseType, [step, 'tools=' + event.toolCallCount, duration, session]);
+        case 'model_failed':
+        case 'run_failed':
+          return safeAgentEventRow('error', event.type === 'run_failed' ? 'Run failed' : 'Model failed', [step, duration, session]);
+        case 'step_limit_reached':
+          return safeAgentEventRow('error', 'Step budget reached', ['max=' + event.maxSteps, session]);
+        case 'session_started':
+          return safeAgentEventRow('status', 'Session started', [event.targetMode, session]);
+        case 'step_started':
+          return safeAgentEventRow('reasoning', 'Thinking step ' + event.step, [event.provider, event.model, session]);
+        case 'assistant_note':
+          return safeAgentEventRow('status', 'Assistant note', [step, session]);
+        default:
+          return safeAgentEventRow('status', event.type || 'agent.event', [step, session]);
+      }
+    }
+
+    function safeAgentEventRow(kind, title, values) {
+      return {
+        kind,
+        title: String(title || 'agent.event'),
+        meta: values.filter(Boolean).join(' | ') || 'safe event',
+      };
     }
 
     function renderOperator() {
@@ -3161,6 +3303,7 @@ export function renderAppHtml(): string {
     document.getElementById('session-dashboard-target-mode').onchange = loadSessionDashboard;
     document.getElementById('session-inspection-refresh').onclick = refreshSelectedSessionInspection;
     setInterval(refreshOpenSessionViews, 5000);
+    connectAgentEventStream();
     loadState();
 
     function row(left, right, className) {

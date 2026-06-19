@@ -1,4 +1,4 @@
-import type { AuditEvent, PolicyAction, Session } from "../domain/index.js";
+import type { AuditEvent, FileChange, PolicyAction, Session } from "../domain/index.js";
 import { ModelUsageService } from "../model/model-usage-service.js";
 import type { AgentStore } from "../store/agent-store.js";
 import type { CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
@@ -154,6 +154,8 @@ type SessionInspectionSnapshot = {
     modelSuccessfulCalls: number;
     modelCallsWithUsage: number;
     modelTotalTokens: number;
+    finalAnswerChars: number;
+    finalAnswerState: "visible" | "empty" | "missing";
     reviewProfile: UnifiedDiffReviewProfile;
     nextActionStatuses: Record<string, number>;
     lastCommand?: SessionCommandSummary;
@@ -276,8 +278,10 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
       stats: summarizeUnifiedDiffPatch(patch),
     };
   });
-  const diffStats = mergeDiffStats(patchDiffs.map((patch) => patch.stats));
-  const fileSummaries = summarizeDiffFileSummaries(patchDiffs);
+  const fileChangeDiffs = patchDiffs.length === 0 ? summarizeFileChangeDiffs(fileChanges, patchDiffs.length + 1) : [];
+  const diffSources = [...patchDiffs, ...fileChangeDiffs];
+  const diffStats = mergeDiffStats(diffSources.map((patch) => patch.stats));
+  const fileSummaries = summarizeDiffFileSummaries(diffSources);
   const reviewProfile = buildDiffReviewProfile({ patches: patchDiffs.length, diffStats, fileSummaries });
   const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
@@ -507,6 +511,12 @@ export async function buildSessionVerificationView(store: AgentStore, sessionId:
     label: "session succeeded",
     status: result.summary.outcome === "succeeded" ? "pass" : "fail",
     summary: `outcome=${result.summary.outcome}, status=${result.summary.status}`,
+  });
+  checks.push({
+    id: "final-answer-visible",
+    label: "final answer visible",
+    status: result.summary.finalAnswerState === "empty" ? "fail" : "pass",
+    summary: `state=${result.summary.finalAnswerState}, visibleChars=${result.summary.finalAnswerChars}`,
   });
   checks.push({
     id: "tools-clean",
@@ -773,8 +783,10 @@ export async function buildSessionDiffView(store: AgentStore, sessionId: string)
       patch,
     };
   });
-  const diffStats = mergeDiffStats(patches.map((patch) => patch.stats));
-  const fileSummaries = summarizeDiffFileSummaries(patches);
+  const fileChangeDiffs = patches.length === 0 ? summarizeFileChangeDiffs(fileChanges, patches.length + 1) : [];
+  const diffSources = [...patches, ...fileChangeDiffs];
+  const diffStats = mergeDiffStats(diffSources.map((patch) => patch.stats));
+  const fileSummaries = summarizeDiffFileSummaries(diffSources);
   const reviewProfile = buildDiffReviewProfile({ patches: patches.length, diffStats, fileSummaries });
   const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
   const changedPaths = [...new Set(fileChanges.map((change) => change.path))].sort();
@@ -1095,6 +1107,7 @@ async function buildSessionInspectionSnapshot(store: AgentStore, sessionId: stri
   }
 
   const toolResults = await store.getToolResults(sessionId);
+  const messages = await store.getMessages(sessionId);
   const fileChanges = await store.listFileChanges(sessionId);
   const auditEvents = await store.listAuditEvents({ sessionId, limit: 1000 });
   const modelUsage = await new ModelUsageService(store).summarize({ filters: { sessionId, limit: 1000 } });
@@ -1131,17 +1144,25 @@ async function buildSessionInspectionSnapshot(store: AgentStore, sessionId: stri
       stats: summarizeUnifiedDiffPatch(patch),
     };
   });
-  const diffStats = mergeDiffStats(patchDiffs.map((patch) => patch.stats));
-  const fileSummaries = summarizeDiffFileSummaries(patchDiffs);
+  const fileChangeDiffs = patchDiffs.length === 0 ? summarizeFileChangeDiffs(fileChanges, patchDiffs.length + 1) : [];
+  const diffSources = [...patchDiffs, ...fileChangeDiffs];
+  const diffStats = mergeDiffStats(diffSources.map((patch) => patch.stats));
+  const fileSummaries = summarizeDiffFileSummaries(diffSources);
   const reviewProfile = buildDiffReviewProfile({ patches: patchDiffs.length, diffStats, fileSummaries });
   const pendingApprovalIds = approvals.filter((approval) => approval.status === "pending").map((approval) => approval.id);
   const failedToolResults = toolResults.filter((result) => !result.ok);
+  const finalAssistantMessage = messages
+    .filter((message) => message.role === "assistant" && !message.toolCalls?.length)
+    .at(-1);
+  const finalAnswerChars = finalAssistantMessage?.content.trim().length ?? 0;
+  const finalAnswerState = finalAssistantMessage ? finalAnswerChars > 0 ? "visible" : "empty" : "missing";
   const nextActions = buildSessionNextActions(sessionId, {
     outcome,
     sessionStatus: session.status,
     pendingApprovalIds,
     changedPaths,
     patches: patchDiffs.length,
+    diffFiles: diffStats.files,
     commandsFinished: finishedCommands.length,
     failedCommands: failedCommands.length,
     timedOutCommands: timedOutCommands.length,
@@ -1184,6 +1205,8 @@ async function buildSessionInspectionSnapshot(store: AgentStore, sessionId: stri
       modelSuccessfulCalls: modelUsage.totals.successfulCalls,
       modelCallsWithUsage: modelUsage.totals.callsWithUsage,
       modelTotalTokens: modelUsage.totals.totalTokens,
+      finalAnswerChars,
+      finalAnswerState,
       reviewProfile,
       nextActionStatuses: countNextActionStatuses(nextActions),
       lastCommand: commandSummaries.at(-1),
@@ -1291,6 +1314,7 @@ function buildSessionNextActions(sessionId: string, input: {
   pendingApprovalIds: string[];
   changedPaths: string[];
   patches: number;
+  diffFiles: number;
   commandsFinished: number;
   failedCommands: number;
   timedOutCommands: number;
@@ -1332,7 +1356,7 @@ function buildSessionNextActions(sessionId: string, input: {
       label: "Review persisted diff",
       status: "recommended",
       command: `agent session diff ${sessionId}`,
-      reason: `${input.changedPaths.length} changed path(s) and ${input.patches} persisted patch(es) are available for review.`,
+      reason: `${input.changedPaths.length} changed path(s), ${input.patches} persisted patch(es), and ${input.diffFiles} diff-summary file(s) are available for review.`,
     });
   }
   if (input.timedOutCommands > 0) {
@@ -1364,6 +1388,7 @@ function buildSessionNextActions(sessionId: string, input: {
 function buildSessionVerifyNextActionCommand(sessionId: string, input: {
   changedPaths: string[];
   patches: number;
+  diffFiles: number;
   failedCommands: number;
   timedOutCommands: number;
   modelCalls: number;
@@ -1374,7 +1399,10 @@ function buildSessionVerifyNextActionCommand(sessionId: string, input: {
     flags.push("--require-change");
   }
   if (input.patches > 0) {
-    flags.push("--require-patch", "--require-diff-stat", "--require-review-profile");
+    flags.push("--require-patch");
+  }
+  if (input.diffFiles > 0) {
+    flags.push("--require-diff-stat", "--require-review-profile");
   }
   if (input.failedCommands > 0 && input.recovered) {
     flags.push("--require-recovery");
@@ -1407,8 +1435,8 @@ function effectiveSessionVerificationOptions(
     ...options,
     requireChange: options.requireChange ?? snapshot.summary.changedPaths.length > 0,
     requirePatch: options.requirePatch ?? snapshot.summary.patches > 0,
-    requireDiffStat: options.requireDiffStat ?? snapshot.summary.patches > 0,
-    requireReviewProfile: options.requireReviewProfile ?? snapshot.summary.patches > 0,
+    requireDiffStat: options.requireDiffStat ?? snapshot.summary.diffStats.files > 0,
+    requireReviewProfile: options.requireReviewProfile ?? snapshot.summary.reviewProfile.files > 0,
     requireRecovery: options.requireRecovery ?? (snapshot.summary.failedCommands > 0 && snapshot.summary.recovered),
     requireTimeout: options.requireTimeout ?? snapshot.summary.timedOutCommands > 0,
     requireModelCall: options.requireModelCall ?? snapshot.summary.modelCalls > 0,
@@ -1723,6 +1751,76 @@ function auditPatchInput(metadata: Record<string, unknown> | undefined): string 
   return typeof patch === "string" ? patch : undefined;
 }
 
+function summarizeFileChangeDiffs(fileChanges: FileChange[], startOrdinal: number): Array<{ ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }> {
+  const summaries: Array<{ ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }> = [];
+  let ordinal = startOrdinal;
+  for (const change of fileChanges.slice().sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+    const summary = summarizeFileChangeDiff(change, ordinal);
+    if (summary) {
+      summaries.push(summary);
+      ordinal += 1;
+    }
+  }
+  return summaries;
+}
+
+function summarizeFileChangeDiff(change: FileChange, ordinal: number): { ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType } | undefined {
+  if (change.kind === "patch") {
+    return undefined;
+  }
+  const pathStats = fileChangePathStats(change);
+  if (!pathStats) {
+    return undefined;
+  }
+  const byPath = new Map<string, UnifiedDiffPathStats>();
+  byPath.set(pathStats.path, {
+    path: pathStats.path,
+    additions: pathStats.additions,
+    deletions: pathStats.deletions,
+  });
+  return {
+    ordinal,
+    stats: diffStatsFromMap(byPath),
+    changeType: pathStats.changeType,
+  };
+}
+
+function fileChangePathStats(change: FileChange): (UnifiedDiffPathStats & { changeType: UnifiedDiffChangeType }) | undefined {
+  if (change.kind === "replace_range") {
+    const replacedLines = replacedLineCount(change.summary);
+    return { path: change.path, additions: replacedLines, deletions: replacedLines, changeType: "modified" };
+  }
+  if (change.kind === "create") {
+    const isOverwrite = Boolean(change.beforeHash);
+    return {
+      path: change.path,
+      additions: 1,
+      deletions: isOverwrite ? 1 : 0,
+      changeType: isOverwrite ? "modified" : "added",
+    };
+  }
+  if (change.kind === "delete") {
+    return { path: change.path, additions: 0, deletions: 1, changeType: "deleted" };
+  }
+  if (change.kind === "rename") {
+    return { path: change.path, additions: 1, deletions: 1, changeType: "renamed" };
+  }
+  return undefined;
+}
+
+function replacedLineCount(summary: string): number {
+  const match = /replaced lines (\d+)-(\d+)/i.exec(summary);
+  if (!match) {
+    return 1;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) {
+    return 1;
+  }
+  return Math.max(1, end - start + 1);
+}
+
 function summarizeUnifiedDiffPatch(patch: string | undefined): UnifiedDiffStats {
   if (!patch) {
     return emptyDiffStats();
@@ -1933,7 +2031,7 @@ function diffInspectionReason(summary: UnifiedDiffFileSummary): string {
   return `${size}; confirm intent, tests, and nearby behavior.`;
 }
 
-function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: string; stats: UnifiedDiffStats }>): UnifiedDiffFileSummary[] {
+function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: string; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }>): UnifiedDiffFileSummary[] {
   const byPath = new Map<string, {
     path: string;
     additions: number;
@@ -1962,7 +2060,7 @@ function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: st
       target.patches += 1;
       target.firstPatchOrdinal = Math.min(target.firstPatchOrdinal, patch.ordinal);
       target.lastPatchOrdinal = Math.max(target.lastPatchOrdinal, patch.ordinal);
-      target.changeTypes.add(changeTypes.get(entry.path) ?? "modified");
+      target.changeTypes.add(changeTypes.get(entry.path) ?? patch.changeType ?? "modified");
       byPath.set(entry.path, target);
     }
   }

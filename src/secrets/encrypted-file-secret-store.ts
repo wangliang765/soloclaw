@@ -21,10 +21,35 @@ type EncryptedVaultFile = {
 
 export type EncryptedFileSecretStoreOptions = {
   passphraseEnv?: string;
+  passphraseFile?: string;
 };
+
+const DEFAULT_PASSPHRASE_FILE_NAME = "secrets.key";
+
+export function localSecretVaultPassphraseFile(cwd: string): string {
+  return path.join(cwd, ".agent", DEFAULT_PASSPHRASE_FILE_NAME);
+}
+
+export function localSecretVaultStoreOptions(cwd: string): EncryptedFileSecretStoreOptions {
+  return { passphraseFile: localSecretVaultPassphraseFile(cwd) };
+}
+
+export function ensureLocalSecretVaultPassphraseFile(cwd: string): string {
+  const passphraseFile = localSecretVaultPassphraseFile(cwd);
+  if (!existsSync(passphraseFile)) {
+    mkdirSync(path.dirname(passphraseFile), { recursive: true, mode: 0o700 });
+    writeFileSync(passphraseFile, `${randomBytes(32).toString("base64url")}\n`, { mode: 0o600 });
+  }
+  const passphrase = readFileSync(passphraseFile, "utf8").trim();
+  if (passphrase.length < 12) {
+    throw new Error(`Invalid secret vault key file: ${passphraseFile}`);
+  }
+  return passphraseFile;
+}
 
 export class EncryptedFileSecretStore implements SecretStore {
   private readonly passphraseEnv: string;
+  private readonly passphraseFile?: string;
   private readonly leases = new Set<string>();
 
   constructor(
@@ -32,6 +57,7 @@ export class EncryptedFileSecretStore implements SecretStore {
     options: EncryptedFileSecretStoreOptions = {},
   ) {
     this.passphraseEnv = options.passphraseEnv ?? "AGENT_SECRETS_PASSPHRASE";
+    this.passphraseFile = options.passphraseFile;
   }
 
   async putSecret(input: PutSecretInput): Promise<SecretRef> {
@@ -130,13 +156,24 @@ export class EncryptedFileSecretStore implements SecretStore {
   }
 
   private deriveKey(salt: Buffer): Buffer {
-    const passphrase = process.env[this.passphraseEnv];
+    const { passphrase, source } = this.resolvePassphrase();
     if (!passphrase) {
-      throw new Error(`Missing ${this.passphraseEnv}; refusing to open encrypted secret vault.`);
+      throw new Error(`Missing ${source}; refusing to open encrypted secret vault.`);
     }
     if (passphrase.length < 12) {
-      throw new Error(`${this.passphraseEnv} must be at least 12 characters.`);
+      throw new Error(`${source} must be at least 12 characters.`);
     }
     return scryptSync(passphrase, salt, 32);
+  }
+
+  private resolvePassphrase(): { passphrase?: string; source: string } {
+    const envPassphrase = process.env[this.passphraseEnv];
+    if (envPassphrase) {
+      return { passphrase: envPassphrase, source: this.passphraseEnv };
+    }
+    if (this.passphraseFile && existsSync(this.passphraseFile)) {
+      return { passphrase: readFileSync(this.passphraseFile, "utf8").trim(), source: this.passphraseFile };
+    }
+    return { source: this.passphraseFile ? `${this.passphraseEnv} or ${this.passphraseFile}` : this.passphraseEnv };
   }
 }

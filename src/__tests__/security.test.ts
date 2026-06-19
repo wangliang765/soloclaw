@@ -40,9 +40,10 @@ import type { RegisteredTool } from "../protocol/types.js";
 import { DefaultPolicyEngine } from "../policy/default-policy-engine.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
 import { createWorkspaceTools } from "../tools/workspace-tools.js";
-import { withPolicy } from "../tools/policy-tools.js";
+import { policyActionForWorkspaceCommand, withPolicy } from "../tools/policy-tools.js";
 import { OrganizationService } from "../organizations/organization-service.js";
 import { BasicRedactor } from "../secrets/basic-redactor.js";
+import { ensureLocalSecretVaultPassphraseFile } from "../secrets/encrypted-file-secret-store.js";
 import { MemorySecretStore } from "../secrets/memory-secret-store.js";
 import { PolicySecretBroker } from "../secrets/policy-secret-broker.js";
 import { LocalGitService } from "../git/local-git-service.js";
@@ -54,6 +55,7 @@ import { LocalSchedulerService } from "../scheduler/local-scheduler-service.js";
 import { MemoryAgentStore } from "../store/memory-agent-store.js";
 import { SqliteAgentStore } from "../store/sqlite-agent-store.js";
 import { SpecificationService } from "../specifications/specification-service.js";
+import { buildSessionVerificationView } from "../sessions/session-inspection-view.js";
 import { TaskAssignmentService } from "../tasks/task-assignment-service.js";
 import { TaskOperationsService } from "../tasks/task-operations-service.js";
 import { startLocalRoomWebServer } from "../web/local-room-web-server.js";
@@ -259,20 +261,23 @@ test("stored model profile secret ref configures the default model client", asyn
   });
   await profiles.setDefaultProvider("openai_compatible");
 
-  const platform = await createLocalPlatform(dir, { executionMode: "full_access" });
-  const client = platform.modelRegistry.get("openai_compatible");
-  assert(client);
-  const response = await client.complete({
-    messages: [{ role: "user", content: "hello" }],
-    tools: [],
-  });
-  assert.equal(response.type, "message");
-  assert.equal(response.content, "profile-secret-ok");
-  assert.equal(seenAuthorization, "Bearer profile-model-secret");
-  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
-  assert.equal(configText.includes("profile-model-secret"), false);
-  platform.locks.close();
-  platform.store.close();
+  const platform = await createLocalPlatform(dir);
+  try {
+    const client = platform.modelRegistry.get("openai_compatible");
+    assert(client);
+    const response = await client.complete({
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+    });
+    assert.equal(response.type, "message");
+    assert.equal(response.content, "profile-secret-ok");
+    assert.equal(seenAuthorization, "Bearer profile-model-secret");
+    const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+    assert.equal(configText.includes("profile-model-secret"), false);
+  } finally {
+    platform.locks.close();
+    platform.store.close();
+  }
 });
 
 test("known OpenAI-compatible provider profiles send real chat requests with default models", async (t) => {
@@ -1758,6 +1763,44 @@ test("soloclaw status summarizes the active workspace model and readiness", asyn
   assert.match(parsed.workspaceConfigPath ?? "", /workspaces\.json$/);
 });
 
+test("soloclaw status readiness follows the configured default real provider", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-status-real-provider-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Status Real Provider Workspace\n", "utf8");
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "status-real-provider-workspace", version: "0.0.0" }, null, 2), "utf8");
+
+  const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+  await profiles.set({
+    name: "deepseek",
+    protocol: "openai_chat",
+    defaultBaseUrl: "https://api.deepseek.com",
+    defaultModel: "deepseek-v4-flash",
+    apiKeyEnvNames: ["DEEPSEEK_API_KEY"],
+    apiKeySecretRef: "sec_statusrealprovider",
+  });
+  await profiles.setDefaultProvider("deepseek");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const statusJson = await run(process.execPath, [cli, "status", "--workspace", dir, "--json"], dir);
+  assert.equal(statusJson.exitCode, 0, statusJson.stderr);
+  const parsed = JSON.parse(statusJson.stdout) as {
+    model?: { activeProvider?: string; defaultProvider?: string };
+    readiness?: {
+      checks?: Array<{ id?: string; status?: string; summary?: string }>;
+      commands?: { realProviderSmoke?: string };
+    };
+  };
+  const realProvider = parsed.readiness?.checks?.find((check) => check.id === "real-provider");
+  assert.equal(parsed.model?.activeProvider, "deepseek");
+  assert.equal(parsed.model?.defaultProvider, "deepseek");
+  assert.equal(realProvider?.status, "warn");
+  assert.match(realProvider?.summary ?? "", /configured default provider deepseek/);
+  assert.match(realProvider?.summary ?? "", /encrypted secret reference/);
+  assert.equal(parsed.readiness?.commands?.realProviderSmoke, "soloclaw smoke --rich-tui-real-provider");
+});
+
 test("soloclaw TUI status summarizes the current workspace", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-status-"));
   t.after(async () => {
@@ -1854,7 +1897,7 @@ test("soloclaw TUI exposes local agent status and logs", async (t) => {
       "/approve",
       "/exit",
       "",
-    ].join("\n"),
+    ].join("\n") + "\n",
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.match(result.stdout, /\/agent\s+Show local agent execution status/);
@@ -2017,7 +2060,7 @@ test("soloclaw TUI exposes focused session inspection", async (t) => {
       "/session bundle",
       "/exit",
       "",
-    ].join("\n"),
+    ].join("\n") + "\n",
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.match(result.stdout, /\/sessions\s+Show recent session dashboard/);
@@ -2198,6 +2241,127 @@ test("soloclaw TUI supports ask alias and rejects unknown slash commands", async
   assert.match(unknown.stdout, /bye/);
 });
 
+test("soloclaw TUI shows session and tool progress while a natural-language task runs", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-run-progress-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Run Progress Project\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(process.execPath, [cli], dir, "inspect this workspace\n/exit\n");
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Run session: sess_/);
+  assert.match(result.stdout, /\[step 1\] model call started/);
+  assert.match(result.stdout, /\[step 1\] tool list_files started/);
+  assert.match(result.stdout, /\[step 1\] tool list_files ok/);
+  assert.match(result.stdout, /Blueprint agent loop is working/);
+  assert.match(result.stdout, /timeline: \/session timeline sess_/);
+  assert.match(result.stdout, /bye/);
+});
+
+test("soloclaw TUI reports model run errors without exiting the shell", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-run-error-"));
+  const previousKey = process.env.TUI_FAILING_MODEL_API_KEY;
+  process.env.TUI_FAILING_MODEL_API_KEY = "failing-model-secret";
+  t.after(async () => {
+    if (previousKey === undefined) {
+      delete process.env.TUI_FAILING_MODEL_API_KEY;
+    } else {
+      process.env.TUI_FAILING_MODEL_API_KEY = previousKey;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Model Run Error Project\n", "utf8");
+
+  const server = createServer((request, response) => {
+    request.resume();
+    response.writeHead(401, { "content-type": "application/json", connection: "close" });
+    response.end(JSON.stringify({ error: "invalid test key" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected TCP test server address.");
+  }
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup custom --base-url http://127.0.0.1:${address.port}/v1 --model failing-model --api-key-env TUI_FAILING_MODEL_API_KEY\n你好\n/exit\n`,
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Error: OpenAI-compatible request failed: 401/);
+  assert.match(result.stdout, /soloclaw> bye/);
+  assert.equal(result.stdout.includes("failing-model-secret"), false);
+  assert.equal(result.stderr.includes("failing-model-secret"), false);
+  assert.doesNotMatch(result.stderr, /PolicySecretBroker|getSecret|AgentLoop|http-model-clients/);
+});
+
+test("soloclaw TUI can run a task with a vaulted model API key", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-vaulted-model-run-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# TUI Vaulted Model Run Project\n", "utf8");
+
+  let seenAuthorization = "";
+  const server = createServer((request, response) => {
+    seenAuthorization = request.headers.authorization ?? "";
+    request.resume();
+    response.writeHead(200, { "content-type": "application/json", connection: "close" });
+    response.end(JSON.stringify({ choices: [{ message: { content: "tui-vaulted-model-ok" } }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected TCP test server address.");
+  }
+
+  ensureLocalSecretVaultPassphraseFile(dir);
+  const setupPlatform = await createLocalPlatform(dir);
+  const ref = await setupPlatform.secrets.putSecret({
+    name: "tui-vaulted-model",
+    class: "model_api_key",
+    scopeType: "workspace",
+    scopeId: "local",
+    value: "tui-vaulted-secret-value",
+  });
+  setupPlatform.locks.close();
+  setupPlatform.store.close();
+
+  const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+  await profiles.set({
+    name: "openai_compatible",
+    protocol: "openai_chat",
+    defaultBaseUrl: `http://127.0.0.1:${address.port}/v1`,
+    defaultModel: "tui-vaulted-model",
+    apiKeyEnvNames: ["TUI_VAULTED_MODEL_API_KEY"],
+    apiKeySecretRef: ref.id,
+  });
+  await profiles.setDefaultProvider("openai_compatible");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(process.execPath, [cli], dir, "你好\n/exit\n");
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.equal(seenAuthorization, "Bearer tui-vaulted-secret-value");
+  assert.match(result.stdout, /tui-vaulted-model-ok/);
+  assert.match(result.stdout, /bye/);
+  assert.equal(result.stdout.includes("Secret access requires approval"), false);
+  assert.equal(result.stdout.includes("tui-vaulted-secret-value"), false);
+  assert.equal(result.stderr.includes("tui-vaulted-secret-value"), false);
+});
+
 test("soloclaw TUI supports local smoke command", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-smoke-"));
   t.after(async () => {
@@ -2211,6 +2375,59 @@ test("soloclaw TUI supports local smoke command", async (t) => {
   assert.match(result.stdout, /\/smoke\s+Run the local mock smoke task/);
   assert.match(result.stdout, /Blueprint agent loop is working/);
   assert.match(result.stdout, /bye/);
+});
+
+test("soloclaw smoke can exercise the rich TUI scripted flow", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-rich-tui-smoke-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Rich TUI Smoke Project\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "smoke", "--rich-tui"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Soloclaw rich TUI smoke/);
+  assert.match(result.stdout, /ok=true/);
+  assert.match(result.stdout, /saw=welcome,mode,input,progress,answer,context,resume,phase2,evidence-record,evidence-check,exit/);
+  assert.match(result.stdout, /answer=rich-smoke-done/);
+  assert.match(result.stdout, /context=1\.2K \(3%\)/);
+  assert.equal(result.stdout.includes("sk-"), false);
+});
+
+test("soloclaw real-provider rich TUI smoke fails closed when no real provider is configured", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-rich-tui-real-smoke-missing-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Rich TUI Real Provider Missing\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "smoke", "--rich-tui-real-provider"], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Real-provider rich TUI smoke is not ready/);
+  assert.match(result.stderr, /soloclaw phase2 readiness/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("soloclaw real-provider long-task rich TUI smoke fails closed when no real provider is configured", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-rich-tui-real-long-smoke-missing-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Rich TUI Real Provider Long Missing\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "smoke", "--rich-tui-real-provider-long-task"], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Real-provider long-task rich TUI smoke is not ready/);
+  assert.match(result.stderr, /soloclaw phase2 readiness/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
 });
 
 test("soloclaw TUI accepts CLI-style model and workspace use commands", async (t) => {
@@ -2309,7 +2526,7 @@ test("soloclaw TUI reports invalid model api key env without exiting or leaking 
 test("soloclaw TUI model setup menu stores pasted API key as encrypted secret ref", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-setup-menu-"));
   const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
-  process.env.AGENT_SECRETS_PASSPHRASE = "test-passphrase-12345";
+  delete process.env.AGENT_SECRETS_PASSPHRASE;
   t.after(async () => {
     if (previousPassphrase === undefined) {
       delete process.env.AGENT_SECRETS_PASSPHRASE;
@@ -2326,14 +2543,23 @@ test("soloclaw TUI model setup menu stores pasted API key as encrypted secret re
     process.execPath,
     [cli],
     dir,
-    `/model setup\n5\n1\n1\n1\n${pastedSecret}\n/model check\n/config\n/exit\n`,
+    `/model setup\n5\n1\n\n\n${pastedSecret}\n/model check\n/config\n/exit\n`,
   );
   assert.equal(result.exitCode, 0, result.stderr);
   assert.match(result.stdout, /Model setup/);
-  assert.match(result.stdout, /Google Gemini \(gemini\)/);
-  assert.match(result.stdout, /Kimi \/ Moonshot AI \(kimi\)/);
-  assert.match(result.stdout, /Qwen \/ DashScope \(qwen\)/);
+  assert.match(result.stdout, /> \[ \] OpenAI \(https:\/\/api\.openai\.com\/v1\)/);
+  assert.match(result.stdout, /  \[ \] DeepSeek \(https:\/\/api\.deepseek\.com\)/);
+  assert.match(result.stdout, /  \[ \] Qwen \/ DashScope \(https:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1\)/);
+  assert.match(result.stdout, /Model ID/);
+  assert.match(result.stdout, /> \[ \] deepseek-v4-flash/);
   assert.match(result.stdout, /API key:/);
+  assert.equal(result.stdout.includes("API key was empty"), false);
+  assert.equal(result.stdout.includes("Vault passphrase"), false);
+  assert.equal(result.stdout.includes("AGENT_SECRETS_PASSPHRASE"), false);
+  assert.equal(result.stdout.includes("Base URL:"), false);
+  assert.equal(result.stdout.includes("keys="), false);
+  assert.equal(result.stdout.includes("pricing="), false);
+  assert.equal(result.stdout.includes("models="), false);
   assert.equal(result.stdout.includes(pastedSecret), false);
   assert.equal(result.stderr.includes(pastedSecret), false);
   assert.match(result.stdout, /deepseek\tlocal\topenai_chat\tmodel=deepseek-v4-flash\tbaseUrl=https:\/\/api\.deepseek\.com\tenv=DEEPSEEK_API_KEY\tsecret=configured\tdefault=deepseek/);
@@ -2354,6 +2580,100 @@ test("soloclaw TUI model setup menu stores pasted API key as encrypted secret re
   const vaultText = await fs.readFile(path.join(dir, ".agent", "secrets.vault.json"), "utf8");
   assert.equal(vaultText.includes(pastedSecret), false);
   assert.match(vaultText, /"ciphertext"/);
+
+  const vaultKey = await fs.readFile(path.join(dir, ".agent", "secrets.key"), "utf8");
+  assert.equal(vaultKey.includes(pastedSecret), false);
+  assert.match(vaultKey.trim(), /^[A-Za-z0-9_-]{43}$/);
+});
+
+test("soloclaw TUI model setup menu supports custom Anthropic-compatible base URL", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-setup-anthropic-compatible-"));
+  const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
+  delete process.env.AGENT_SECRETS_PASSPHRASE;
+  t.after(async () => {
+    if (previousPassphrase === undefined) {
+      delete process.env.AGENT_SECRETS_PASSPHRASE;
+    } else {
+      process.env.AGENT_SECRETS_PASSPHRASE = previousPassphrase;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Anthropic Compatible Menu Project\n", "utf8");
+
+  const pastedSecret = "anthropic-menu-secret-should-not-leak";
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup\n12\nhttps://anthropic-compatible.example/v1\n2\n${pastedSecret}\n/config\n/exit\n`,
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Custom Anthropic-compatible \(http:\/\/localhost:8000\/v1\)/);
+  assert.match(result.stdout, /Base URL \[http:\/\/localhost:8000\/v1\]:/);
+  assert.equal(result.stdout.includes(pastedSecret), false);
+  assert.equal(result.stderr.includes(pastedSecret), false);
+  assert.match(result.stdout, /anthropic_compatible\tlocal\tanthropic_messages\tmodel=claude-local\tbaseUrl=https:\/\/anthropic-compatible\.example\/v1\tenv=ANTHROPIC_COMPATIBLE_API_KEY\tsecret=configured\tdefault=anthropic_compatible/);
+
+  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+  const config = JSON.parse(configText) as {
+    defaultProvider?: string;
+    profiles?: Record<string, { defaultBaseUrl?: string; defaultModel?: string; apiKeyEnvNames?: string[]; apiKeySecretRef?: string }>;
+  };
+  assert.equal(config.defaultProvider, "anthropic_compatible");
+  assert.equal(config.profiles?.anthropic_compatible?.defaultBaseUrl, "https://anthropic-compatible.example/v1");
+  assert.equal(config.profiles?.anthropic_compatible?.defaultModel, "claude-local");
+  assert.deepEqual(config.profiles?.anthropic_compatible?.apiKeyEnvNames, ["ANTHROPIC_COMPATIBLE_API_KEY"]);
+  assert.match(config.profiles?.anthropic_compatible?.apiKeySecretRef ?? "", /^sec_[a-z0-9]+$/);
+  assert.equal(configText.includes(pastedSecret), false);
+
+  const vaultText = await fs.readFile(path.join(dir, ".agent", "secrets.vault.json"), "utf8");
+  assert.equal(vaultText.includes(pastedSecret), false);
+  assert.match(vaultText, /"ciphertext"/);
+});
+
+test("soloclaw CLI model setup menu supports custom Anthropic-compatible base URL without leaking input", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-cli-model-setup-anthropic-compatible-"));
+  const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
+  delete process.env.AGENT_SECRETS_PASSPHRASE;
+  t.after(async () => {
+    if (previousPassphrase === undefined) {
+      delete process.env.AGENT_SECRETS_PASSPHRASE;
+    } else {
+      process.env.AGENT_SECRETS_PASSPHRASE = previousPassphrase;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# Anthropic Compatible CLI Menu Project\n", "utf8");
+
+  const pastedSecret = "anthropic-cli-secret-should-not-leak";
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup\n12\nhttps://anthropic-cli.example/v1\n2\n${pastedSecret}\n/config\n/exit\n`,
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Custom Anthropic-compatible \(http:\/\/localhost:8000\/v1\)/);
+  assert.match(result.stdout, /Base URL \[http:\/\/localhost:8000\/v1\]:/);
+  assert.match(result.stdout, /anthropic_compatible\tlocal\tanthropic_messages\tmodel=claude-local\tbaseUrl=https:\/\/anthropic-cli\.example\/v1\tenv=ANTHROPIC_COMPATIBLE_API_KEY\tsecret=configured\tdefault=anthropic_compatible/);
+  assert.equal(result.stdout.includes(pastedSecret), false);
+  assert.equal(result.stderr.includes(pastedSecret), false);
+
+  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+  const config = JSON.parse(configText) as {
+    defaultProvider?: string;
+    profiles?: Record<string, { defaultBaseUrl?: string; defaultModel?: string; apiKeyEnvNames?: string[]; apiKeySecretRef?: string }>;
+  };
+  assert.equal(config.defaultProvider, "anthropic_compatible");
+  assert.equal(config.profiles?.anthropic_compatible?.defaultBaseUrl, "https://anthropic-cli.example/v1");
+  assert.equal(config.profiles?.anthropic_compatible?.defaultModel, "claude-local");
+  assert.deepEqual(config.profiles?.anthropic_compatible?.apiKeyEnvNames, ["ANTHROPIC_COMPATIBLE_API_KEY"]);
+  assert.match(config.profiles?.anthropic_compatible?.apiKeySecretRef ?? "", /^sec_[a-z0-9]+$/);
+  assert.equal(configText.includes(pastedSecret), false);
 });
 
 test("soloclaw model check validates local provider readiness without leaking keys", async (t) => {
@@ -4151,6 +4471,49 @@ test("workspace command policy separates dependency installs, git mutations, and
   assert.deepEqual(new Set(requestedActions), new Set(["shell.run.safe", "dependency.install", "git.mutation", "shell.run.high_risk"]));
 });
 
+test("workspace command policy treats allowed agent tmp writes as workspace writes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-command-policy-agent-tmp-"));
+  const workspace = new LocalWorkspaceRuntime(dir);
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
+  const sessionId = "sess_command_policy_agent_tmp";
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  assert.equal(policyActionForWorkspaceCommand("node -e \"require('fs').mkdirSync('.agent/tmp',{recursive:true})\"", "local-workspace-write"), "workspace.write");
+  assert.equal(policyActionForWorkspaceCommand("node -e \"require('fs').mkdirSync('scratch',{recursive:true})\"", "local-workspace-write"), "workspace.write");
+  assert.equal(policyActionForWorkspaceCommand("rm -rf .agent/tmp", "local-workspace-write"), "shell.run.high_risk");
+  assert.equal(policyActionForWorkspaceCommand("node -e \"require('fs').mkdirSync('.agent/secrets',{recursive:true})\"", "local-workspace-write"), "shell.run.high_risk");
+
+  const tools = withPolicy(createWorkspaceTools(workspace, { store, actor, sessionId }), {
+    actor,
+    mode: "trusted",
+    risk: "medium",
+    policy: new DefaultPolicyEngine(),
+    store,
+    sessionId,
+  });
+  const runCommand = tools.find((tool) => tool.name === "run_command");
+  assert.ok(runCommand);
+
+  const result = await runCommand.handler({
+    command: "node -e \"require('fs').mkdirSync('.agent/tmp',{recursive:true})\"",
+    timeoutMs: 20_000,
+    executionProfile: "local-workspace-write",
+  });
+
+  assert.equal(result.ok, true, result.error?.message);
+  assert.equal(await exists(path.join(dir, ".agent", "tmp")), true);
+
+  const approvals = await store.listApprovalRequests();
+  assert.equal(approvals.length, 0);
+  const requestedActions = (await store.listAuditEvents({ sessionId }))
+    .filter((event) => event.type === "tool.requested")
+    .map((event) => event.metadata?.action);
+  assert.deepEqual(requestedActions, ["workspace.write"]);
+});
+
 test("execution hygiene scan flags temporary tests outside approved temp roots", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-hygiene-scan-"));
   t.after(async () => {
@@ -4368,6 +4731,126 @@ test("plan target mode records a plan session without exposing or executing tool
   assert.equal((await store.getToolResults(session.id)).length, 0);
 });
 
+test("plan target mode retries when the provider returns an empty visible plan", async () => {
+  const store = new MemoryAgentStore();
+  const prompts: string[] = [];
+  const model: ModelClient = {
+    async complete(request) {
+      prompts.push(request.messages.at(-1)?.content ?? "");
+      return prompts.length === 1
+        ? { type: "message", content: "" }
+        : { type: "message", content: "Plan:\n1. Inspect index.html.\n2. Verify with a safe command." };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "planner-empty", displayName: "Planner Empty" },
+    targetMode: "plan",
+  });
+
+  const answer = await agent.run("plan a small UI marker");
+  const session = (await store.listSessions(1))[0];
+  const messages = await store.getMessages(session.id);
+
+  assert.match(answer, /Plan:/);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /visible final answer/i);
+  assert.equal(session.status, "completed");
+  assert.equal(messages.filter((message) => message.role === "assistant").at(-1)?.content, answer);
+});
+
+test("session verification derives diff evidence from replace_range file changes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-replace-range-diff-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const platform = await createLocalPlatform(dir);
+  const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
+  const session = await platform.store.createSession({
+    objective: "Record a replace_range-only file edit.",
+    targetMode: "build",
+    status: "completed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await platform.store.recordFileChange({
+    id: "change_replace_range_only",
+    sessionId: session.id,
+    actor,
+    kind: "replace_range",
+    path: "index.html",
+    beforeHash: "before_hash",
+    afterHash: "after_hash",
+    summary: "replaced lines 26-26",
+    createdAt: "2026-06-20T00:00:00.000Z",
+  });
+  platform.locks.close?.();
+  platform.store.close();
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const verify = await run(process.execPath, [
+    cli,
+    "session",
+    "verify",
+    session.id,
+    "--json",
+    "--allow-no-command",
+    "--require-change",
+    "--require-diff-stat",
+    "--require-review-profile",
+  ], dir);
+  assert.equal(verify.exitCode, 0, verify.stderr);
+  const parsed = JSON.parse(verify.stdout) as {
+    status?: string;
+    summary?: {
+      patches?: number;
+      fileChanges?: number;
+      diffStats?: { files?: number; additions?: number; deletions?: number; byPath?: Array<{ path?: string; additions?: number; deletions?: number }> };
+      reviewProfile?: { reviewSize?: string; largestFile?: { path?: string } };
+    };
+  };
+  assert.equal(parsed.status, "pass");
+  assert.equal(parsed.summary?.patches, 0);
+  assert.equal(parsed.summary?.fileChanges, 1);
+  assert.equal(parsed.summary?.diffStats?.files, 1);
+  assert.equal(parsed.summary?.diffStats?.additions, 1);
+  assert.equal(parsed.summary?.diffStats?.deletions, 1);
+  assert.equal(parsed.summary?.diffStats?.byPath?.some((entry) => entry.path === "index.html" && entry.additions === 1 && entry.deletions === 1), true);
+  assert.equal(parsed.summary?.reviewProfile?.reviewSize, "small");
+  assert.equal(parsed.summary?.reviewProfile?.largestFile?.path, "index.html");
+});
+
+test("build and goal mode prompts guide safe file writes and zero-exit verification", async () => {
+  for (const mode of ["build", "goal"] as const) {
+    let userMessage = "";
+    const model: ModelClient = {
+      async complete(request) {
+        userMessage = request.messages.find((message) => message.role === "user")?.content ?? "";
+        return { type: "message", content: "done" };
+      },
+    };
+    const agent = new AgentLoop({
+      model,
+      tools: [],
+      systemPrompt: "system",
+      store: new MemoryAgentStore(),
+      actor: { type: "user", id: `prompt-${mode}`, displayName: "Prompt Tester" },
+      targetMode: mode,
+    });
+
+    await agent.run("Remove marker text and verify it is absent.");
+
+    assert.match(userMessage, /exit 0/i);
+    assert.match(userMessage, /absence/i);
+    assert.match(userMessage, /file tools/i);
+    assert.match(userMessage, /create_file/i);
+  }
+});
+
 test("agent loop audits model calls without storing prompt or response text", async () => {
   const store = new MemoryAgentStore();
   const model: ModelClient = {
@@ -4427,6 +4910,95 @@ test("agent loop audits model calls without storing prompt or response text", as
   assert.deepEqual(audits[0].metadata?.usage, { promptTokens: 17, completionTokens: 19, totalTokens: 36 });
   assert.equal(JSON.stringify(audits[0]).includes("secret prompt text"), false);
   assert.equal(JSON.stringify(audits[0]).includes("private response"), false);
+});
+
+test("agent loop retries an empty final answer before completing a session", async () => {
+  const store = new MemoryAgentStore();
+  const prompts: string[] = [];
+  const model: ModelClient = {
+    async complete(request) {
+      prompts.push(request.messages.at(-1)?.content ?? "");
+      return prompts.length === 1
+        ? { type: "message", content: "" }
+        : { type: "message", content: "Visible final answer." };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "empty-final", displayName: "Empty Final" },
+    targetMode: "build",
+  });
+
+  const answer = await agent.run("finish with a visible answer");
+  const session = (await store.listSessions(1))[0];
+  const messages = await store.getMessages(session.id);
+
+  assert.equal(answer, "Visible final answer.");
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /visible final answer/i);
+  assert.equal(session.status, "completed");
+  assert.equal(messages.filter((message) => message.role === "assistant").length, 1);
+  assert.equal(messages.filter((message) => message.role === "assistant")[0]?.content, "Visible final answer.");
+});
+
+test("session verification fails when the final assistant answer is empty", async () => {
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "verifier", displayName: "Verifier" };
+  const session = await store.createSession({
+    objective: "empty final verification",
+    targetMode: "plan",
+    status: "completed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await store.appendMessage({ sessionId: session.id, message: { role: "system", content: "system" } });
+  await store.appendMessage({ sessionId: session.id, message: { role: "user", content: "plan something" } });
+  await store.appendMessage({ sessionId: session.id, message: { role: "assistant", content: "" } });
+
+  const verification = await buildSessionVerificationView(store, session.id, {
+    requireCommand: false,
+  });
+
+  assert.equal(verification.status, "fail");
+  assert.equal(verification.checks.find((check) => check.id === "final-answer-visible")?.status, "fail");
+});
+
+test("agent loop step budget stop points to the recorded session timeline", async () => {
+  const store = new MemoryAgentStore();
+  const model: ModelClient = {
+    async complete() {
+      return {
+        type: "tool_calls",
+        content: "I need one more tool call.",
+        toolCalls: [
+          {
+            id: "looping-call",
+            name: "missing_tool",
+            input: {},
+          },
+        ],
+      };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "operator", displayName: "Operator" },
+    maxSteps: 1,
+  });
+
+  const answer = await agent.run("keep calling tools forever");
+  const session = (await store.listSessions(1))[0];
+
+  assert.match(answer, /Stopped after 1 steps without a final answer/);
+  assert.match(answer, new RegExp(`session: ${session.id}`));
+  assert.match(answer, new RegExp(`agent session timeline ${session.id}`));
+  assert.equal(session.status, "failed");
 });
 
 test("model usage service summarizes audit metadata and optional cost estimates", async () => {
@@ -8099,6 +8671,1315 @@ test("agent phase1 verify reports local project-reading readiness", async (t) =>
   assert.equal(parsed.commands?.quickstart, "soloclaw quickstart");
   assert.equal(parsed.commands?.smoke, "soloclaw smoke");
   assert.match(parsed.commands?.realProviderSmoke ?? "", /soloclaw ask --provider/);
+});
+
+test("agent phase2 checklist prints manual rich TUI and real-provider closure steps", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-checklist-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "checklist"], dir);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 manual closure checklist/);
+  assert.match(result.stdout, /soloclaw phase2 checklist/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-guide/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --all/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C1\|C2\|C3/);
+  assert.match(result.stdout, /C1.*external terminal rich TUI/i);
+  assert.match(result.stdout, /C2.*real-provider setup/i);
+  assert.match(result.stdout, /C3.*automated completion gate/i);
+  assert.match(result.stdout, /node dist\\cli\\index\.js/);
+  assert.match(result.stdout, /If readiness reports a problem, run \/model setup; otherwise skip setup/);
+  assert.match(result.stdout, /\/model setup/);
+  assert.match(result.stdout, /\/model check/);
+  assert.match(result.stdout, /smoke --rich-tui-real-provider/);
+  assert.match(result.stdout, /rg -n --hidden/);
+  assert.match(result.stdout, /phase2 evidence-record --section C1\|C2\|C3/);
+  assert.match(result.stdout, /Evidence notes template/);
+  assert.match(result.stdout, /C1 evidence:/);
+  assert.match(result.stdout, /Terminal:/);
+  assert.match(result.stdout, /C2 evidence:/);
+  assert.match(result.stdout, /Provider:/);
+  assert.match(result.stdout, /Leak check:/);
+  assert.match(result.stdout, /C3 evidence:/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 closeout-guide prints a step-by-step manual acceptance path", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closeout-guide-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "closeout-guide"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 closeout guide/);
+  assert.match(result.stdout, /Step 1/);
+  assert.match(result.stdout, /soloclaw phase2 launch-terminal/);
+  assert.match(result.stdout, /Step 2/);
+  assert.match(result.stdout, /\/phase2 readiness/);
+  assert.match(result.stdout, /If readiness reports a problem: \/model setup/);
+  assert.match(result.stdout, /\/model check/);
+  assert.match(result.stdout, /Skip \/model setup when readiness is already ready_for_manual_run/);
+  assert.match(result.stdout, /package\.json/);
+  assert.match(result.stdout, /Step 3/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C1/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C2/);
+  assert.match(result.stdout, /phase2 evidence-record --section C1/);
+  assert.match(result.stdout, /phase2 evidence-record --section C2/);
+  assert.match(result.stdout, /phase2 closure-task --section C1 --confirm-reviewed/);
+  assert.match(result.stdout, /phase2 closure-task --section C2 --confirm-reviewed/);
+  assert.match(result.stdout, /Step 4/);
+  assert.match(result.stdout, /npm\.cmd run check/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C3/);
+  assert.match(result.stdout, /phase2 evidence-record --section C3/);
+  assert.match(result.stdout, /phase2 closure-task --section C3 --confirm-reviewed/);
+  assert.match(result.stdout, /Step 5/);
+  assert.match(result.stdout, /phase2 evidence-check --strict/);
+  assert.match(result.stdout, /phase2 gate/);
+  assert.match(result.stdout, /Do not record API keys/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 operator-runbook prints current closeout commands without secrets", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-operator-runbook-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "operator-runbook", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 operator runbook/);
+  assert.match(result.stdout, /workspace=/);
+  assert.match(result.stdout, /status=blocked_manual_evidence|status=secret_leak_detected/);
+  assert.match(result.stdout, /Current model path/);
+  assert.match(result.stdout, /soloclaw phase2 launch-terminal/);
+  assert.match(result.stdout, /\/phase2 readiness/);
+  assert.match(result.stdout, /\/model check/);
+  assert.match(result.stdout, /Inspect package\.json and report only the npm scripts whose names include test or check/);
+  assert.match(result.stdout, /Guided prompts:/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C1/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C2/);
+  assert.match(result.stdout, /Fallback manual commands:/);
+  assert.match(result.stdout, /soloclaw phase2 evidence-record --section C1/);
+  assert.match(result.stdout, /Only use these if the wizard is not usable/);
+  assert.match(result.stdout, /soloclaw phase2 evidence-show --section C1/);
+  assert.match(result.stdout, /soloclaw phase2 final-gate/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C3/);
+  assert.match(result.stdout, /Never record API keys/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 evidence-template prints paste-safe manual closure notes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-template-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-template"], dir);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 evidence notes template/);
+  assert.match(result.stdout, /Paste this under/);
+  assert.match(result.stdout, /C1 external terminal rich-TUI evidence/);
+  assert.match(result.stdout, /C2 real-provider setup and task evidence/);
+  assert.match(result.stdout, /C3 final automated gate evidence/);
+  assert.match(result.stdout, /Terminal:/);
+  assert.match(result.stdout, /Provider:/);
+  assert.match(result.stdout, /Model:/);
+  assert.match(result.stdout, /Leak check:/);
+  assert.match(result.stdout, /Never record API keys/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 evidence-check accepts paste-safe evidence files", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-check-safe-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const evidencePath = path.join(dir, "phase2-evidence.md");
+  await fs.writeFile(
+    evidencePath,
+    [
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "### C2 real-provider setup and task evidence",
+      "- Provider: deepseek",
+      "- Secret notes: no key text recorded",
+      "### C3 final automated gate evidence",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", evidencePath], dir);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 evidence check/);
+  assert.match(result.stdout, /status=paste_safe_pending_manual_review/);
+  assert.match(result.stdout, /c1Section: pass/);
+  assert.match(result.stdout, /c2Section: pass/);
+  assert.match(result.stdout, /c3Section: pass/);
+  assert.match(result.stdout, /secretMaterial: pass/);
+  assert.match(result.stdout, /matches=0/);
+  assert.match(result.stdout, /does not satisfy C1, C2, or C3/i);
+
+  const json = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", evidencePath, "--json"], dir);
+  assert.equal(json.exitCode, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout) as {
+    status?: string;
+    checks?: Array<{ id?: string; status?: string }>;
+  };
+  assert.equal(parsed.status, "paste_safe_pending_manual_review");
+  assert.equal(parsed.checks?.some((check) => check.id === "secretMaterial" && check.status === "pass"), true);
+});
+
+test("agent phase2 evidence-check rejects secret-looking evidence without echoing matches", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-check-secret-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const leakedApiKey = "sk-phase2EvidenceCheckLeak123456789";
+  const leakedBearer = "Authorization: Bearer phase2EvidenceBearerToken123456789";
+  const evidencePath = path.join(dir, "phase2-evidence.md");
+  await fs.writeFile(
+    evidencePath,
+    [
+      "### C1 external terminal rich-TUI evidence",
+      "### C2 real-provider setup and task evidence",
+      leakedApiKey,
+      leakedBearer,
+      "### C3 final automated gate evidence",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", evidencePath], dir);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /Phase 2 evidence check/);
+  assert.match(result.stdout, /status=secret_leak_detected/);
+  assert.match(result.stdout, /secretMaterial: fail/);
+  assert.match(result.stdout, /matches=2/);
+  assert.equal(result.stdout.includes(leakedApiKey), false);
+  assert.equal(result.stdout.includes(leakedBearer), false);
+  assert.equal(result.stderr.includes(leakedApiKey), false);
+  assert.equal(result.stderr.includes(leakedBearer), false);
+});
+
+test("agent phase2 evidence-record appends paste-safe manual notes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-record-safe-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "",
+      "### C1 external terminal rich-TUI evidence",
+      "",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "",
+      "### C2 real-provider setup and task evidence",
+      "",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "",
+      "### C3 final automated gate evidence",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [
+    cli,
+    "phase2",
+    "evidence-record",
+    "--workspace",
+    dir,
+    "--section",
+    "C1",
+    "--terminal",
+    "Windows Terminal",
+    "--shell",
+    "PowerShell 7",
+    "--node",
+    "v24.13.1",
+    "--result",
+    "Rich TUI opened, F2 cycled modes, ctrl+p palette worked, cursor restored.",
+  ], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 evidence recorded/);
+  assert.match(result.stdout, /section=C1/);
+  assert.match(result.stdout, /secretMatches=0/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+
+  const text = await fs.readFile(planPath, "utf8");
+  assert.match(text, /### C1 external terminal rich-TUI evidence/);
+  assert.match(text, /Date: \d{4}-\d{2}-\d{2}/);
+  assert.match(text, /Terminal: Windows Terminal/);
+  assert.match(text, /Shell: PowerShell 7/);
+  assert.match(text, /Node version: v24\.13\.1/);
+  assert.match(text, /Rich TUI opened, F2 cycled modes/);
+
+  const check = await run(process.execPath, [cli, "phase2", "evidence-check", "--workspace", dir, "--json"], dir);
+  assert.equal(check.exitCode, 0, check.stderr);
+  const parsed = JSON.parse(check.stdout) as { secretMatches?: number };
+  assert.equal(parsed.secretMatches, 0);
+});
+
+test("agent phase2 evidence-record rejects secret-looking notes without echoing them", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-record-secret-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "### C1 external terminal rich-TUI evidence",
+      "",
+      "### C2 real-provider setup and task evidence",
+      "",
+      "### C3 final automated gate evidence",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const leakedApiKey = ["sk", "phase2EvidenceRecordLeak123456789"].join("-");
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [
+    cli,
+    "phase2",
+    "evidence-record",
+    "--workspace",
+    dir,
+    "--section",
+    "C2",
+    "--provider",
+    "deepseek",
+    "--model",
+    "deepseek-v4-flash",
+    "--result",
+    leakedApiKey,
+  ], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Refusing to record evidence because it contains secret-looking text/);
+  assert.equal(result.stdout.includes(leakedApiKey), false);
+  assert.equal(result.stderr.includes(leakedApiKey), false);
+  const text = await fs.readFile(planPath, "utf8");
+  assert.equal(text.includes(leakedApiKey), false);
+});
+
+test("agent phase2 closure-task requires explicit review confirmation", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closure-task-confirm-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  const plan = [
+    "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+    "### C1 external terminal rich-TUI evidence",
+    "- Date: 2026-06-19",
+    "- Terminal: Windows Terminal",
+    "- [ ] **C2: Record one real-provider setup and natural-language run**",
+    "### C2 real-provider setup and task evidence",
+    "- Date: 2026-06-19",
+    "- Provider: deepseek",
+    "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+    "### C3 final automated gate evidence",
+    "- Date: 2026-06-19",
+    "- npm.cmd run check: pass",
+  ].join("\n");
+  await fs.writeFile(planPath, plan, "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "closure-task", "--section", "C1", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /--confirm-reviewed/);
+  assert.equal(await fs.readFile(planPath, "utf8"), plan);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 closure-task checks one reviewed closure checkbox", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closure-task-check-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "closure-task", "--section", "C1", "--workspace", dir, "--confirm-reviewed"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 closure task updated/);
+  assert.match(result.stdout, /section=C1/);
+  assert.match(result.stdout, /status=checked/);
+  assert.match(result.stdout, /secretMatches=0/);
+  const updated = await fs.readFile(planPath, "utf8");
+  assert.match(updated, /- \[x\] \*\*C1: Record a real external terminal rich-TUI smoke\*\*/);
+  assert.match(updated, /- \[ \] \*\*C2: Record one real-provider setup and natural-language run\*\*/);
+  assert.match(updated, /- \[ \] \*\*C3: Re-run the full automated completion gate after C1 and C2\*\*/);
+  assert.doesNotMatch(updated, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 closeout-wizard records and checks reviewed C1 evidence", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closeout-wizard-c1-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "",
+      "### C1 external terminal rich-TUI evidence",
+      "",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "",
+      "### C2 real-provider setup and task evidence",
+      "",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "",
+      "### C3 final automated gate evidence",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli, "phase2", "closeout-wizard", "--workspace", dir, "--section", "C1"],
+    dir,
+    [
+      "yes",
+      "Windows Terminal",
+      "PowerShell 7",
+      "v24.13.1",
+      "Rich TUI rendered, F2 cycled modes, ctrl+p opened palette, cursor restored.",
+      "none",
+      "yes",
+    ].join("\n"),
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 closeout wizard/);
+  assert.match(result.stdout, /Phase 2 evidence recorded/);
+  assert.match(result.stdout, /Phase 2 evidence review/);
+  assert.match(result.stdout, /Phase 2 closure task updated/);
+  assert.match(result.stdout, /section=C1/);
+  assert.match(result.stdout, /secretMatches=0/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+
+  const updated = await fs.readFile(planPath, "utf8");
+  assert.match(updated, /- \[x\] \*\*C1: Record a real external terminal rich-TUI smoke\*\*/);
+  assert.match(updated, /Date: \d{4}-\d{2}-\d{2}/);
+  assert.match(updated, /Terminal: Windows Terminal/);
+  assert.match(updated, /Shell: PowerShell 7/);
+  assert.match(updated, /Node version: v24\.13\.1/);
+  assert.match(updated, /Rich TUI rendered, F2 cycled modes/);
+  assert.match(updated, /Rendering issues: none/);
+  assert.doesNotMatch(updated, /sk-[A-Za-z0-9_-]{12,}/);
+});
+
+test("agent phase2 closeout-wizard can walk all C1 C2 C3 sections in order", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closeout-wizard-all-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "",
+      "### C1 external terminal rich-TUI evidence",
+      "",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "",
+      "### C2 real-provider setup and task evidence",
+      "",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "",
+      "### C3 final automated gate evidence",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli, "phase2", "closeout-wizard", "--workspace", dir, "--all"],
+    dir,
+    [
+      "yes",
+      "Windows Terminal",
+      "PowerShell 7",
+      "v24.13.1",
+      "Rich TUI rendered and keyboard controls worked.",
+      "none",
+      "yes",
+      "yes",
+      "deepseek",
+      "deepseek-v4-flash",
+      "https://api.deepseek.com",
+      "skipped; readiness ready_for_manual_run",
+      "ready",
+      "Read-only package.json task returned test and check scripts.",
+      "visible",
+      "passed",
+      "yes",
+      "yes",
+      "passed",
+      "passed",
+      "passed",
+      "passed",
+      "passed",
+      "passed or only LF/CRLF warnings",
+      "passed",
+      "Final automated gate passed; see local terminal output",
+      "yes",
+    ].join("\n"),
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /section=C1/);
+  assert.match(result.stdout, /section=C2/);
+  assert.match(result.stdout, /section=C3/);
+  assert.match(result.stdout, /Phase 2 closeout wizard finished/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+
+  const updated = await fs.readFile(planPath, "utf8");
+  assert.match(updated, /- \[x\] \*\*C1: Record a real external terminal rich-TUI smoke\*\*/);
+  assert.match(updated, /- \[x\] \*\*C2: Record one real-provider setup and natural-language run\*\*/);
+  assert.match(updated, /- \[x\] \*\*C3: Re-run the full automated completion gate after C1 and C2\*\*/);
+  assert.match(updated, /Terminal: Windows Terminal/);
+  assert.match(updated, /Provider: deepseek/);
+  assert.match(updated, /Real-provider rich TUI smoke: passed/);
+  assert.doesNotMatch(updated, /sk-[A-Za-z0-9_-]{12,}/);
+});
+
+test("agent phase2 closeout-wizard rejects secret-looking evidence without echoing it", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-closeout-wizard-secret-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "",
+      "### C1 external terminal rich-TUI evidence",
+      "",
+      "### C2 real-provider setup and task evidence",
+      "",
+      "### C3 final automated gate evidence",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const leakedApiKey = ["sk", "phase2CloseoutWizardLeak123456789"].join("-");
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli, "phase2", "closeout-wizard", "--workspace", dir, "--section", "C1"],
+    dir,
+    [
+      "yes",
+      "Windows Terminal",
+      "PowerShell 7",
+      "v24.13.1",
+      leakedApiKey,
+      "none",
+      "yes",
+    ].join("\n"),
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Refusing to record evidence because it contains secret-looking text/);
+  assert.equal(result.stdout.includes(leakedApiKey), false);
+  assert.equal(result.stderr.includes(leakedApiKey), false);
+  const text = await fs.readFile(planPath, "utf8");
+  assert.equal(text.includes(leakedApiKey), false);
+  assert.match(text, /- \[ \] \*\*C1: Record a real external terminal rich-TUI smoke\*\*/);
+});
+
+test("agent phase2 evidence-check strict mode requires dated C1 C2 and C3 evidence", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-check-strict-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const incompletePath = path.join(dir, "phase2-incomplete.md");
+  await fs.writeFile(
+    incompletePath,
+    [
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "### C2 real-provider setup and task evidence",
+      "- Provider: deepseek",
+      "### C3 final automated gate evidence",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+  const completePath = path.join(dir, "phase2-complete.md");
+  await fs.writeFile(
+    completePath,
+    [
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const incomplete = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", incompletePath, "--strict"], dir);
+  assert.equal(incomplete.exitCode, 1);
+  assert.match(incomplete.stdout, /status=missing_dated_evidence/);
+  assert.match(incomplete.stdout, /c1DatedEvidence: pass/);
+  assert.match(incomplete.stdout, /c2DatedEvidence: fail/);
+  assert.match(incomplete.stdout, /c3DatedEvidence: fail/);
+  assert.doesNotMatch(incomplete.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+
+  const complete = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", completePath, "--strict", "--json"], dir);
+  assert.equal(complete.exitCode, 0, complete.stderr);
+  const parsed = JSON.parse(complete.stdout) as {
+    status?: string;
+    strict?: boolean;
+    checks?: Array<{ id?: string; status?: string }>;
+  };
+  assert.equal(parsed.status, "paste_safe_pending_manual_review");
+  assert.equal(parsed.strict, true);
+  assert.equal(parsed.checks?.some((check) => check.id === "c2DatedEvidence" && check.status === "pass"), true);
+});
+
+test("agent phase2 evidence-check strict mode rejects unchecked closure tasks", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-check-unchecked-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const evidencePath = path.join(dir, "phase2-unchecked.md");
+  await fs.writeFile(
+    evidencePath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-check", "--file", evidencePath, "--strict"], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /status=incomplete_closure_tasks/);
+  assert.match(result.stdout, /c1ClosureTaskComplete: fail/);
+  assert.match(result.stdout, /c2ClosureTaskComplete: fail/);
+  assert.match(result.stdout, /c3ClosureTaskComplete: fail/);
+  assert.match(result.stdout, /C1 closure task is still unchecked/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 evidence-check does not treat old progress notes as dated closure evidence", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-old-notes-not-evidence-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "Fresh automated preflight on 2026-06-19 10:50:17 +08:00, before manual C1/C2 evidence:",
+      "- Mentioned C1 external terminal rich-TUI evidence but did not record it.",
+      "- Verification on 2026-06-19: automated command passed, but this is still not manual C1 evidence.",
+      "- Mentioned C2 real-provider setup and task evidence but did not record it.",
+      "- Verification on 2026-06-19: automated command passed, but this is still not manual C2 evidence.",
+      "- Mentioned C3 final automated gate evidence but did not record it.",
+      "- Verification on 2026-06-19: automated command passed, but this is still not manual C3 evidence.",
+      "",
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "Manual checks to complete before marking C1 done:",
+      "- Add a dated evidence bullet after observation.",
+      "",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "Manual checks to complete before marking C2 done:",
+      "- Add a dated evidence bullet after observation.",
+      "",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "Manual checks to complete before marking C3 done:",
+      "- Add a dated evidence bullet after observation.",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-check", "--workspace", dir, "--strict"], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /status=missing_dated_evidence/);
+  assert.match(result.stdout, /c1DatedEvidence: fail/);
+  assert.match(result.stdout, /c2DatedEvidence: fail/);
+  assert.match(result.stdout, /c3DatedEvidence: fail/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 gate summarizes blockers and next actions", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-gate-summary-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "gate", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /Phase 2 gate summary/);
+  assert.match(result.stdout, /status=blocked_manual_evidence/);
+  assert.match(result.stdout, /realProviderReadiness=missing_real_provider/);
+  assert.match(result.stdout, /strictEvidence=incomplete_closure_tasks/);
+  assert.match(result.stdout, /blockers=C1,C2,C3,real-provider/);
+  assert.match(result.stdout, /C1 closure task is still unchecked/);
+  assert.match(result.stdout, /C2 closure task is still unchecked/);
+  assert.match(result.stdout, /C3 closure task is still unchecked/);
+  assert.match(result.stdout, /C1: review saved evidence, then run `soloclaw phase2 closure-task --section C1 --confirm-reviewed`/);
+  assert.match(result.stdout, /\/model setup/);
+  assert.match(result.stdout, /C3: review saved evidence, then run `soloclaw phase2 closure-task --section C3 --confirm-reviewed`/);
+  assert.match(result.stdout, /soloclaw phase2 gate/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 gate does not require model setup when the real provider is ready", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-gate-ready-provider-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+  ensureLocalSecretVaultPassphraseFile(dir);
+  const platform = await createLocalPlatform(dir);
+  try {
+    const secret = await platform.secrets.putSecret({
+      name: "phase2-gate-ready-provider",
+      class: "model_api_key",
+      scopeType: "workspace",
+      scopeId: "local",
+      value: "phase2-gate-ready-provider-secret-value",
+    });
+    const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+    await profiles.set({
+      name: "deepseek",
+      protocol: "openai_chat",
+      defaultBaseUrl: "https://api.deepseek.com",
+      defaultModel: "deepseek-v4-flash",
+      apiKeyEnvNames: ["DEEPSEEK_API_KEY"],
+      apiKeySecretRef: secret.id,
+    });
+    await profiles.setDefaultProvider("deepseek");
+  } finally {
+    platform.locks.close();
+    platform.store.close();
+  }
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "gate", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /realProviderReadiness=ready_for_manual_run/);
+  assert.match(result.stdout, /blockers=C1,C2,C3/);
+  assert.match(result.stdout, /C2: review saved evidence, then run `soloclaw phase2 closure-task --section C2 --confirm-reviewed`/);
+  assert.doesNotMatch(result.stdout, /run `\/model setup` before `\/model check`/);
+  assert.doesNotMatch(result.stdout + result.stderr, /phase2-gate-ready-provider-secret-value/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 gate points to review commands when evidence is already recorded", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-gate-review-recorded-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+  ensureLocalSecretVaultPassphraseFile(dir);
+  const platform = await createLocalPlatform(dir);
+  try {
+    const secret = await platform.secrets.putSecret({
+      name: "phase2-gate-review-recorded",
+      class: "model_api_key",
+      scopeType: "workspace",
+      scopeId: "local",
+      value: "phase2-gate-review-recorded-secret-value",
+    });
+    const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+    await profiles.set({
+      name: "deepseek",
+      protocol: "openai_chat",
+      defaultBaseUrl: "https://api.deepseek.com",
+      defaultModel: "deepseek-v4-flash",
+      apiKeyEnvNames: ["DEEPSEEK_API_KEY"],
+      apiKeySecretRef: secret.id,
+    });
+    await profiles.setDefaultProvider("deepseek");
+  } finally {
+    platform.locks.close();
+    platform.store.close();
+  }
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "gate", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stdout, /realProviderReadiness=ready_for_manual_run/);
+  assert.match(result.stdout, /C1: review saved evidence, then run `soloclaw phase2 closure-task --section C1 --confirm-reviewed`/);
+  assert.match(result.stdout, /C2: review saved evidence, then run `soloclaw phase2 closure-task --section C2 --confirm-reviewed`/);
+  assert.match(result.stdout, /C3: review saved evidence, then run `soloclaw phase2 closure-task --section C3 --confirm-reviewed`/);
+  assert.doesNotMatch(result.stdout, /C1: run `soloclaw phase2 launch-terminal`/);
+  assert.doesNotMatch(result.stdout, /read-only package\.json task; record dated evidence/);
+  assert.doesNotMatch(result.stdout, /record dated C3 evidence/);
+  assert.doesNotMatch(result.stdout + result.stderr, /phase2-gate-review-recorded-secret-value/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 next shows only the next unfinished closeout action", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-next-action-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "next", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 next action/);
+  assert.match(result.stdout, /status=blocked_manual_evidence/);
+  assert.match(result.stdout, /blocker=C1/);
+  assert.match(result.stdout, /C1: review saved evidence, then run `soloclaw phase2 closure-task --section C1 --confirm-reviewed`/);
+  assert.doesNotMatch(result.stdout, /\/model setup/);
+  assert.doesNotMatch(result.stdout, /record dated C3 evidence/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 next and review prefer closeout-wizard when dated evidence is missing", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-next-wizard-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const next = await run(process.execPath, [cli, "phase2", "next", "--workspace", dir], dir);
+  const review = await run(process.execPath, [cli, "phase2", "review", "--workspace", dir], dir);
+
+  assert.equal(next.exitCode, 0, next.stderr);
+  assert.match(next.stdout, /strictEvidence=missing_dated_evidence/);
+  assert.match(next.stdout, /soloclaw phase2 closeout-wizard --all/);
+  assert.match(next.stdout, /C1: run `soloclaw phase2 launch-terminal`, verify the real Soloclaw TTY, then run `soloclaw phase2 closeout-wizard --section C1`/);
+  assert.doesNotMatch(next.stdout, /record dated evidence with `soloclaw phase2 evidence-record --section C1`/);
+
+  assert.equal(review.exitCode, 0, review.stderr);
+  assert.match(review.stdout, /C1 evidence=undated review=waiting_for_evidence/);
+  assert.match(review.stdout, /next=soloclaw phase2 closeout-wizard --section C1/);
+  assert.match(review.stdout, /C1: record and review dated evidence with `soloclaw phase2 closeout-wizard --section C1`/);
+  assert.doesNotMatch(review.stdout + review.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(review.stdout + review.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 review summarizes C1 C2 C3 evidence and review commands", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-review-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [x] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "review", "--workspace", dir], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 review board/);
+  assert.match(result.stdout, /status=blocked_manual_evidence/);
+  assert.match(result.stdout, /C1 evidence=recorded review=checked/);
+  assert.match(result.stdout, /C2 evidence=recorded review=needs_review/);
+  assert.match(result.stdout, /C3 evidence=recorded review=needs_review/);
+  assert.match(result.stdout, /soloclaw phase2 closure-task --section C2 --confirm-reviewed/);
+  assert.match(result.stdout, /soloclaw phase2 closure-task --section C3 --confirm-reviewed/);
+  assert.match(result.stdout, /Next review action:/);
+  assert.match(result.stdout, /C2: review saved evidence, then run `soloclaw phase2 closure-task --section C2 --confirm-reviewed`/);
+  assert.match(result.stdout, /soloclaw phase2 next/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 evidence-show prints one safe evidence section for review", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-show-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "### C1 external terminal rich-TUI evidence",
+      "- Date: 2026-06-19",
+      "- Terminal: Windows Terminal",
+      "- Result: Rich TUI rendered cleanly.",
+      "- Secret check: sk-phase2EvidenceShowLeak123456789",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- Provider: deepseek",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+      "- npm.cmd run check: pass",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-show", "--workspace", dir, "--section", "C1"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 evidence review/);
+  assert.match(result.stdout, /section=C1/);
+  assert.match(result.stdout, /Terminal: Windows Terminal/);
+  assert.match(result.stdout, /Result: Rich TUI rendered cleanly/);
+  assert.match(result.stdout, /\[REDACTED_SECRET\]/);
+  assert.match(result.stdout, /next=soloclaw phase2 closure-task --section C1 --confirm-reviewed/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-phase2EvidenceShowLeak123456789/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 evidence-show points to closeout-wizard when dated evidence is missing", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-evidence-show-missing-date-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planPath = path.join(dir, "docs", "superpowers", "plans", "2026-06-18-soloclaw-rich-tui-event-stream.md");
+  await fs.mkdir(path.dirname(planPath), { recursive: true });
+  await fs.writeFile(
+    planPath,
+    [
+      "- [ ] **C1: Record a real external terminal rich-TUI smoke**",
+      "Manual checks to complete before marking C1 done:",
+      "- Add a dated evidence bullet after observation.",
+      "- [ ] **C2: Record one real-provider setup and natural-language run**",
+      "### C2 real-provider setup and task evidence",
+      "- Date: 2026-06-19",
+      "- [ ] **C3: Re-run the full automated completion gate after C1 and C2**",
+      "### C3 final automated gate evidence",
+      "- Date: 2026-06-19",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "evidence-show", "--workspace", dir, "--section", "C1"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /status=missing_dated_evidence/);
+  assert.match(result.stdout, /next=soloclaw phase2 closeout-wizard --section C1/);
+  assert.doesNotMatch(result.stdout, /closure-task --section C1/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase2 final-gate print shows the C3 automated command sequence", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-final-gate-print-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "final-gate", "--workspace", dir, "--print"], dir);
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 final automated gate/);
+  assert.match(result.stdout, /workspace=/);
+  assert.match(result.stdout, /npm\.cmd run check|npm run check/);
+  assert.match(result.stdout, /npm\.cmd test|npm test/);
+  assert.match(result.stdout, /node dist\\cli\\index\.js smoke --rich-tui/);
+  assert.match(result.stdout, /node dist\\cli\\index\.js smoke --rich-tui-real-provider/);
+  assert.match(result.stdout, /git diff --check/);
+  assert.match(result.stdout, /temp-file scan/);
+  assert.match(result.stdout, /soloclaw phase2 closeout-wizard --section C3/);
+  assert.match(result.stdout, /Fallback manual command:/);
+  assert.match(result.stdout, /soloclaw phase2 evidence-record --section C3/);
+  assert.match(result.stdout, /Only use the fallback if the wizard is not usable/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout + result.stderr, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 final-gate executes Windows cmd steps without spawn EINVAL", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows .cmd process spawning regression only applies on win32.");
+    return;
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-final-gate-cmd-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.mkdir(path.join(dir, "bin"), { recursive: true });
+  await fs.mkdir(path.join(dir, "dist", "cli"), { recursive: true });
+  await fs.writeFile(path.join(dir, "bin", "npm.cmd"), "@echo off\r\necho fake npm %*\r\nexit /b 0\r\n", "utf8");
+  await fs.writeFile(
+    path.join(dir, "dist", "cli", "index.js"),
+    "if (process.argv.includes('smoke')) { console.log('fake smoke ok'); process.exit(0); }\nprocess.exit(1);\n",
+    "utf8",
+  );
+  await git(dir, ["init"]);
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithEnv(process.execPath, [cli, "phase2", "final-gate", "--workspace", dir], dir, {
+    PATH: `${path.join(dir, "bin")}${path.delimiter}${process.env.PATH ?? ""}`,
+  });
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 final automated gate/);
+  assert.match(result.stdout, /status=pass/);
+  assert.match(result.stdout, /typecheck: pass/);
+  assert.match(result.stdout, /tests: pass/);
+  assert.match(result.stdout, /Next: soloclaw phase2 closeout-wizard --section C3/);
+  assert.doesNotMatch(result.stdout + result.stderr, /spawn EINVAL/);
+  assert.doesNotMatch(result.stdout + result.stderr, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout + result.stderr, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout + result.stderr, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 launch-terminal prints safe external terminal instructions", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-launch-terminal-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "launch-terminal", "--print"], dir);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 external terminal launcher/);
+  assert.match(result.stdout, /method=powershell-start-process/);
+  assert.match(result.stdout, /windowTitle=Soloclaw Phase 2 - /);
+  assert.match(result.stdout, /powershell\.exe/);
+  assert.match(result.stdout, /\[Console\]::Title = 'Soloclaw Phase 2 - /);
+  assert.match(result.stdout, /Set-Location -LiteralPath/);
+  assert.match(result.stdout, /node dist\\cli\\index\.js/);
+  assert.match(result.stdout, /If a window does not stay open, copy the command above into Windows Terminal or PowerShell/);
+  assert.match(result.stdout, /if it reports a problem run \/model setup, otherwise skip setup/);
+  assert.match(result.stdout, /\/model setup/);
+  assert.match(result.stdout, /\/model check/);
+  assert.match(result.stdout, /soloclaw phase2 evidence-template/);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+});
+
+test("agent phase2 readiness reports missing real-provider setup without leaking secrets", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-readiness-missing-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const text = await run(process.execPath, [cli, "phase2", "readiness", "--workspace", dir], dir);
+  assert.equal(text.exitCode, 0, text.stderr);
+  assert.match(text.stdout, /Phase 2 real-provider readiness/);
+  assert.match(text.stdout, /status=missing_real_provider/);
+  assert.match(text.stdout, /activeProvider=mock/);
+  assert.match(text.stdout, /realProviderConfigured: fail/);
+  assert.match(text.stdout, /soloclaw phase2 launch-terminal/);
+  assert.match(text.stdout, /\/model setup/);
+  assert.match(text.stdout, /\/model check/);
+  assert.match(text.stdout, /One-sitting closeout: soloclaw phase2 closeout-wizard --all/);
+  assert.match(text.stdout, /Record and review evidence: soloclaw phase2 closeout-wizard --section C1\|C2\|C3/);
+  assert.match(text.stdout, /does not satisfy C2/i);
+  assert.doesNotMatch(text.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(text.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(text.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+
+  const json = await run(process.execPath, [cli, "phase2", "readiness", "--workspace", dir, "--json"], dir);
+  assert.equal(json.exitCode, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout) as {
+    status?: string;
+    activeProvider?: string;
+    checks?: Array<{ id?: string; status?: string }>;
+    nextCommands?: Record<string, string>;
+  };
+  assert.equal(parsed.status, "missing_real_provider");
+  assert.equal(parsed.activeProvider, "mock");
+  assert.equal(parsed.checks?.some((check) => check.id === "realProviderConfigured" && check.status === "fail"), true);
+  assert.equal(parsed.nextCommands?.closeoutWizardAll, "soloclaw phase2 closeout-wizard --all");
+  assert.equal(parsed.nextCommands?.closeoutWizard, "soloclaw phase2 closeout-wizard --section C1|C2|C3");
+});
+
+test("agent phase2 readiness reports configured provider as ready for manual C2 run", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-readiness-ready-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  ensureLocalSecretVaultPassphraseFile(dir);
+  const platform = await createLocalPlatform(dir);
+  try {
+    const secret = await platform.secrets.putSecret({
+      name: "phase2-readiness",
+      class: "model_api_key",
+      scopeType: "workspace",
+      scopeId: "local",
+      value: "phase2-readiness-secret-value",
+    });
+    const profiles = new LocalProviderProfileStore(path.join(dir, ".agent"));
+    await profiles.set({
+      name: "deepseek",
+      protocol: "openai_chat",
+      defaultBaseUrl: "https://api.deepseek.com",
+      defaultModel: "deepseek-v4-flash",
+      apiKeyEnvNames: ["DEEPSEEK_API_KEY"],
+      apiKeySecretRef: secret.id,
+    });
+    await profiles.setDefaultProvider("deepseek");
+  } finally {
+    platform.locks.close();
+    platform.store.close();
+  }
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await run(process.execPath, [cli, "phase2", "readiness", "--workspace", dir], dir);
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /Phase 2 real-provider readiness/);
+  assert.match(result.stdout, /status=ready_for_manual_run/);
+  assert.match(result.stdout, /activeProvider=deepseek/);
+  assert.match(result.stdout, /model=deepseek-v4-flash/);
+  assert.match(result.stdout, /realProviderConfigured: pass/);
+  assert.match(result.stdout, /apiKeyReference: pass/);
+  assert.match(result.stdout, /secretStorage: pass/);
+  assert.match(result.stdout, /secretLeakScan: pass/);
+  assert.match(result.stdout, /Configure model if readiness reports a problem: \/model setup/);
+  assert.match(result.stdout, /One-sitting closeout: soloclaw phase2 closeout-wizard --all/);
+  assert.match(result.stdout, /Record and review evidence: soloclaw phase2 closeout-wizard --section C1\|C2\|C3/);
+  assert.match(result.stdout, /still requires a real external-terminal task run/i);
+  assert.equal(result.stdout.includes("phase2-readiness-secret-value"), false);
+  assert.equal(result.stderr.includes("phase2-readiness-secret-value"), false);
+  assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(result.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+
+  const json = await run(process.execPath, [cli, "phase2", "readiness", "--workspace", dir, "--json"], dir);
+  assert.equal(json.exitCode, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout) as { nextCommands?: Record<string, string> };
+  assert.equal(parsed.nextCommands?.closeoutWizardAll, "soloclaw phase2 closeout-wizard --all");
+  assert.equal(parsed.nextCommands?.closeoutWizard, "soloclaw phase2 closeout-wizard --section C1|C2|C3");
+});
+
+test("agent phase2 status reports manual evidence blockers without leaking secrets", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase2-status-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const text = await run(process.execPath, [cli, "phase2", "status"], dir);
+  assert.equal(text.exitCode, 0, text.stderr);
+  assert.match(text.stdout, /Phase 2 closure status/);
+  assert.match(text.stdout, /status=pending_manual_evidence/);
+  assert.match(text.stdout, /C1 external terminal rich TUI: pending/);
+  assert.match(text.stdout, /C2 real-provider setup and task: pending/);
+  assert.match(text.stdout, /C3 final automated gate: waiting_for_C1_C2/);
+  assert.match(text.stdout, /soloclaw phase2 checklist/);
+  assert.match(text.stdout, /soloclaw phase2 closeout-wizard --all/);
+  assert.match(text.stdout, /soloclaw phase2 evidence-template/);
+  assert.doesNotMatch(text.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(text.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(text.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
+
+  const json = await run(process.execPath, [cli, "phase2", "status", "--json"], dir);
+  assert.equal(json.exitCode, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout) as {
+    status?: string;
+    phaseClosure?: string;
+    blockers?: string[];
+    nextCommands?: Record<string, string>;
+  };
+  assert.equal(parsed.status, "pending_manual_evidence");
+  assert.equal(parsed.phaseClosure, "manual_closeout_required");
+  assert.deepEqual(parsed.blockers, ["C1", "C2", "C3"]);
+  assert.equal(parsed.nextCommands?.checklist, "soloclaw phase2 checklist");
+  assert.equal(parsed.nextCommands?.closeoutWizardAll, "soloclaw phase2 closeout-wizard --all");
+  assert.equal(parsed.nextCommands?.evidenceTemplate, "soloclaw phase2 evidence-template");
+  assert.doesNotMatch(json.stdout, /sk-[A-Za-z0-9_-]{12,}/);
+  assert.doesNotMatch(json.stdout, /Authorization:\s*Bearer/i);
+  assert.doesNotMatch(json.stdout, /AGENT_SECRETS_PASSPHRASE=.+/);
 });
 
 test("agent phase2 verify reports local alpha deliverable engineering execution smoke", async (t) => {
@@ -17684,6 +19565,35 @@ test("local Git service ignores private .agent files when preparing PR state", a
   assert.equal(prepared.status.dirtyFiles.includes(".agent/secrets.vault.json"), false);
 });
 
+test("git dirty summaries preserve tracked modified file path prefixes", async (t) => {
+  if (!(await commandExists("git"))) {
+    t.skip("git command is not available");
+    return;
+  }
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-git-dirty-prefix-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await git(dir, ["init"]);
+  await git(dir, ["config", "user.email", "security@example.test"]);
+  await git(dir, ["config", "user.name", "Agent Security"]);
+  await fs.mkdir(path.join(dir, "src"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "tracked.ts"), "export const value = 1;\n", "utf8");
+  await git(dir, ["add", "src/tracked.ts"]);
+  await git(dir, ["commit", "-m", "initial"]);
+  await fs.writeFile(path.join(dir, "src", "tracked.ts"), "export const value = 2;\n", "utf8");
+
+  const service = new LocalGitService(dir);
+  const status = await service.status();
+  const snapshot = await collectWorkspaceSnapshot(dir);
+
+  assert.equal(status.dirtyFiles.includes("src/tracked.ts"), true);
+  assert.equal(status.dirtyFiles.includes("rc/tracked.ts"), false);
+  assert.equal(snapshot.git.dirtyFiles.includes("src/tracked.ts"), true);
+  assert.equal(snapshot.git.dirtyFiles.includes("rc/tracked.ts"), false);
+});
+
 test("control plane web API requires the local access token", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-control-plane-security-"));
   const server = await startLocalRoomWebServer(dir, { port: 0, token: "test-control-token" });
@@ -17780,6 +19690,15 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(html, /No persisted patches/);
   assert.match(html, /No file changes/);
   assert.match(html, /No recent audit events/);
+  assert.match(html, /Agent Event Stream/);
+  assert.match(html, /id="agent-event-stream"/);
+  assert.match(html, /id="agent-event-stream-status"/);
+  assert.match(html, /connectAgentEventStream/);
+  assert.match(html, /new EventSource\('\/api\/events\?token=' \+ encodeURIComponent\(controlToken\)\)/);
+  assert.match(html, /renderAgentEventStream/);
+  assert.match(html, /projectAgentEventForWeb/);
+  assert.match(html, /agent-event-row/);
+  assert.match(html, /No agent events yet/);
   assert.match(html, /sessionInspectionItem/);
   assert.match(html, /view\.reviewCommands/);
   assert.match(html, /No timeline items/);
@@ -19038,6 +20957,22 @@ function runWithInput(command: string, args: string[], cwd: string, input: strin
     child.on("error", reject);
     child.on("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
     child.stdin.end(input);
+  });
+}
+
+function runWithEnv(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: { ...process.env, ...env } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
   });
 }
 

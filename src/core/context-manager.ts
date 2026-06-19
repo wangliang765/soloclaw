@@ -19,6 +19,10 @@ export class ContextManager {
     this.messages.push({ role: "assistant", content, toolCalls });
   }
 
+  addUser(content: string) {
+    this.messages.push({ role: "user", content });
+  }
+
   addToolResult(result: ToolResult) {
     this.messages.push({
       role: "tool",

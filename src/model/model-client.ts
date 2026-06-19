@@ -32,6 +32,13 @@ export type ModelRequest = {
   provider?: ModelProviderConfig;
 };
 
+export type ModelStreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "reasoning_delta"; text: string }
+  | { type: "tool_call_delta"; callId: string; name?: string; inputDelta?: string }
+  | ModelResponse;
+
 export interface ModelClient {
   complete(request: ModelRequest): Promise<ModelResponse>;
+  streamComplete?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }

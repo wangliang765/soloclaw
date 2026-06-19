@@ -208,7 +208,7 @@ export function policyActionForWorkspaceCommand(command: string, executionProfil
 function policyActionForCommandExecutionProfile(executionProfile?: string): PolicyAction | undefined {
   switch (executionProfile) {
     case "local-workspace-write":
-      return "shell.run.high_risk";
+      return "workspace.write";
     case "local-network":
       return "dependency.install";
     case "local-full-access":

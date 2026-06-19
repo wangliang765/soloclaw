@@ -6,6 +6,7 @@ export type AuditEventType =
   | "session.cancelled"
   | "session.resumed"
   | "model.called"
+  | "agent.event"
   | "tool.requested"
   | "tool.approved"
   | "tool.denied"

@@ -1,5 +1,6 @@
 import { AgentLoop } from "../core/agent-loop.js";
-import type { AgentContextAttachment } from "../core/agent-loop.js";
+import type { AgentContextAttachment, AgentLoopProgressEvent } from "../core/agent-loop.js";
+import type { LocalEventBus } from "../events/local-event-bus.js";
 import { LocalAssignmentTaskBroker, taskLeaseEnvelopeHash } from "../broker/local-assignment-task-broker.js";
 import { SYSTEM_PROMPT } from "../core/system-prompt.js";
 import { LocalGitService } from "../git/local-git-service.js";
@@ -28,7 +29,7 @@ import type { KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { LocalMcpRegistry } from "../mcp/local-mcp-registry.js";
 import { LocalMcpRuntime } from "../mcp/local-mcp-runtime.js";
 import { McpHealthService } from "../mcp/mcp-health-service.js";
-import { EncryptedFileSecretStore } from "../secrets/encrypted-file-secret-store.js";
+import { EncryptedFileSecretStore, localSecretVaultStoreOptions } from "../secrets/encrypted-file-secret-store.js";
 import { PolicySecretBroker } from "../secrets/policy-secret-broker.js";
 import type { ActorRef, ExecutionMode, PolicyRequest } from "../domain/index.js";
 import { MemoryService } from "../memory/memory-service.js";
@@ -63,6 +64,9 @@ export type LocalPlatformOptions = {
   modelCircuitOpenMs?: number;
   executionMode?: "strict" | "balanced" | "trusted" | "full_access";
   targetMode?: "plan" | "build" | "goal";
+  maxSteps?: number;
+  onAgentProgress?: (event: AgentLoopProgressEvent) => void | Promise<void>;
+  eventBus?: LocalEventBus;
   parentSessionId?: string;
   orgId?: string;
   projectId?: string;
@@ -88,7 +92,7 @@ export type LocalPlatformOptions = {
 export async function createLocalPlatform(cwd: string, options: LocalPlatformOptions = {}) {
   const agentDbPath = `${cwd}/.agent/agent.db`;
   const store = new SqliteAgentStore(agentDbPath);
-  const secrets = new EncryptedFileSecretStore(`${cwd}/.agent/secrets.vault.json`);
+  const secrets = new EncryptedFileSecretStore(`${cwd}/.agent/secrets.vault.json`, localSecretVaultStoreOptions(cwd));
   const identity = new LocalAgentIdentityService(cwd, store);
   const localAgent = await identity.getOrCreate();
   const workspace = new LocalWorkspaceRuntime(cwd);
@@ -191,6 +195,10 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
   const routedModel = fallbackEntries.length > 0 ? new FallbackModelClient([{ client: primaryModel }, ...fallbackEntries]) : primaryModel;
   const configuredModel = withModelReliabilityGuards(routedModel, options);
   const activeSession = { id: undefined as string | undefined };
+  const onAgentProgress = async (event: AgentLoopProgressEvent) => {
+    options.eventBus?.publish(event);
+    await options.onAgentProgress?.(event);
+  };
 
   const makeAgent = async () => {
     const actor = {
@@ -229,10 +237,12 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
       contextAttachments: context.attachments,
       selectedSkillIds: context.selectedSkillIds,
       targetMode: options.targetMode ?? "build",
+      maxSteps: options.maxSteps,
       sessionScope: policyScope,
       onSessionActivated: (session) => {
         activeSession.id = session.id;
       },
+      onProgress: onAgentProgress,
     });
   };
 
@@ -273,10 +283,12 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
       contextAttachments: context.attachments,
       selectedSkillIds: context.selectedSkillIds,
       targetMode: options.targetMode ?? "build",
+      maxSteps: options.maxSteps,
       sessionScope: policyScope,
       onSessionActivated: (session) => {
         activeSession.id = session.id;
       },
+      onProgress: onAgentProgress,
     });
   };
 
@@ -518,11 +530,12 @@ function apiKeyResolver(
         id: secretRef,
         purpose: "model_api_key",
         actor: context.actor,
-        mode: context.mode,
+        mode: "full_access",
         scope: context.scope,
         metadata: {
           envName: envLabel,
           consumer: "model_api_key_resolver",
+          requestedMode: context.mode,
         },
       });
       try {

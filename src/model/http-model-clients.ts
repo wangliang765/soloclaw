@@ -1,5 +1,5 @@
 import type { AgentMessage, JsonObject, ModelResponse, ModelResponseMetadata, ModelUsage, ToolCall, ToolDefinition } from "../protocol/types.js";
-import type { ModelClient, ModelRequest } from "./model-client.js";
+import type { ModelClient, ModelRequest, ModelStreamEvent } from "./model-client.js";
 
 export type ApiKeyResolver = string | (() => Promise<string>);
 
@@ -60,28 +60,88 @@ export class OpenAICompatibleChatClient implements ModelClient {
     });
 
     const data = (await response.json()) as OpenAIChatCompletionResponse;
-    const metadata = openAIResponseMetadata(response, data);
-    const message = data.choices?.[0]?.message;
-    const toolCalls = message?.tool_calls?.map((call): ToolCall => {
-      return {
-        id: call.id,
-        name: call.function.name,
-        input: parseJsonObject(call.function.arguments),
-      };
+    return openAIChatCompletionToModelResponse(response, data);
+  }
+
+  async *streamComplete(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const apiKey = await resolveApiKey(this.options.apiKey);
+    const response = await fetchWithRetry("openai_compatible", this.options, request.provider, `${trimTrailingSlash(request.provider?.baseUrl ?? this.options.baseUrl)}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+        ...this.options.headers,
+        ...request.provider?.headers,
+      },
+      body: JSON.stringify({
+        model: request.provider?.model ?? this.options.defaultModel,
+        messages: toOpenAIMessages(request.messages),
+        tools: request.tools.map(toOpenAITool),
+        tool_choice: request.tools.length > 0 ? "auto" : "none",
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
     });
 
-    if (toolCalls && toolCalls.length > 0) {
-      return {
+    if (!isEventStreamResponse(response)) {
+      yield openAIChatCompletionToModelResponse(response, (await response.json()) as OpenAIChatCompletionResponse);
+      return;
+    }
+
+    let content = "";
+    let providerResponseId: string | undefined;
+    let providerModel: string | undefined;
+    let usage: ModelUsage | undefined;
+    const streamedToolCalls = new Map<number, { id?: string; name?: string; arguments: string }>();
+    for await (const data of readSseData(response)) {
+      if (data.trim() === "[DONE]") {
+        break;
+      }
+      const chunk = parseOpenAIStreamChunk(data);
+      providerResponseId = typeof chunk.id === "string" ? chunk.id : providerResponseId;
+      providerModel = typeof chunk.model === "string" ? chunk.model : providerModel;
+      usage = openAIUsage(chunk.usage) ?? usage;
+      const delta = chunk.choices?.[0]?.delta;
+      if (typeof delta?.content === "string" && delta.content) {
+        content += delta.content;
+        yield { type: "text_delta", text: delta.content };
+      }
+      for (const toolCall of delta?.tool_calls ?? []) {
+        const index = typeof toolCall.index === "number" ? toolCall.index : streamedToolCalls.size;
+        const current = streamedToolCalls.get(index) ?? { arguments: "" };
+        streamedToolCalls.set(index, {
+          id: toolCall.id ?? current.id,
+          name: toolCall.function?.name ?? current.name,
+          arguments: `${current.arguments}${toolCall.function?.arguments ?? ""}`,
+        });
+      }
+    }
+
+    const metadata = compactMetadata({
+      providerRequestId: firstHeader(response.headers, ["x-request-id", "request-id", "openai-request-id"]),
+      providerResponseId,
+      providerModel,
+      usage,
+    });
+    const toolCalls = [...streamedToolCalls.values()]
+      .filter((call) => call.name)
+      .map((call, index): ToolCall => ({
+        id: call.id ?? `call_${index}`,
+        name: call.name ?? "",
+        input: parseJsonObject(call.arguments),
+      }));
+    if (toolCalls.length > 0) {
+      yield {
         type: "tool_calls",
-        content: typeof message?.content === "string" ? message.content : undefined,
+        content,
         toolCalls,
         metadata,
       };
+      return;
     }
-
-    return {
+    yield {
       type: "message",
-      content: typeof message?.content === "string" ? message.content : "",
+      content,
       metadata,
     };
   }
@@ -112,29 +172,116 @@ export class AnthropicCompatibleMessagesClient implements ModelClient {
     });
 
     const data = (await response.json()) as AnthropicMessagesResponse;
-    const metadata = anthropicResponseMetadata(response, data);
-    const toolCalls = data.content
-      .filter((block): block is AnthropicToolUseBlock => block.type === "tool_use")
-      .map((block): ToolCall => ({ id: block.id, name: block.name, input: block.input }));
+    return anthropicMessagesToModelResponse(response, data);
+  }
 
+  async *streamComplete(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const apiKey = await resolveApiKey(this.options.apiKey);
+    const converted = toAnthropicMessages(request.messages);
+    const response = await fetchWithRetry("anthropic_compatible", this.options, request.provider, `${trimTrailingSlash(request.provider?.baseUrl ?? this.options.baseUrl)}/messages`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        ...this.options.headers,
+        ...request.provider?.headers,
+      },
+      body: JSON.stringify({
+        model: request.provider?.model ?? this.options.defaultModel,
+        max_tokens: this.options.maxTokens ?? 4096,
+        system: converted.system,
+        messages: converted.messages,
+        tools: request.tools.map(toAnthropicTool),
+        stream: true,
+      }),
+    });
+
+    if (!isEventStreamResponse(response)) {
+      yield anthropicMessagesToModelResponse(response, (await response.json()) as AnthropicMessagesResponse);
+      return;
+    }
+
+    let content = "";
+    let providerResponseId: string | undefined;
+    let providerModel: string | undefined;
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
+    const streamedToolCalls = new Map<number, { id?: string; name?: string; input?: JsonObject; inputJson: string }>();
+    for await (const data of readSseData(response)) {
+      const chunk = parseAnthropicStreamChunk(data);
+      if (chunk.type === "message_start") {
+        providerResponseId = typeof chunk.message?.id === "string" ? chunk.message.id : providerResponseId;
+        providerModel = typeof chunk.message?.model === "string" ? chunk.message.model : providerModel;
+        promptTokens = finiteNumber(chunk.message?.usage?.input_tokens) ?? promptTokens;
+        completionTokens = finiteNumber(chunk.message?.usage?.output_tokens) ?? completionTokens;
+        continue;
+      }
+      if (chunk.type === "content_block_start" && chunk.content_block?.type === "tool_use") {
+        streamedToolCalls.set(chunk.index, {
+          id: chunk.content_block.id,
+          name: chunk.content_block.name,
+          input: chunk.content_block.input,
+          inputJson: "",
+        });
+        continue;
+      }
+      if (chunk.type === "content_block_delta" && chunk.delta?.type === "text_delta" && typeof chunk.delta.text === "string") {
+        content += chunk.delta.text;
+        yield { type: "text_delta", text: chunk.delta.text };
+        continue;
+      }
+      if (chunk.type === "content_block_delta" && chunk.delta?.type === "input_json_delta" && typeof chunk.delta.partial_json === "string") {
+        const index = typeof chunk.index === "number" ? chunk.index : streamedToolCalls.size;
+        const current = streamedToolCalls.get(index) ?? { inputJson: "" };
+        streamedToolCalls.set(index, {
+          ...current,
+          inputJson: `${current.inputJson}${chunk.delta.partial_json}`,
+        });
+        if (current.id) {
+          yield { type: "tool_call_delta", callId: current.id, name: current.name, inputDelta: chunk.delta.partial_json };
+        }
+        continue;
+      }
+      if (chunk.type === "message_delta") {
+        completionTokens = finiteNumber(chunk.usage?.output_tokens) ?? completionTokens;
+        continue;
+      }
+      if (chunk.type === "message_stop") {
+        break;
+      }
+    }
+
+    const metadata = compactMetadata({
+      providerRequestId: firstHeader(response.headers, ["request-id", "x-request-id", "anthropic-request-id"]),
+      providerResponseId,
+      providerModel,
+      usage: compactUsage({
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens !== undefined && completionTokens !== undefined ? promptTokens + completionTokens : undefined,
+      }),
+    });
+    const toolCalls = [...streamedToolCalls.values()]
+      .filter((call) => call.name)
+      .map((call, index): ToolCall => ({
+        id: call.id ?? `call_${index}`,
+        name: call.name ?? "",
+        input: call.inputJson ? parseJsonObject(call.inputJson) : call.input ?? {},
+      }));
     if (toolCalls.length > 0) {
-      return {
+      yield {
         type: "tool_calls",
-        content: data.content
-          .filter((block): block is AnthropicTextBlock => block.type === "text")
-          .map((block) => block.text)
-          .join("\n"),
+        content,
         toolCalls,
         metadata,
       };
+      return;
     }
 
-    return {
+    yield {
       type: "message",
-      content: data.content
-        .filter((block): block is AnthropicTextBlock => block.type === "text")
-        .map((block) => block.text)
-        .join("\n"),
+      content,
       metadata,
     };
   }
@@ -243,6 +390,121 @@ function anthropicResponseMetadata(response: Response, data: AnthropicMessagesRe
     providerModel: typeof data.model === "string" ? data.model : undefined,
     usage: anthropicUsage(data.usage),
   });
+}
+
+function openAIChatCompletionToModelResponse(response: Response, data: OpenAIChatCompletionResponse): ModelResponse {
+  const metadata = openAIResponseMetadata(response, data);
+  const message = data.choices?.[0]?.message;
+  const toolCalls = message?.tool_calls?.map((call): ToolCall => {
+    return {
+      id: call.id,
+      name: call.function.name,
+      input: parseJsonObject(call.function.arguments),
+    };
+  });
+
+  if (toolCalls && toolCalls.length > 0) {
+    return {
+      type: "tool_calls",
+      content: typeof message?.content === "string" ? message.content : undefined,
+      toolCalls,
+      metadata,
+    };
+  }
+
+  return {
+    type: "message",
+    content: typeof message?.content === "string" ? message.content : "",
+    metadata,
+  };
+}
+
+function anthropicMessagesToModelResponse(response: Response, data: AnthropicMessagesResponse): ModelResponse {
+  const metadata = anthropicResponseMetadata(response, data);
+  const toolCalls = data.content
+    .filter((block): block is AnthropicToolUseBlock => block.type === "tool_use")
+    .map((block): ToolCall => ({ id: block.id, name: block.name, input: block.input }));
+  const content = data.content
+    .filter((block): block is AnthropicTextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  if (toolCalls.length > 0) {
+    return {
+      type: "tool_calls",
+      content,
+      toolCalls,
+      metadata,
+    };
+  }
+
+  return {
+    type: "message",
+    content,
+    metadata,
+  };
+}
+
+function isEventStreamResponse(response: Response): boolean {
+  return response.headers.get("content-type")?.toLowerCase().includes("text/event-stream") === true;
+}
+
+async function* readSseData(response: Response): AsyncIterable<string> {
+  if (!response.body) {
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    yield* drainSseBuffer(buffer, (next) => {
+      buffer = next;
+    });
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    for (const data of sseBlockData(buffer)) {
+      yield data;
+    }
+  }
+}
+
+function* drainSseBuffer(buffer: string, updateBuffer: (value: string) => void): Iterable<string> {
+  let current = buffer;
+  while (true) {
+    const separator = current.search(/\r?\n\r?\n/);
+    if (separator < 0) {
+      updateBuffer(current);
+      return;
+    }
+    const block = current.slice(0, separator);
+    const separatorLength = current.slice(separator).startsWith("\r\n\r\n") ? 4 : 2;
+    current = current.slice(separator + separatorLength);
+    for (const data of sseBlockData(block)) {
+      yield data;
+    }
+  }
+}
+
+function sseBlockData(block: string): string[] {
+  const dataLines = block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart());
+  return dataLines.length > 0 ? [dataLines.join("\n")] : [];
+}
+
+function parseOpenAIStreamChunk(value: string): OpenAIChatCompletionChunk {
+  return JSON.parse(value) as OpenAIChatCompletionChunk;
+}
+
+function parseAnthropicStreamChunk(value: string): AnthropicMessagesStreamChunk {
+  return JSON.parse(value) as AnthropicMessagesStreamChunk;
 }
 
 function firstHeader(headers: Headers, names: string[]): string | undefined {
@@ -431,6 +693,25 @@ type OpenAIChatCompletionResponse = {
   }>;
 };
 
+type OpenAIChatCompletionChunk = {
+  id?: string;
+  model?: string;
+  usage?: OpenAIChatCompletionResponse["usage"];
+  choices?: Array<{
+    delta?: {
+      content?: string | null;
+      tool_calls?: Array<{
+        index?: number;
+        id?: string;
+        function?: {
+          name?: string;
+          arguments?: string;
+        };
+      }>;
+    };
+  }>;
+};
+
 type AnthropicTextBlock = {
   type: "text";
   text: string;
@@ -452,3 +733,43 @@ type AnthropicMessagesResponse = {
   };
   content: Array<AnthropicTextBlock | AnthropicToolUseBlock>;
 };
+
+type AnthropicMessagesStreamChunk =
+  | {
+      type: "message_start";
+      message?: {
+        id?: string;
+        model?: string;
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+        };
+      };
+    }
+  | {
+      type: "content_block_start";
+      index: number;
+      content_block?: {
+        type?: "tool_use" | "text";
+        id?: string;
+        name?: string;
+        input?: JsonObject;
+      };
+    }
+  | {
+      type: "content_block_delta";
+      index?: number;
+      delta?: {
+        type?: "text_delta" | "input_json_delta";
+        text?: string;
+        partial_json?: string;
+      };
+    }
+  | { type: "content_block_stop"; index?: number }
+  | {
+      type: "message_delta";
+      usage?: {
+        output_tokens?: number;
+      };
+    }
+  | { type: "message_stop" };

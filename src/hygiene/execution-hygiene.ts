@@ -31,7 +31,20 @@ export function assertWorkspacePathAllowed(inputPath: string, access: WorkspaceA
 
 export function commandTouchesProtectedPath(command: string): boolean {
   const normalized = command.replace(/\\/g, "/").toLowerCase();
-  return /(^|[\s"'`])\.git(\/|[\s"'`]|$)/.test(normalized) || /(^|[\s"'`])\.agent(\/|[\s"'`]|$)/.test(normalized);
+  if (/(^|[\s"'`])\.git(\/|[\s"'`]|$)/.test(normalized)) {
+    return true;
+  }
+
+  const protectedPathPattern = /(^|[\s"'`])(\.agent(?:\/[^\s"'`;,|&<>)]*)?)(?=$|[\s"'`;,|&<>)])/g;
+  for (const match of normalized.matchAll(protectedPathPattern)) {
+    const protectedPath = match[2] ?? "";
+    if (isAllowedAgentTempPath(protectedPath)) {
+      continue;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 export async function scanExecutionHygiene(root: string): Promise<HygieneFinding[]> {
@@ -95,4 +108,12 @@ function classifyPotentialResidue(relativePath: string): HygieneFinding | undefi
 function normalizeWorkspacePath(inputPath: string): string {
   const normalized = path.posix.normalize(inputPath.replace(/\\/g, "/"));
   return normalized === "." ? "" : normalized.replace(/^\.?\//, "");
+}
+
+function isAllowedAgentTempPath(inputPath: string): boolean {
+  const normalized = normalizeWorkspacePath(inputPath);
+  if (normalized.split("/").includes("..")) {
+    return false;
+  }
+  return normalized === ".agent/tmp" || normalized.startsWith(".agent/tmp/");
 }

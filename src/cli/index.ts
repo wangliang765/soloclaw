@@ -2,6 +2,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
+import { emitKeypressEvents } from "node:readline";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 import type {
   ActorRef,
@@ -33,6 +34,7 @@ import type {
   Session,
 } from "../domain/index.js";
 import { ControlPlaneService } from "../control-plane/control-plane-service.js";
+import type { AgentLoopProgressEvent } from "../core/agent-loop.js";
 import { DEFAULT_ROOM_AGENT_RESPONSE_MODE, DEFAULT_ROOM_WIDE_MENTION_POLICY } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import { scanExecutionHygiene } from "../hygiene/execution-hygiene.js";
@@ -55,7 +57,7 @@ import { createLocalPlatform } from "../platform/local-platform.js";
 import { RemoteRoomRunner } from "../remote/remote-room-runner.js";
 import type { SchedulerRunResult, SchedulerTickResult } from "../scheduler/local-scheduler-service.js";
 import type { PutSecretInput } from "../secrets/secret-store.js";
-import { EncryptedFileSecretStore } from "../secrets/encrypted-file-secret-store.js";
+import { EncryptedFileSecretStore, ensureLocalSecretVaultPassphraseFile, localSecretVaultPassphraseFile, localSecretVaultStoreOptions } from "../secrets/encrypted-file-secret-store.js";
 import { buildSessionInspectView, buildSessionNextView, buildSessionReportView, buildSessionVerificationView, type SessionVerificationOptions, type SessionVerificationPreset } from "../sessions/session-inspection-view.js";
 import type { KnowledgeEvalCase, KnowledgeEvalThresholds, KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { parseSpecificationClarificationStatus, parseSpecificationStatus, parseSpecificationTaskStatus } from "../specifications/specification-service.js";
@@ -69,6 +71,37 @@ import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } fro
 import { runWorkspaceRuntimeJsonRpcRustSmoke, runWorkspaceRuntimeJsonRpcRustToolsSmoke } from "../workspace/workspace-runtime-jsonrpc-smoke.js";
 import { renderAppHtml } from "../web/local-room-web-server.js";
 import {
+  buildPhaseTwoClosureStatus,
+  buildPhaseTwoEvidenceCheck,
+  buildPhaseTwoEvidenceReview,
+  buildPhaseTwoExternalTerminalLaunch,
+  buildPhaseTwoExternalTerminalStartProcessCommand,
+  buildPhaseTwoGateSummary,
+  buildPhaseTwoNextAction,
+  buildPhaseTwoRealProviderReadiness,
+  buildPhaseTwoReviewBoard,
+  checkPhaseTwoClosureTask,
+  recordPhaseTwoEvidence,
+  renderPhaseTwoClosureStatus,
+  renderPhaseTwoClosureTask,
+  renderPhaseTwoCloseoutGuide,
+  renderPhaseTwoEvidenceCheck,
+  renderPhaseTwoEvidenceRecord,
+  renderPhaseTwoEvidenceReview,
+  renderPhaseTwoEvidenceTemplate,
+  renderPhaseTwoExternalTerminalLaunch,
+  renderPhaseTwoFinalGatePlan,
+  renderPhaseTwoGateSummary,
+  renderPhaseTwoManualChecklist,
+  renderPhaseTwoNextAction,
+  renderPhaseTwoOperatorRunbook,
+  renderPhaseTwoRealProviderReadiness,
+  renderPhaseTwoReviewBoard,
+  type PhaseTwoExternalTerminalLaunch,
+  type PhaseTwoExternalTerminalLaunchResult,
+  type PhaseTwoEvidenceRecordSection,
+} from "./phase2-closure-status.js";
+import {
   buildSessionTimelineView as buildSessionTimeline,
   countTimelineKinds,
   timelineItemFromApproval,
@@ -78,6 +111,12 @@ import {
   timelineKindOrder,
   type SessionTimelineItem,
 } from "../sessions/session-timeline-view.js";
+import { shouldUseRichTui, startRichTuiShell, type RichTuiModelSetupResult, type RichTuiSessionResumeInput, type RichTuiSessionsResult, type RichTuiTaskRunInput, type RichTuiTaskRunResult } from "./tui/rich-shell.js";
+import type { RichModelSetupRequest } from "./tui/model-setup.js";
+import type { RichTuiMode, RichTuiWorkspaceStatus } from "./tui/state.js";
+import { formatRichTuiRealProviderSmokeResult, formatRichTuiSmokeResult, runRichTuiRealProviderSmoke, runRichTuiSmoke } from "./tui/rich-smoke.js";
+
+const TUI_RUN_MAX_STEPS = 80;
 
 async function main() {
   const [, , command, ...rest] = process.argv;
@@ -217,6 +256,26 @@ async function main() {
   if (command === "smoke") {
     try {
       const workspace = await resolveInitialWorkspace(process.cwd(), rest);
+      if (rest.includes("--rich-tui-real-provider-long-task") || rest.includes("rich-tui-real-provider-long-task")) {
+        const result = await runRichTuiRealProviderSmoke({ workspace, version: "0.1.0", longTask: true });
+        console.log(formatRichTuiRealProviderSmokeResult(result));
+        if (!result.ok) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+      if (rest.includes("--rich-tui-real-provider") || rest.includes("rich-tui-real-provider")) {
+        const result = await runRichTuiRealProviderSmoke({ workspace, version: "0.1.0" });
+        console.log(formatRichTuiRealProviderSmokeResult(result));
+        if (!result.ok) {
+          process.exitCode = 1;
+        }
+        return;
+      }
+      if (rest.includes("--rich-tui") || rest.includes("rich-tui")) {
+        console.log(formatRichTuiSmokeResult(await runRichTuiSmoke({ workspace, version: "0.1.0" })));
+        return;
+      }
       const answer = await runSoloclawSmoke(workspace);
       console.log(answer);
     } catch (error) {
@@ -4162,8 +4221,258 @@ async function main() {
 
   if (command === "phase2") {
     const subcommand = rest[0] ?? "verify";
+    if (subcommand === "checklist" || subcommand === "manual-checklist") {
+      printPhaseTwoManualChecklist();
+      return;
+    }
+    if (subcommand === "closeout-guide" || subcommand === "guide") {
+      console.log(renderPhaseTwoCloseoutGuide());
+      return;
+    }
+    if (subcommand === "operator-runbook" || subcommand === "runbook") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const summary = await buildPhaseTwoGateSummary(workspace);
+        const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
+        console.log(renderPhaseTwoOperatorRunbook(summary, launch));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "closeout-wizard" || subcommand === "evidence-wizard") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        await runPhaseTwoCloseoutWizard(workspace, parsePhaseTwoCloseoutWizardArgs(cleanArgs));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "next" || subcommand === "next-action") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const next = await buildPhaseTwoNextAction(workspace);
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(next, null, 2));
+        } else {
+          console.log(renderPhaseTwoNextAction(next));
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "review" || subcommand === "review-board") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const board = await buildPhaseTwoReviewBoard(workspace);
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(board, null, 2));
+        } else {
+          console.log(renderPhaseTwoReviewBoard(board));
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "final-gate" || subcommand === "c3-gate") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
+          console.log(renderPhaseTwoFinalGatePlan(workspace));
+          return;
+        }
+        const result = await runPhaseTwoFinalGate(workspace);
+        console.log(renderPhaseTwoFinalGateResult(result));
+        if (result.status !== "pass") {
+          process.exitCode = 1;
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "evidence-template" || subcommand === "evidence") {
+      printPhaseTwoEvidenceTemplate();
+      return;
+    }
+    if (subcommand === "evidence-record" || subcommand === "record-evidence") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const parsed = parsePhaseTwoEvidenceRecordArgs(cleanArgs);
+        const result = await recordPhaseTwoEvidence(workspace, {
+          section: parsed.section,
+          filePath: parsed.filePath,
+          date: parsed.date,
+          fields: parsed.fields,
+        });
+        console.log(renderPhaseTwoEvidenceRecord(result));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "evidence-show" || subcommand === "show-evidence" || subcommand === "evidence-review") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const parsed = parsePhaseTwoEvidenceShowArgs(cleanArgs);
+        const review = await buildPhaseTwoEvidenceReview(workspace, parsed);
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(review, null, 2));
+        } else {
+          console.log(renderPhaseTwoEvidenceReview(review));
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "closure-task" || subcommand === "check-closure-task") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const parsed = parsePhaseTwoClosureTaskArgs(cleanArgs);
+        const result = await checkPhaseTwoClosureTask(workspace, parsed);
+        console.log(renderPhaseTwoClosureTask(result));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "gate" || subcommand === "summary") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const summary = await buildPhaseTwoGateSummary(workspace);
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(summary, null, 2));
+        } else {
+          console.log(renderPhaseTwoGateSummary(summary));
+        }
+        if (summary.status !== "ready_for_completion") {
+          process.exitCode = 1;
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "evidence-check" || subcommand === "check-evidence") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const evidence = await buildPhaseTwoEvidenceCheck(workspace, {
+          filePath: parsePhaseTwoEvidenceFileOption(cleanArgs),
+          strict: cleanArgs.includes("--strict"),
+        });
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(evidence, null, 2));
+        } else {
+          console.log(renderPhaseTwoEvidenceCheck(evidence));
+        }
+        if (evidence.status !== "paste_safe_pending_manual_review") {
+          process.exitCode = 1;
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "launch-terminal" || subcommand === "terminal") {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(process.cwd(), args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
+      if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
+        console.log(renderPhaseTwoExternalTerminalLaunch(launch, false));
+        return;
+      }
+      try {
+        const result = await launchPhaseTwoExternalTerminal(launch);
+        console.log(renderPhaseTwoExternalTerminalLaunch(launch, true, result));
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        console.error("Use `soloclaw phase2 launch-terminal --print` to copy the command manually.");
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "readiness" || subcommand === "real-provider-readiness") {
+      try {
+        const args = rest.slice(1);
+        const workspace = await resolveInitialWorkspace(process.cwd(), args);
+        const cleanArgs = stripWorkspaceOption(args);
+        const readiness = await buildPhaseTwoRealProviderReadiness(workspace);
+        if (cleanArgs.includes("--json")) {
+          console.log(JSON.stringify(readiness, null, 2));
+        } else {
+          console.log(renderPhaseTwoRealProviderReadiness(readiness));
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    if (subcommand === "status") {
+      const status = buildPhaseTwoClosureStatus();
+      if (rest.slice(1).includes("--json")) {
+        console.log(JSON.stringify(status, null, 2));
+      } else {
+        console.log(renderPhaseTwoClosureStatus(status));
+      }
+      return;
+    }
     if (subcommand !== "verify" && subcommand !== "smoke") {
-      console.error("Usage: agent phase2 verify [--workspace path] [--json] [--cleanup]");
+      console.error(
+          "Usage: soloclaw phase2 verify [--workspace path] [--json] [--cleanup]\n" +
+          "       soloclaw phase2 status [--json]\n" +
+          "       soloclaw phase2 gate [--workspace path] [--json]\n" +
+          "       soloclaw phase2 next [--workspace path] [--json]\n" +
+          "       soloclaw phase2 review [--workspace path] [--json]\n" +
+          "       soloclaw phase2 final-gate [--workspace path] [--print]\n" +
+          "       soloclaw phase2 readiness [--workspace path] [--json]\n" +
+          "       soloclaw phase2 launch-terminal [--workspace path] [--print]\n" +
+          "       soloclaw phase2 checklist\n" +
+          "       soloclaw phase2 closeout-guide\n" +
+          "       soloclaw phase2 operator-runbook [--workspace path]\n" +
+          "       soloclaw phase2 closeout-wizard --section C1|C2|C3 [--workspace path]\n" +
+          "       soloclaw phase2 evidence-template\n" +
+          "       soloclaw phase2 evidence-show --section C1|C2|C3 [--workspace path] [--json]\n" +
+          "       soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]\n" +
+          "       soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed\n" +
+          "       soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]\n" +
+          "       soloclaw smoke --rich-tui-real-provider\n" +
+          "       agent phase2 checklist",
+      );
       process.exitCode = 1;
       return;
     }
@@ -4930,15 +5239,33 @@ async function verifyPhaseOneReadiness(cwd: string): Promise<PhaseOneReadinessRe
     platform.store.close();
   }
 
-  const profiles = await new LocalProviderProfileStore(path.join(cwd, ".agent")).list();
+  const profileStore = new LocalProviderProfileStore(path.join(cwd, ".agent"));
+  const profiles = await profileStore.list();
+  const defaultProvider = await profileStore.getDefaultProvider();
+  const defaultProfile = profiles.find((profile) => profile.name === defaultProvider);
+  const defaultProfilePresentEnvNames = defaultProfile?.apiKeyEnvNames.filter((name) => Boolean(process.env[name])) ?? [];
+  const defaultRealProviderReady = Boolean(
+    defaultProfile &&
+    defaultProfile.name !== "mock" &&
+    (defaultProfile.apiKeySecretRef || defaultProfilePresentEnvNames.length > 0),
+  );
   const configuredProviders = profiles.filter((profile) => profile.name !== "mock" && profile.apiKeyEnvNames.some((name) => Boolean(process.env[name])));
+  const firstConfiguredProvider = configuredProviders[0];
+  const firstConfiguredProviderEnvName = firstConfiguredProvider?.apiKeyEnvNames.find((name) => Boolean(process.env[name]));
+  const realProviderSmokeCommand = defaultRealProviderReady
+    ? "soloclaw smoke --rich-tui-real-provider"
+    : firstConfiguredProvider && firstConfiguredProviderEnvName
+      ? `soloclaw ask --provider ${firstConfiguredProvider.name} --api-key-env ${firstConfiguredProviderEnvName} "inspect this workspace"`
+      : 'soloclaw ask --provider openai --api-key-env OPENAI_API_KEY "inspect this workspace"';
   checks.push({
     id: "real-provider",
     label: "real provider",
     status: "warn",
     summary:
-      configuredProviders.length > 0
-        ? `provider env present for ${configuredProviders.map((profile) => profile.name).join(", ")}; run the smoke command to verify live model access`
+      defaultRealProviderReady && defaultProfile
+        ? `configured default provider ${defaultProfile.name} (${defaultProfile.defaultModel}) uses ${defaultProfile.apiKeySecretRef ? "encrypted secret reference" : `environment ${defaultProfilePresentEnvNames.join(",")}`}; run the smoke command to verify live model access`
+        : configuredProviders.length > 0
+          ? `provider env present for ${configuredProviders.map((profile) => profile.name).join(", ")}; run the smoke command to verify live model access`
         : "no live provider was called by this local check; set an API key env and run the smoke command below",
   });
 
@@ -4964,7 +5291,7 @@ async function verifyPhaseOneReadiness(cwd: string): Promise<PhaseOneReadinessRe
       configShow: "soloclaw config show --json",
       quickstart: "soloclaw quickstart",
       smoke: "soloclaw smoke",
-      realProviderSmoke: 'soloclaw ask --provider openai --api-key-env OPENAI_API_KEY "inspect this workspace"',
+      realProviderSmoke: realProviderSmokeCommand,
     },
   };
 }
@@ -7069,6 +7396,247 @@ async function verifyPhaseTwoEngineeringSmoke(cwd: string, options: { cleanup?: 
       await fs.rm(sampleWorkspace, { recursive: true, force: true });
     }
   }
+}
+
+function printPhaseTwoManualChecklist(): void {
+  console.log(renderPhaseTwoManualChecklist());
+}
+
+function printPhaseTwoEvidenceTemplate(): void {
+  console.log(renderPhaseTwoEvidenceTemplate());
+}
+
+async function launchPhaseTwoExternalTerminal(launch: PhaseTwoExternalTerminalLaunch): Promise<PhaseTwoExternalTerminalLaunchResult> {
+  if (process.platform !== "win32") {
+    throw new Error("phase2 launch-terminal can only open a PowerShell window automatically on Windows.");
+  }
+  const { spawn } = await import("node:child_process");
+  const startProcessCommand = buildPhaseTwoExternalTerminalStartProcessCommand(launch);
+  return await new Promise<PhaseTwoExternalTerminalLaunchResult>((resolve, reject) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", startProcessCommand], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdoutText = "";
+    let stderrText = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutText += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrText += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("close", (exitCode) => {
+      if (exitCode !== 0) {
+        reject(new Error(`PowerShell terminal launcher failed with exit code ${exitCode}: ${stderrText.trim()}`));
+        return;
+      }
+      const pidText = stdoutText.match(/\d+/)?.[0];
+      resolve({ pid: pidText ? Number(pidText) : undefined });
+    });
+  });
+}
+
+type PhaseTwoFinalGateStep =
+  | {
+    id: string;
+    label: string;
+    kind: "command";
+    command: string;
+    args: string[];
+    display: string;
+  }
+  | {
+    id: string;
+    label: string;
+    kind: "temp_scan";
+    display: string;
+  };
+
+type PhaseTwoFinalGateStepResult = {
+  id: string;
+  label: string;
+  status: "pass" | "fail";
+  display: string;
+  exitCode?: number;
+  durationMs: number;
+  findings?: string[];
+};
+
+type PhaseTwoFinalGateResult = {
+  status: "pass" | "fail";
+  workspace: string;
+  steps: PhaseTwoFinalGateStepResult[];
+};
+
+function phaseTwoFinalGateSteps(workspace: string): PhaseTwoFinalGateStep[] {
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const cliDisplayPath = "dist\\cli\\index.js";
+  return [
+    {
+      id: "typecheck",
+      label: "TypeScript check",
+      kind: "command",
+      command: npmCommand,
+      args: ["run", "check"],
+      display: `${npmCommand} run check`,
+    },
+    {
+      id: "tests",
+      label: "Full test suite",
+      kind: "command",
+      command: npmCommand,
+      args: ["test"],
+      display: `${npmCommand} test`,
+    },
+    {
+      id: "rich-tui-smoke",
+      label: "Rich TUI smoke",
+      kind: "command",
+      command: process.execPath,
+      args: ["dist/cli/index.js", "smoke", "--rich-tui", "--workspace", workspace],
+      display: `node ${cliDisplayPath} smoke --rich-tui --workspace ${workspace}`,
+    },
+    {
+      id: "real-provider-rich-tui-smoke",
+      label: "Real-provider rich TUI smoke",
+      kind: "command",
+      command: process.execPath,
+      args: ["dist/cli/index.js", "smoke", "--rich-tui-real-provider", "--workspace", workspace],
+      display: `node ${cliDisplayPath} smoke --rich-tui-real-provider --workspace ${workspace}`,
+    },
+    {
+      id: "whitespace",
+      label: "Whitespace check",
+      kind: "command",
+      command: "git",
+      args: ["diff", "--check"],
+      display: "git diff --check",
+    },
+    {
+      id: "temp-file-scan",
+      label: "Temp-file scan",
+      kind: "temp_scan",
+      display: "temp-file scan: find .tmp/.bak/.log/.old/.orig/.rej/.tsbuildinfo outside .git, node_modules, and .agent/tmp",
+    },
+  ];
+}
+
+async function runPhaseTwoFinalGate(workspace: string): Promise<PhaseTwoFinalGateResult> {
+  const resolvedWorkspace = path.resolve(workspace);
+  const steps: PhaseTwoFinalGateStepResult[] = [];
+  for (const step of phaseTwoFinalGateSteps(resolvedWorkspace)) {
+    if (step.kind === "command") {
+      steps.push(await runPhaseTwoFinalGateCommand(resolvedWorkspace, step));
+    } else {
+      steps.push(await runPhaseTwoTempFileScan(resolvedWorkspace, step));
+    }
+  }
+  return {
+    status: steps.every((step) => step.status === "pass") ? "pass" : "fail",
+    workspace: resolvedWorkspace,
+    steps,
+  };
+}
+
+async function runPhaseTwoFinalGateCommand(workspace: string, step: Extract<PhaseTwoFinalGateStep, { kind: "command" }>): Promise<PhaseTwoFinalGateStepResult> {
+  const startedAt = Date.now();
+  const { spawn } = await import("node:child_process");
+  const spawnSpec = phaseTwoFinalGateSpawnSpec(step.command, step.args);
+  const exitCode = await new Promise<number>((resolve, reject) => {
+    const child = spawn(spawnSpec.command, spawnSpec.args, {
+      cwd: workspace,
+      shell: false,
+      stdio: "inherit",
+      windowsHide: true,
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve(code ?? 1));
+  });
+  return {
+    id: step.id,
+    label: step.label,
+    status: exitCode === 0 ? "pass" : "fail",
+    display: step.display,
+    exitCode,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+function phaseTwoFinalGateSpawnSpec(command: string, args: string[]): { command: string; args: string[] } {
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(command)) {
+    return { command: "cmd.exe", args: ["/d", "/s", "/c", command, ...args] };
+  }
+  return { command, args };
+}
+
+async function runPhaseTwoTempFileScan(workspace: string, step: Extract<PhaseTwoFinalGateStep, { kind: "temp_scan" }>): Promise<PhaseTwoFinalGateStepResult> {
+  const startedAt = Date.now();
+  const findings = await collectPhaseTwoTempFileFindings(workspace);
+  return {
+    id: step.id,
+    label: step.label,
+    status: findings.length === 0 ? "pass" : "fail",
+    display: step.display,
+    durationMs: Date.now() - startedAt,
+    findings,
+  };
+}
+
+async function collectPhaseTwoTempFileFindings(workspace: string): Promise<string[]> {
+  const findings: string[] = [];
+  const ignoredDirs = new Set([".git", "node_modules"]);
+  const suspicious = /\.(tmp|bak|log|old|orig|rej|tsbuildinfo)$/i;
+  async function walk(dir: string): Promise<void> {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relative = path.relative(workspace, fullPath).replace(/\\/g, "/");
+      if (entry.isDirectory()) {
+        if (ignoredDirs.has(entry.name) || relative === ".agent/tmp" || relative.startsWith(".agent/tmp/")) {
+          continue;
+        }
+        await walk(fullPath);
+        continue;
+      }
+      if (entry.isFile() && suspicious.test(entry.name)) {
+        findings.push(relative);
+      }
+    }
+  }
+  await walk(workspace);
+  return findings.sort((left, right) => left.localeCompare(right));
+}
+
+function renderPhaseTwoFinalGateResult(result: PhaseTwoFinalGateResult): string {
+  const lines = [
+    "Phase 2 final automated gate",
+    `status=${result.status}`,
+    `workspace=${result.workspace}`,
+    "",
+    "Checks:",
+  ];
+  for (const step of result.steps) {
+    lines.push(`- ${step.id}: ${step.status}`);
+    lines.push(`  command=${step.display}`);
+    if (step.exitCode !== undefined) {
+      lines.push(`  exitCode=${step.exitCode}`);
+    }
+    lines.push(`  durationMs=${step.durationMs}`);
+    if (step.findings?.length) {
+      lines.push(`  findings=${step.findings.join(",")}`);
+    }
+  }
+  lines.push(
+    "",
+    result.status === "pass"
+      ? "Next: soloclaw phase2 closeout-wizard --section C3"
+      : "Fix failed checks, then rerun `soloclaw phase2 final-gate`.",
+    result.status === "pass" ? 'Fallback manual command: soloclaw phase2 evidence-record --section C3 --result "Final automated gate passed; see local terminal output"' : "",
+    result.status === "pass" ? "Only use the fallback if the wizard is not usable." : "",
+    "Never record API keys, key prefixes, bearer tokens, vault passphrases, or Authorization headers.",
+  );
+  return lines.join("\n");
 }
 
 function printPhaseTwoEngineeringSmoke(result: PhaseTwoEngineeringSmokeResult): void {
@@ -10538,8 +11106,10 @@ async function buildSessionDiff(store: AgentStore, sessionId: string) {
       patch,
     };
   });
-  const diffStats = mergeDiffStats(patches.map((patch) => patch.stats));
-  const fileSummaries = summarizeDiffFileSummaries(patches);
+  const fileChangeDiffs = patches.length === 0 ? summarizeFileChangeDiffs(fileChanges, patches.length + 1) : [];
+  const diffSources = [...patches, ...fileChangeDiffs];
+  const diffStats = mergeDiffStats(diffSources.map((patch) => patch.stats));
+  const fileSummaries = summarizeDiffFileSummaries(diffSources);
   const reviewProfile = buildDiffReviewProfile({ patches: patches.length, diffStats, fileSummaries });
   const inspectionPlan = buildDiffInspectionPlan(sessionId, { reviewProfile, fileSummaries });
   return {
@@ -10609,6 +11179,76 @@ function auditPatchInput(metadata: Record<string, unknown> | undefined): string 
   }
   const patch = (input as Record<string, unknown>).patch;
   return typeof patch === "string" ? patch : undefined;
+}
+
+function summarizeFileChangeDiffs(fileChanges: FileChange[], startOrdinal: number): Array<{ ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }> {
+  const summaries: Array<{ ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }> = [];
+  let ordinal = startOrdinal;
+  for (const change of fileChanges.slice().sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+    const summary = summarizeFileChangeDiff(change, ordinal);
+    if (summary) {
+      summaries.push(summary);
+      ordinal += 1;
+    }
+  }
+  return summaries;
+}
+
+function summarizeFileChangeDiff(change: FileChange, ordinal: number): { ordinal: number; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType } | undefined {
+  if (change.kind === "patch") {
+    return undefined;
+  }
+  const pathStats = fileChangePathStats(change);
+  if (!pathStats) {
+    return undefined;
+  }
+  const byPath = new Map<string, UnifiedDiffPathStats>();
+  byPath.set(pathStats.path, {
+    path: pathStats.path,
+    additions: pathStats.additions,
+    deletions: pathStats.deletions,
+  });
+  return {
+    ordinal,
+    stats: diffStatsFromMap(byPath),
+    changeType: pathStats.changeType,
+  };
+}
+
+function fileChangePathStats(change: FileChange): (UnifiedDiffPathStats & { changeType: UnifiedDiffChangeType }) | undefined {
+  if (change.kind === "replace_range") {
+    const replacedLines = replacedLineCount(change.summary);
+    return { path: change.path, additions: replacedLines, deletions: replacedLines, changeType: "modified" };
+  }
+  if (change.kind === "create") {
+    const isOverwrite = Boolean(change.beforeHash);
+    return {
+      path: change.path,
+      additions: 1,
+      deletions: isOverwrite ? 1 : 0,
+      changeType: isOverwrite ? "modified" : "added",
+    };
+  }
+  if (change.kind === "delete") {
+    return { path: change.path, additions: 0, deletions: 1, changeType: "deleted" };
+  }
+  if (change.kind === "rename") {
+    return { path: change.path, additions: 1, deletions: 1, changeType: "renamed" };
+  }
+  return undefined;
+}
+
+function replacedLineCount(summary: string): number {
+  const match = /replaced lines (\d+)-(\d+)/i.exec(summary);
+  if (!match) {
+    return 1;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) {
+    return 1;
+  }
+  return Math.max(1, end - start + 1);
 }
 
 type UnifiedDiffPathStats = {
@@ -10913,7 +11553,7 @@ function formatDiffReviewProfile(profile: UnifiedDiffReviewProfile): string {
   return `${profile.reviewSize}:files=${profile.files},+${profile.additions},-${profile.deletions},largest=${largest}`;
 }
 
-function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: string; stats: UnifiedDiffStats }>): UnifiedDiffFileSummary[] {
+function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: string; stats: UnifiedDiffStats; changeType?: UnifiedDiffChangeType }>): UnifiedDiffFileSummary[] {
   const byPath = new Map<string, {
     path: string;
     additions: number;
@@ -10942,7 +11582,7 @@ function summarizeDiffFileSummaries(patches: Array<{ ordinal: number; patch?: st
       target.patches += 1;
       target.firstPatchOrdinal = Math.min(target.firstPatchOrdinal, patch.ordinal);
       target.lastPatchOrdinal = Math.max(target.lastPatchOrdinal, patch.ordinal);
-      target.changeTypes.add(changeTypes.get(entry.path) ?? "modified");
+      target.changeTypes.add(changeTypes.get(entry.path) ?? patch.changeType ?? "modified");
       byPath.set(entry.path, target);
     }
   }
@@ -11071,6 +11711,7 @@ type SoloclawStatus = {
   workspace: string;
   activeWorkspace?: string;
   workspaceConfigPath: string;
+  workspaceStatus: RichTuiWorkspaceStatus;
   model: {
     activeProvider: ModelProviderName;
     defaultProvider?: ModelProviderName;
@@ -11133,12 +11774,16 @@ async function buildSoloclawStatus(historyRoot: string, workspace: string, activ
   const profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
   const defaultProvider = await profileStore.getDefaultProvider();
   const profiles = await profileStore.list();
-  const readiness = await verifyPhaseOneReadiness(workspace);
+  const [readiness, snapshot] = await Promise.all([
+    verifyPhaseOneReadiness(workspace),
+    collectWorkspaceSnapshot(workspace),
+  ]);
   return {
     generatedAt: new Date().toISOString(),
     workspace,
     activeWorkspace: history.activeWorkspace,
     workspaceConfigPath: workspaceHistoryPath(historyRoot),
+    workspaceStatus: snapshot.git,
     model: {
       activeProvider: activeProvider ?? defaultProvider ?? "mock",
       defaultProvider,
@@ -11207,6 +11852,7 @@ function printSoloclawStatus(status: SoloclawStatus): void {
   console.log(`workspace=${status.workspace}`);
   console.log(`activeWorkspace=${status.activeWorkspace ?? "-"}`);
   console.log(`workspaceConfig=${status.workspaceConfigPath}`);
+  console.log(`git=${formatSoloclawWorkspaceStatus(status.workspaceStatus)}`);
   console.log(`model=${status.model.activeProvider}`);
   console.log(`modelDefault=${status.model.defaultProvider ?? "-"}`);
   console.log(`modelConfig=${status.model.configPath}`);
@@ -11214,6 +11860,15 @@ function printSoloclawStatus(status: SoloclawStatus): void {
   for (const check of status.readiness.checks) {
     console.log(`[${check.status}] ${check.label}: ${check.summary}`);
   }
+}
+
+function formatSoloclawWorkspaceStatus(status: RichTuiWorkspaceStatus): string {
+  if (!status.insideWorkTree) {
+    return status.error ? `not-a-git-worktree (${status.error})` : "not-a-git-worktree";
+  }
+  const branch = status.branch ?? "detached";
+  const dirty = status.dirtyCount === 0 ? "clean" : `${status.dirtyCount}-changed`;
+  return `${branch},${dirty}`;
 }
 
 function printSoloclawQuickstart(view: SoloclawQuickstartView): void {
@@ -11395,6 +12050,435 @@ function stripWorkspaceOption(args: string[]): string[] {
     stripped.push(arg);
   }
   return stripped;
+}
+
+function parsePhaseTwoEvidenceFileOption(args: string[]): string | undefined {
+  const fileFlagIndex = args.indexOf("--file");
+  if (fileFlagIndex >= 0 && args[fileFlagIndex + 1]) {
+    return args[fileFlagIndex + 1];
+  }
+  const fileEquals = args.find((arg) => arg.startsWith("--file="));
+  if (fileEquals) {
+    return fileEquals.slice("--file=".length);
+  }
+  return undefined;
+}
+
+type PhaseTwoCloseoutWizardArgs = {
+  sections: PhaseTwoEvidenceRecordSection[];
+  filePath?: string;
+};
+
+type PhaseTwoWizardQuestioner = {
+  question(question: string): Promise<string>;
+  close(): void;
+};
+
+async function runPhaseTwoCloseoutWizard(workspace: string, args: PhaseTwoCloseoutWizardArgs): Promise<void> {
+  const readiness = await buildPhaseTwoRealProviderReadiness(workspace);
+  const rl = await createPhaseTwoWizardQuestioner();
+  try {
+    console.log("Phase 2 closeout wizard");
+    console.log(`workspace=${workspace}`);
+    console.log(`sections=${args.sections.join(",")}`);
+    console.log(`provider=${readiness.activeProvider}`);
+    console.log(`model=${readiness.model}`);
+    console.log("Never paste API keys, key prefixes, bearer tokens, vault passphrases, or Authorization headers.");
+    console.log("");
+
+    for (const section of args.sections) {
+      await runPhaseTwoCloseoutWizardSection(workspace, {
+        section,
+        filePath: args.filePath,
+        readiness,
+        rl,
+      });
+    }
+
+    if (args.sections.length > 1) {
+      console.log("");
+      console.log("Phase 2 closeout wizard finished");
+      console.log(`sections=${args.sections.join(",")}`);
+      console.log("Rerun `node dist\\cli\\index.js phase2 evidence-check --strict` and `soloclaw phase2 gate`.");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+async function runPhaseTwoCloseoutWizardSection(
+  workspace: string,
+  args: {
+    section: PhaseTwoEvidenceRecordSection;
+    filePath?: string;
+    readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>;
+    rl: PhaseTwoWizardQuestioner;
+  },
+): Promise<void> {
+    console.log(`section=${args.section}`);
+    const confirmed = await askPhaseTwoWizardYesNo(args.rl, phaseTwoWizardObservationPrompt(args.section));
+    if (!confirmed) {
+      throw new Error(`No ${args.section} evidence was recorded because the manual observation was not confirmed.`);
+    }
+
+    const fields = await askPhaseTwoWizardFields(args.rl, args.section, args.readiness);
+    const recorded = await recordPhaseTwoEvidence(workspace, {
+      section: args.section,
+      filePath: args.filePath,
+      fields,
+    });
+    console.log("");
+    console.log(renderPhaseTwoEvidenceRecord(recorded));
+
+    const review = await buildPhaseTwoEvidenceReview(workspace, { section: args.section, filePath: args.filePath });
+    console.log("");
+    console.log(renderPhaseTwoEvidenceReview(review));
+
+    const reviewed = await askPhaseTwoWizardYesNo(args.rl, `After personally reviewing the redacted ${args.section} evidence above, check the ${args.section} closure task? Type yes to confirm: `);
+    if (!reviewed) {
+      console.log("");
+      console.log(`${args.section} closure task left unchecked. Run soloclaw phase2 evidence-show --section ${args.section} when you are ready to review it.`);
+      return;
+    }
+
+    const closure = await checkPhaseTwoClosureTask(workspace, {
+      section: args.section,
+      filePath: args.filePath,
+      confirmReviewed: true,
+    });
+    console.log("");
+    console.log(renderPhaseTwoClosureTask(closure));
+}
+
+async function createPhaseTwoWizardQuestioner(): Promise<PhaseTwoWizardQuestioner> {
+  if (stdin.isTTY) {
+    return createInterface({ input: stdin, output: stdout });
+  }
+  const lines = splitPhaseTwoWizardPipedInput(await readPhaseTwoWizardStdin());
+  let index = 0;
+  return {
+    async question(question: string) {
+      stdout.write(question);
+      const answer = lines[index] ?? "";
+      index += 1;
+      stdout.write("\n");
+      return answer;
+    },
+    close() {},
+  };
+}
+
+async function readPhaseTwoWizardStdin(): Promise<string> {
+  let text = "";
+  for await (const chunk of stdin) {
+    text += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+  }
+  return text;
+}
+
+function splitPhaseTwoWizardPipedInput(input: string): string[] {
+  const normalized = input.replace(/\r\n/gu, "\n").replace(/\r/gu, "\n");
+  if (!normalized) {
+    return [];
+  }
+  const lines = normalized.split("\n");
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  return lines;
+}
+
+function parsePhaseTwoCloseoutWizardArgs(args: string[]): PhaseTwoCloseoutWizardArgs {
+  let section: PhaseTwoEvidenceRecordSection | undefined;
+  let filePath: string | undefined;
+  let all = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const rawArg = args[index];
+    const equalsIndex = rawArg.indexOf("=");
+    const arg = equalsIndex > 0 ? rawArg.slice(0, equalsIndex) : rawArg;
+    const inlineValue = equalsIndex > 0 ? rawArg.slice(equalsIndex + 1) : undefined;
+    const takeValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue;
+      }
+      const next = args[index + 1];
+      if (!next || next.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      index += 1;
+      return next;
+    };
+    if (arg === "--all") {
+      all = true;
+      continue;
+    }
+    if (arg === "--section") {
+      section = parsePhaseTwoEvidenceRecordSection(takeValue());
+      continue;
+    }
+    if (arg === "--file" || arg === "--evidence-file") {
+      filePath = takeValue();
+      continue;
+    }
+    if (!rawArg.startsWith("--") && rawArg.toLowerCase() === "all") {
+      all = true;
+      continue;
+    }
+    if (!rawArg.startsWith("--") && !section) {
+      section = parsePhaseTwoEvidenceRecordSection(rawArg);
+      continue;
+    }
+    throw new Error(`Unknown phase2 closeout-wizard option: ${arg}.`);
+  }
+  if (all && section) {
+    throw new Error("Use either --all or --section C1|C2|C3, not both.");
+  }
+  if (all) {
+    return { sections: ["C1", "C2", "C3"], filePath };
+  }
+  if (!section) {
+    throw new Error("Usage: soloclaw phase2 closeout-wizard --section C1|C2|C3 [--all] [--workspace path]");
+  }
+  return { sections: [section], filePath };
+}
+
+function phaseTwoWizardObservationPrompt(section: PhaseTwoEvidenceRecordSection): string {
+  if (section === "C1") {
+    return "Did you personally confirm the real Soloclaw terminal rendered, handled F2/ctrl+p/arrows/Space/Enter, and restored the cursor? Type yes to continue: ";
+  }
+  if (section === "C2") {
+    return "Did you personally confirm /phase2 readiness, /model check, the read-only package.json task, live progress, final answer, and no key echo? Type yes to continue: ";
+  }
+  return "Did you personally run and review the final automated gate after C1 and C2 evidence were recorded? Type yes to continue: ";
+}
+
+async function askPhaseTwoWizardFields(
+  rl: PhaseTwoWizardQuestioner,
+  section: PhaseTwoEvidenceRecordSection,
+  readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>,
+): Promise<Record<string, string>> {
+  if (section === "C1") {
+    return {
+      terminal: await askPhaseTwoWizardValue(rl, "Terminal", "Windows Terminal"),
+      shell: await askPhaseTwoWizardValue(rl, "Shell", "PowerShell"),
+      nodeVersion: await askPhaseTwoWizardValue(rl, "Node version", process.version),
+      result: await askPhaseTwoWizardValue(rl, "Result", "Rich TUI rendered and exited cleanly"),
+      renderingIssues: await askPhaseTwoWizardValue(rl, "Rendering issues", "none"),
+    };
+  }
+  if (section === "C2") {
+    return {
+      provider: await askPhaseTwoWizardValue(rl, "Provider", readiness.activeProvider),
+      model: await askPhaseTwoWizardValue(rl, "Model", readiness.model),
+      baseUrl: await askPhaseTwoWizardValue(rl, "Base URL", readiness.baseUrl),
+      modelSetup: await askPhaseTwoWizardValue(rl, "/model setup result", readiness.status === "ready_for_manual_run" ? "skipped; readiness ready_for_manual_run" : "completed after readiness warning"),
+      modelCheck: await askPhaseTwoWizardValue(rl, "/model check result", "ready"),
+      taskResult: await askPhaseTwoWizardValue(rl, "Task result", "Read-only package.json task returned an answer"),
+      liveProgress: await askPhaseTwoWizardValue(rl, "Live progress rows", "visible"),
+      leakCheck: await askPhaseTwoWizardValue(rl, "Leak check", "passed"),
+    };
+  }
+  return {
+    check: await askPhaseTwoWizardValue(rl, "npm.cmd run check", "passed"),
+    test: await askPhaseTwoWizardValue(rl, "npm.cmd test", "passed"),
+    richSmoke: await askPhaseTwoWizardValue(rl, "Rich TUI smoke", "passed"),
+    realProviderSmoke: await askPhaseTwoWizardValue(rl, "Real-provider rich TUI smoke", "passed"),
+    evidenceCheck: await askPhaseTwoWizardValue(rl, "Evidence check", "passed"),
+    gitDiff: await askPhaseTwoWizardValue(rl, "git diff --check", "passed or only LF/CRLF warnings"),
+    tempScan: await askPhaseTwoWizardValue(rl, "Temp-file scan", "passed"),
+    result: await askPhaseTwoWizardValue(rl, "Result", "Final automated gate passed; see local terminal output"),
+  };
+}
+
+async function askPhaseTwoWizardValue(rl: PhaseTwoWizardQuestioner, label: string, defaultValue: string): Promise<string> {
+  const raw = (await rl.question(`${label} [${defaultValue}]: `)).trim();
+  return raw || defaultValue;
+}
+
+async function askPhaseTwoWizardYesNo(rl: PhaseTwoWizardQuestioner, question: string): Promise<boolean> {
+  const answer = (await rl.question(question)).trim().toLowerCase();
+  return answer === "yes" || answer === "y" || answer === "是";
+}
+
+function parsePhaseTwoEvidenceRecordArgs(args: string[]): {
+  section: PhaseTwoEvidenceRecordSection;
+  filePath?: string;
+  date?: string;
+  fields: Record<string, string>;
+} {
+  let section: PhaseTwoEvidenceRecordSection | undefined;
+  let filePath: string | undefined;
+  let date: string | undefined;
+  const fields: Record<string, string> = {};
+
+  for (let index = 0; index < args.length; index += 1) {
+    const rawArg = args[index];
+    const equalsIndex = rawArg.indexOf("=");
+    const arg = equalsIndex > 0 ? rawArg.slice(0, equalsIndex) : rawArg;
+    const inlineValue = equalsIndex > 0 ? rawArg.slice(equalsIndex + 1) : undefined;
+    const takeValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue;
+      }
+      const next = args[index + 1];
+      if (!next || next.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      index += 1;
+      return next;
+    };
+
+    if (arg === "--section") {
+      section = parsePhaseTwoEvidenceRecordSection(takeValue());
+      continue;
+    }
+    if (arg === "--file" || arg === "--evidence-file") {
+      filePath = takeValue();
+      continue;
+    }
+    if (arg === "--date") {
+      date = takeValue();
+      continue;
+    }
+
+    const fieldName = phaseTwoEvidenceRecordFieldName(arg);
+    if (fieldName) {
+      fields[fieldName] = takeValue();
+      continue;
+    }
+
+    throw new Error(`Unknown phase2 evidence-record option: ${arg}.`);
+  }
+
+  if (!section) {
+    throw new Error("Usage: soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]");
+  }
+  return { section, filePath, date, fields };
+}
+
+function parsePhaseTwoEvidenceShowArgs(args: string[]): {
+  section: PhaseTwoEvidenceRecordSection;
+  filePath?: string;
+} {
+  let section: PhaseTwoEvidenceRecordSection | undefined;
+  let filePath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const rawArg = args[index];
+    if (rawArg === "--json") {
+      continue;
+    }
+    const equalsIndex = rawArg.indexOf("=");
+    const arg = equalsIndex > 0 ? rawArg.slice(0, equalsIndex) : rawArg;
+    const inlineValue = equalsIndex > 0 ? rawArg.slice(equalsIndex + 1) : undefined;
+    const takeValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue;
+      }
+      const next = args[index + 1];
+      if (!next || next.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      index += 1;
+      return next;
+    };
+    if (arg === "--section") {
+      section = parsePhaseTwoEvidenceRecordSection(takeValue());
+      continue;
+    }
+    if (arg === "--file" || arg === "--evidence-file") {
+      filePath = takeValue();
+      continue;
+    }
+    if (!rawArg.startsWith("--") && !section) {
+      section = parsePhaseTwoEvidenceRecordSection(rawArg);
+      continue;
+    }
+    throw new Error(`Unknown phase2 evidence-show option: ${arg}.`);
+  }
+  if (!section) {
+    throw new Error("Usage: soloclaw phase2 evidence-show --section C1|C2|C3");
+  }
+  return { section, filePath };
+}
+
+function parsePhaseTwoClosureTaskArgs(args: string[]): {
+  section: PhaseTwoEvidenceRecordSection;
+  filePath?: string;
+  confirmReviewed: boolean;
+} {
+  let section: PhaseTwoEvidenceRecordSection | undefined;
+  let filePath: string | undefined;
+  let confirmReviewed = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const rawArg = args[index];
+    const equalsIndex = rawArg.indexOf("=");
+    const arg = equalsIndex > 0 ? rawArg.slice(0, equalsIndex) : rawArg;
+    const inlineValue = equalsIndex > 0 ? rawArg.slice(equalsIndex + 1) : undefined;
+    const takeValue = (): string => {
+      if (inlineValue !== undefined) {
+        return inlineValue;
+      }
+      const next = args[index + 1];
+      if (!next || next.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      index += 1;
+      return next;
+    };
+    if (arg === "--section") {
+      section = parsePhaseTwoEvidenceRecordSection(takeValue());
+      continue;
+    }
+    if (arg === "--file" || arg === "--evidence-file") {
+      filePath = takeValue();
+      continue;
+    }
+    if (arg === "--confirm-reviewed") {
+      confirmReviewed = true;
+      continue;
+    }
+    throw new Error(`Unknown phase2 closure-task option: ${arg}.`);
+  }
+  if (!section) {
+    throw new Error("Usage: soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed");
+  }
+  return { section, filePath, confirmReviewed };
+}
+
+function parsePhaseTwoEvidenceRecordSection(value: string): PhaseTwoEvidenceRecordSection {
+  const normalized = value.toUpperCase();
+  if (normalized === "C1" || normalized === "C2" || normalized === "C3") {
+    return normalized;
+  }
+  throw new Error("Phase 2 evidence section must be C1, C2, or C3.");
+}
+
+function phaseTwoEvidenceRecordFieldName(arg: string): string | undefined {
+  const fields: Record<string, string> = {
+    "--terminal": "terminal",
+    "--shell": "shell",
+    "--node": "nodeVersion",
+    "--node-version": "nodeVersion",
+    "--result": "result",
+    "--rendering-issues": "renderingIssues",
+    "--provider": "provider",
+    "--model": "model",
+    "--base-url": "baseUrl",
+    "--model-setup": "modelSetup",
+    "--model-check": "modelCheck",
+    "--task-result": "taskResult",
+    "--live-progress": "liveProgress",
+    "--leak-check": "leakCheck",
+    "--check": "check",
+    "--test": "test",
+    "--rich-smoke": "richSmoke",
+    "--real-provider-smoke": "realProviderSmoke",
+    "--evidence-check": "evidenceCheck",
+    "--git-diff": "gitDiff",
+    "--temp-scan": "tempScan",
+    "--note": "note",
+  };
+  return fields[arg];
 }
 
 function hasWorkspaceOption(args: string[]): boolean {
@@ -11618,6 +12702,36 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   let profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
   let provider = (await profileStore.getDefaultProvider()) ?? "mock";
   const status = await buildSoloclawStatus(historyRoot, workspace, provider);
+  const activeProfile = status.model.profiles.find((profile) => profile.name === provider);
+  if (shouldUseRichTui({
+    stdinIsTTY: stdin.isTTY === true,
+    stdoutIsTTY: stdout.isTTY === true,
+    forcePlain: process.env.SOLOCLAW_PLAIN_TUI === "1",
+  })) {
+    await startRichTuiShell({
+      workspace,
+      provider,
+      model: activeProfile?.defaultModel ?? provider,
+      readiness: status.readiness.status,
+      version: "0.1.0",
+      workspaceStatus: status.workspaceStatus,
+      modelProfiles: status.model.profiles,
+      runTask: (input) => runRichTuiAgentTask({ ...input, workspace, provider }),
+      resumeSession: (input) => resumeRichTuiAgentSession({ ...input, workspace, provider }),
+      setupModel: async () => {
+        const result = await runRichTuiModelSetup(workspace, historyRoot, profileStore);
+        provider = result.provider;
+        return result;
+      },
+      setupModelFromWizard: async (input) => {
+        const result = await saveRichTuiModelSetup(workspace, historyRoot, profileStore, input);
+        provider = result.provider;
+        return result;
+      },
+      listSessions: () => buildRichTuiSessions(workspace),
+    });
+    return;
+  }
   const rl = createInterface({ input: stdin, output: stdout });
   console.log("Soloclaw");
   console.log(`Workspace: ${workspace}`);
@@ -12257,20 +13371,171 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         stdout.write("soloclaw> ");
         continue;
       }
-      await ensureTuiModelSecretReady(tuiInput, profileStore, provider);
-      const platform = await createLocalPlatform(workspace, { provider, knowledgeQuery: task });
       try {
-        const answer = await platform.agent.run(task);
-        console.log(answer);
+        await ensureTuiModelSecretReady(tuiInput, profileStore, provider, workspace);
+        const platform = await createLocalPlatform(workspace, {
+          provider,
+          knowledgeQuery: task,
+          maxSteps: TUI_RUN_MAX_STEPS,
+          onAgentProgress: createTuiRunProgressReporter(),
+        });
+        try {
+          const result = await platform.agent.runWithSession(task);
+          const completedSession = result.session ? (await platform.store.getSession(result.session.id)) ?? result.session : undefined;
+          console.log(result.finalAnswer);
+          if (completedSession) {
+            console.log(`session: ${completedSession.id}`);
+            console.log(`timeline: /session timeline ${completedSession.id}`);
+            console.log(`review: /session review ${completedSession.id}`);
+          }
+        } finally {
+          platform.locks.close?.();
+          platform.store.close();
+        }
+      } catch (error) {
+        console.log(`Error: ${formatTuiTaskError(error)}`);
       } finally {
-        platform.locks.close?.();
-        platform.store.close();
+        stdout.write("soloclaw> ");
       }
-      stdout.write("soloclaw> ");
     }
   } finally {
     rl.close();
   }
+}
+
+async function runRichTuiAgentTask(input: RichTuiTaskRunInput & { workspace: string; provider: ModelProviderName }): Promise<RichTuiTaskRunResult> {
+  const startedAt = Date.now();
+  const platform = await createLocalPlatform(input.workspace, {
+    provider: input.provider,
+    knowledgeQuery: input.task,
+    targetMode: richTuiModeToTargetMode(input.mode),
+    maxSteps: TUI_RUN_MAX_STEPS,
+    onAgentProgress: input.onEvent,
+  });
+  try {
+    const result = await platform.agent.runWithSession(input.task);
+    return {
+      answer: result.finalAnswer,
+      sessionId: result.session?.id,
+      durationMs: Date.now() - startedAt,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function resumeRichTuiAgentSession(input: RichTuiSessionResumeInput & { workspace: string; provider: ModelProviderName }): Promise<RichTuiTaskRunResult> {
+  const startedAt = Date.now();
+  const platform = await createLocalPlatform(input.workspace, {
+    provider: input.provider,
+    maxSteps: TUI_RUN_MAX_STEPS,
+    onAgentProgress: input.onEvent,
+  });
+  try {
+    const answer = await platform.agent.resume(input.sessionId);
+    return {
+      answer,
+      sessionId: input.sessionId,
+      durationMs: Date.now() - startedAt,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function buildRichTuiSessions(workspace: string): Promise<RichTuiSessionsResult> {
+  const platform = await createLocalPlatform(workspace);
+  try {
+    const list = await buildSessionList(platform.store, { limit: 5 });
+    return {
+      returned: list.summary.returned,
+      scanned: list.summary.scanned,
+      limit: list.summary.limit,
+      byStatus: list.summary.byStatus,
+      byOutcome: list.summary.byOutcome,
+      pendingApprovals: list.summary.pendingApprovals,
+      changedSessions: list.summary.changedSessions,
+      sessions: list.sessions.map((entry) => ({
+        id: entry.session.id,
+        targetMode: entry.session.targetMode,
+        status: entry.session.status,
+        outcome: entry.summary.outcome,
+        pendingApprovals: entry.summary.pendingApprovals,
+        commandsFinished: entry.summary.commandsFinished,
+        failedCommands: entry.summary.failedCommands,
+        changedPaths: entry.summary.changedPaths,
+        updatedAt: entry.session.updatedAt,
+        objective: entry.session.objective,
+        handoffState: entry.summary.handoffState,
+        handoffNextCommand: entry.summary.handoffNextCommand,
+      })),
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+function richTuiModeToTargetMode(mode: RichTuiMode): "plan" | "build" | "goal" {
+  if (mode === "Plan") {
+    return "plan";
+  }
+  if (mode === "Goal") {
+    return "goal";
+  }
+  return "build";
+}
+
+async function runRichTuiModelSetup(workspace: string, historyRoot: string, profileStore: LocalProviderProfileStore): Promise<RichTuiModelSetupResult> {
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    const result = await promptTuiModelSetupMenu(createTuiLineReader(rl), workspace, profileStore);
+    const status = await buildSoloclawStatus(historyRoot, workspace, result.provider);
+    stdout.write(`Model: ${result.provider} ${result.profile.defaultModel}\n`);
+    return {
+      provider: result.provider,
+      model: result.profile.defaultModel,
+      readiness: status.readiness.status,
+    };
+  } finally {
+    rl.close();
+  }
+}
+
+async function saveRichTuiModelSetup(
+  workspace: string,
+  historyRoot: string,
+  profileStore: LocalProviderProfileStore,
+  input: RichModelSetupRequest,
+): Promise<RichTuiModelSetupResult> {
+  const apiKeySecretRef = input.protocol === "mock"
+    ? undefined
+    : await storeModelApiKeyFromRichSetup(workspace, input.provider, input.apiKey);
+  const profile = await profileStore.set({
+    name: input.provider,
+    protocol: input.protocol,
+    defaultBaseUrl: input.baseUrl,
+    defaultModel: input.model,
+    apiKeyEnvNames: input.protocol === "mock" ? [] : input.apiKeyEnvNames,
+    apiKeySecretRef,
+  });
+  await profileStore.setDefaultProvider(input.provider);
+  const status = await buildSoloclawStatus(historyRoot, workspace, input.provider);
+  return {
+    provider: input.provider,
+    model: profile.defaultModel,
+    readiness: status.readiness.status,
+  };
+}
+
+async function storeModelApiKeyFromRichSetup(workspace: string, provider: ModelProviderName, apiKey: string | undefined): Promise<string> {
+  if (!apiKey?.trim()) {
+    throw new Error("API key cannot be empty.");
+  }
+  ensureLocalSecretVaultPassphraseFile(workspace);
+  return storeModelApiKeySecret(workspace, provider, apiKey.trim());
 }
 
 async function promptLine(question: string): Promise<string> {
@@ -12284,6 +13549,9 @@ async function promptLine(question: string): Promise<string> {
 
 type TuiQuestionReader = {
   question(question: string): Promise<string>;
+  discardNextEmptyLine?(): void;
+  pause?(): void;
+  resume?(): void;
 };
 
 type TuiLineReader = TuiQuestionReader & {
@@ -12292,6 +13560,7 @@ type TuiLineReader = TuiQuestionReader & {
 
 function createTuiLineReader(rl: ReadlineInterface): TuiLineReader {
   const iterator = rl[Symbol.asyncIterator]();
+  let pendingEmptyLinesToDiscard = 0;
   const reader: TuiLineReader = {
     async readLine() {
       const next = await iterator.next();
@@ -12299,11 +13568,29 @@ function createTuiLineReader(rl: ReadlineInterface): TuiLineReader {
     },
     async question(question: string) {
       stdout.write(question);
-      const line = await reader.readLine();
-      if (line === undefined) {
-        throw new Error("Input ended before setup completed.");
+      while (true) {
+        const line = await reader.readLine();
+        if (line === undefined) {
+          throw new Error("Input ended before setup completed.");
+        }
+        if (pendingEmptyLinesToDiscard > 0) {
+          if (!line.trim()) {
+            pendingEmptyLinesToDiscard -= 1;
+            continue;
+          }
+          pendingEmptyLinesToDiscard = 0;
+        }
+        return line;
       }
-      return line;
+    },
+    discardNextEmptyLine() {
+      pendingEmptyLinesToDiscard += 1;
+    },
+    pause() {
+      rl.pause();
+    },
+    resume() {
+      rl.resume();
     },
   };
   return reader;
@@ -12340,21 +13627,17 @@ async function promptTuiModelSetupMenu(
     .map((name) => profiles.find((profile) => profile.name === name))
     .filter((profile): profile is ModelProviderProfileView => Boolean(profile));
   stdout.write("Model setup\n");
-  stdout.write("Choose a provider:\n");
-  orderedProfiles.forEach((profile, index) => {
-    stdout.write(`${index + 1}. ${modelProviderMenuLine(profile)}\n`);
-  });
-  const providerIndex = await promptChoiceIndex(rl, "Provider [1]: ", orderedProfiles.length, 1);
+  const providerIndex = await promptTuiChoiceIndex(rl, "Provider", orderedProfiles.map(modelProviderMenuLine), 0);
   const current = orderedProfiles[providerIndex];
   const providerName = current.name;
 
-  const baseUrl = await promptTuiModelBaseUrl(rl, current);
+  const baseUrl = requiresCustomBaseUrl(current) ? await promptTuiModelBaseUrl(rl, current) : current.defaultBaseUrl;
   const model = await promptTuiModelId(rl, current);
   const keyConfig = await promptTuiModelApiKeyConfig(rl, workspace, current);
   const profile = await profileStore.set({
     name: providerName,
     protocol: current.protocol,
-    defaultBaseUrl: baseUrl,
+    defaultBaseUrl: baseUrl ?? current.defaultBaseUrl,
     defaultModel: model,
     apiKeyEnvNames: keyConfig.apiKeyEnvNames,
     apiKeySecretRef: keyConfig.apiKeySecretRef,
@@ -12364,39 +13647,35 @@ async function promptTuiModelSetupMenu(
 }
 
 function modelProviderMenuLine(profile: ModelProviderProfileView): string {
-  const models = modelChoicesForProfile(profile).slice(0, 3).join(",") || profile.defaultModel;
-  const baseUrl = profile.defaultBaseUrl ?? "-";
-  const links = [
-    profile.apiKeysUrl ? `keys=${profile.apiKeysUrl}` : undefined,
-    profile.pricingUrl ? `pricing=${profile.pricingUrl}` : undefined,
-  ].filter(Boolean).join(" ");
-  return `${profile.displayName ?? profile.name} (${profile.name}) base=${baseUrl} models=${models}${links ? ` ${links}` : ""}`;
+  return `${profile.displayName ?? profile.name} (${profile.defaultBaseUrl ?? "no base URL"})`;
 }
 
-async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string | undefined> {
-  if (profile.protocol === "mock") {
-    return undefined;
+async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string> {
+  while (true) {
+    const value = (await rl.question(`Base URL [${profile.defaultBaseUrl ?? ""}]: `)).trim();
+    const baseUrl = value || profile.defaultBaseUrl;
+    if (!baseUrl) {
+      throw new Error("Base URL cannot be empty.");
+    }
+    if (isHttpUrl(baseUrl)) {
+      return baseUrl;
+    }
+    stdout.write("Base URL must be an http(s) URL.\n");
   }
-  const defaultBaseUrl = profile.defaultBaseUrl ?? "";
-  stdout.write("Base URL:\n");
-  stdout.write(`1. ${defaultBaseUrl || "provider default"}\n`);
-  stdout.write("2. Custom URL\n");
-  const choice = await promptChoiceIndex(rl, "Base URL [1]: ", 2, 1);
-  if (choice === 0) {
-    return defaultBaseUrl;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
   }
-  const custom = (await rl.question("Custom base URL: ")).trim();
-  return custom || defaultBaseUrl;
 }
 
 async function promptTuiModelId(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string> {
   const modelIds = modelChoicesForProfile(profile);
-  stdout.write("Model ID:\n");
-  modelIds.forEach((modelId, index) => {
-    stdout.write(`${index + 1}. ${modelId}\n`);
-  });
-  stdout.write(`${modelIds.length + 1}. Custom model ID\n`);
-  const choice = await promptChoiceIndex(rl, "Model [1]: ", modelIds.length + 1, 1);
+  const choice = await promptTuiChoiceIndex(rl, "Model ID", [...modelIds, "Custom model ID"], 0);
   if (choice < modelIds.length) {
     return modelIds[choice];
   }
@@ -12415,30 +13694,153 @@ async function promptTuiModelApiKeyConfig(
   if (profile.protocol === "mock") {
     return { apiKeyEnvNames: [] };
   }
-  stdout.write("API key:\n");
-  stdout.write("1. Paste now and save to encrypted local vault\n");
-  stdout.write("2. Use environment variable name\n");
-  stdout.write("3. Keep current/default key setting\n");
-  stdout.write("4. No API key required\n");
-  const choice = await promptChoiceIndex(rl, "API key [1]: ", 4, 1);
-  if (choice === 0) {
-    await ensureSecretVaultPassphrase(rl);
-    const apiKey = (await rl.question("API key: ")).trim();
-    if (!apiKey) {
-      throw new Error("API key was empty.");
+  ensureLocalSecretVaultPassphraseFile(workspace);
+  const apiKey = await promptRequiredTuiLine(rl, "API key: ", "API key cannot be empty.");
+  const secretRef = await storeModelApiKeySecret(workspace, profile.name, apiKey);
+  return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: secretRef };
+}
+
+function requiresCustomBaseUrl(profile: ModelProviderProfileView): boolean {
+  return profile.name === "openai_compatible" || profile.name === "anthropic_compatible";
+}
+
+async function promptRequiredTuiLine(rl: TuiQuestionReader, question: string, emptyMessage: string): Promise<string> {
+  while (true) {
+    const value = (await rl.question(question)).trim();
+    if (value) {
+      return value;
     }
-    const secretRef = await storeModelApiKeySecret(workspace, profile.name, apiKey);
-    return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: secretRef };
+    stdout.write(`${emptyMessage}\n`);
   }
-  if (choice === 1) {
-    const defaultEnv = profile.apiKeyEnvNames[0] ?? "MODEL_API_KEY";
-    const envName = (await rl.question(`API key env [${defaultEnv}]: `)).trim() || defaultEnv;
-    return { apiKeyEnvNames: [envName] };
+}
+
+async function promptTuiChoiceIndex(rl: TuiQuestionReader, title: string, labels: string[], defaultIndex: number): Promise<number> {
+  if (labels.length === 0) {
+    throw new Error(`${title} has no choices.`);
   }
-  if (choice === 2) {
-    return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: profile.apiKeySecretRef };
+  const boundedDefault = Math.min(Math.max(defaultIndex, 0), labels.length - 1);
+  if (canPromptRawTuiChoice()) {
+    return promptRawTuiChoiceIndex(rl, title, labels, boundedDefault);
   }
-  return { apiKeyEnvNames: [] };
+  for (const line of renderTuiChoiceLines(title, labels, boundedDefault, undefined)) {
+    stdout.write(`${line}\n`);
+  }
+  return promptChoiceIndex(rl, `${title} [${boundedDefault + 1}]: `, labels.length, boundedDefault + 1);
+}
+
+function renderTuiChoiceLines(title: string, labels: string[], cursorIndex: number, selectedIndex: number | undefined): string[] {
+  return [
+    title,
+    "Use Up/Down, Space, Enter.",
+    ...labels.map((label, index) => {
+      const cursor = index === cursorIndex ? ">" : " ";
+      const checked = index === selectedIndex ? "[x]" : "[ ]";
+      return `${cursor} ${checked} ${label}`;
+    }),
+  ];
+}
+
+type RawTuiInput = typeof stdin & {
+  isRaw?: boolean;
+  setRawMode?: (mode: boolean) => typeof stdin;
+};
+
+type RawTuiKey = {
+  ctrl?: boolean;
+  name?: string;
+};
+
+function canPromptRawTuiChoice(): boolean {
+  const input = stdin as RawTuiInput;
+  return Boolean(input.isTTY && stdout.isTTY && typeof input.setRawMode === "function");
+}
+
+async function promptRawTuiChoiceIndex(rl: TuiQuestionReader, title: string, labels: string[], defaultIndex: number): Promise<number> {
+  const input = stdin as RawTuiInput;
+  let cursorIndex = defaultIndex;
+  let selectedIndex: number | undefined;
+  let renderedLines = 0;
+  let cleanup = () => {};
+
+  const draw = () => {
+    const lines = renderTuiChoiceLines(title, labels, cursorIndex, selectedIndex);
+    if (renderedLines > 0) {
+      stdout.write(`\x1b[${renderedLines}A`);
+    }
+    for (const line of lines) {
+      stdout.write(`\r\x1b[2K${line}\n`);
+    }
+    renderedLines = lines.length;
+  };
+
+  rl.pause?.();
+  stdout.write("\x1b[?25l");
+  emitKeypressEvents(stdin);
+  const wasRaw = input.isRaw === true;
+  input.setRawMode?.(true);
+  stdin.resume();
+
+  try {
+    return await new Promise<number>((resolve, reject) => {
+      let done = false;
+      const finish = (index: number) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        rl.discardNextEmptyLine?.();
+        selectedIndex = index;
+        cursorIndex = index;
+        draw();
+        resolve(index);
+      };
+      const fail = (error: Error) => {
+        if (done) {
+          return;
+        }
+        done = true;
+        reject(error);
+      };
+      const onKeypress = (str: string | undefined, key: RawTuiKey = {}) => {
+        if (key.ctrl && key.name === "c") {
+          fail(new Error("Cancelled."));
+          return;
+        }
+        if (key.name === "escape") {
+          fail(new Error("Cancelled."));
+          return;
+        }
+        if (key.name === "up") {
+          cursorIndex = (cursorIndex + labels.length - 1) % labels.length;
+          draw();
+          return;
+        }
+        if (key.name === "down") {
+          cursorIndex = (cursorIndex + 1) % labels.length;
+          draw();
+          return;
+        }
+        if (str === " " || key.name === "space") {
+          selectedIndex = cursorIndex;
+          draw();
+          return;
+        }
+        if (str === "\r" || str === "\n" || key.name === "return" || key.name === "enter") {
+          finish(selectedIndex ?? cursorIndex);
+        }
+      };
+      cleanup = () => {
+        stdin.off("keypress", onKeypress);
+        input.setRawMode?.(wasRaw);
+        stdout.write("\x1b[?25h");
+        rl.resume?.();
+      };
+      stdin.on("keypress", onKeypress);
+      draw();
+    });
+  } finally {
+    cleanup();
+  }
 }
 
 async function promptChoiceIndex(rl: TuiQuestionReader, question: string, count: number, defaultOneBased: number): Promise<number> {
@@ -12465,15 +13867,24 @@ async function ensureSecretVaultPassphrase(rl: TuiQuestionReader): Promise<void>
   process.env.AGENT_SECRETS_PASSPHRASE = passphrase;
 }
 
-async function ensureTuiModelSecretReady(rl: TuiQuestionReader, profileStore: LocalProviderProfileStore, provider: ModelProviderName): Promise<void> {
+async function ensureTuiModelSecretReady(rl: TuiQuestionReader, profileStore: LocalProviderProfileStore, provider: ModelProviderName, workspace: string): Promise<void> {
   const profile = (await profileStore.list()).find((entry) => entry.name === provider);
-  if (profile?.apiKeySecretRef && !process.env.AGENT_SECRETS_PASSPHRASE) {
+  if (profile?.apiKeySecretRef && !process.env.AGENT_SECRETS_PASSPHRASE && !(await fileExists(localSecretVaultPassphraseFile(workspace)))) {
     await ensureSecretVaultPassphrase(rl);
   }
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function storeModelApiKeySecret(workspace: string, provider: ModelProviderName, apiKey: string): Promise<string> {
-  const secrets = new EncryptedFileSecretStore(path.join(workspace, ".agent", "secrets.vault.json"));
+  const secrets = new EncryptedFileSecretStore(path.join(workspace, ".agent", "secrets.vault.json"), localSecretVaultStoreOptions(workspace));
   const ref = await secrets.putSecret({
     name: `model:${provider}`,
     class: "model_api_key",
@@ -13025,6 +14436,51 @@ function formatTuiModelSetupError(error: unknown): string {
   return message;
 }
 
+function createTuiRunProgressReporter(): (event: AgentLoopProgressEvent) => void {
+  const printedSessions = new Set<string>();
+  return (event) => {
+    switch (event.type) {
+      case "session_started":
+        if (!printedSessions.has(event.sessionId)) {
+          printedSessions.add(event.sessionId);
+          console.log(`Run session: ${event.sessionId}`);
+        }
+        return;
+      case "step_started":
+        console.log(`[step ${event.step}] model call started`);
+        return;
+      case "model_finished":
+        console.log(`[step ${event.step}] model call ${event.responseType}${event.toolCallCount ? ` toolCalls=${event.toolCallCount}` : ""} durationMs=${event.durationMs}`);
+        return;
+      case "model_failed":
+        console.log(`[step ${event.step}] model call failed durationMs=${event.durationMs}`);
+        return;
+      case "tool_started":
+        console.log(`[step ${event.step}] tool ${event.toolName} started`);
+        return;
+      case "tool_finished":
+        console.log(`[step ${event.step}] tool ${event.toolName} ${event.status === "ok" ? "ok" : `failed${event.errorCode ? ` code=${event.errorCode}` : ""}`}`);
+        return;
+      case "step_limit_reached":
+        console.log(`[step ${event.maxSteps}] step budget reached`);
+        return;
+      case "assistant_note":
+      case "assistant_text":
+      case "file_changed":
+      case "run_failed":
+        return;
+    }
+  };
+}
+
+function formatTuiTaskError(error: unknown): string {
+  return redactInlineSecretText(error instanceof Error ? error.message : String(error));
+}
+
+function redactInlineSecretText(value: string): string {
+  return value.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED:api_key]");
+}
+
 function localModelAliasBaseUrl(value: string | undefined): string | undefined {
   return value === "local" || value === "ollama" ? "http://localhost:11434/v1" : undefined;
 }
@@ -13057,6 +14513,7 @@ Start here:
   soloclaw setup --local --model <model>        Configure local/Ollama-style OpenAI-compatible model
   soloclaw ask "inspect this workspace"         Run a mock-safe project-reading task
   soloclaw smoke                                Run the local mock smoke task
+  soloclaw smoke --rich-tui-real-provider       Run injected rich TUI smoke with the configured real provider
   soloclaw doctor [--json]                      Check Phase 1 readiness
 
 Everyday commands:
@@ -13101,6 +14558,7 @@ Usage:
   soloclaw tui [--workspace path]
   soloclaw status [--workspace path] [--json]
   soloclaw smoke [--workspace path]
+  soloclaw smoke --rich-tui-real-provider [--workspace path]
   soloclaw check [--workspace path] [--json]
   soloclaw doctor [--workspace path] [--json]
   soloclaw providers [--workspace path] [--json]
@@ -13130,7 +14588,23 @@ Usage:
   agent goal [--spec spec-id] "your objective"
   agent inspect [--workspace path] [--json] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n]
   agent phase1 verify [--json]
-  agent phase2 verify [--workspace path] [--json] [--cleanup]
+  soloclaw phase2 verify [--workspace path] [--json] [--cleanup]
+  soloclaw phase2 status [--json]
+  soloclaw phase2 next [--workspace path] [--json]
+  soloclaw phase2 review [--workspace path] [--json]
+  soloclaw phase2 final-gate [--workspace path] [--print]
+  soloclaw phase2 readiness [--workspace path] [--json]
+  soloclaw phase2 launch-terminal [--workspace path] [--print]
+  soloclaw phase2 checklist
+  soloclaw phase2 closeout-guide
+  soloclaw phase2 operator-runbook [--workspace path]
+  soloclaw phase2 closeout-wizard --section C1|C2|C3 [--workspace path]
+  soloclaw phase2 evidence-template
+  soloclaw phase2 evidence-show --section C1|C2|C3 [--workspace path] [--json]
+  soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]
+  soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed
+  soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]
+  agent phase2 checklist
   agent local status [--workspace path] [--json] [--limit n]
   agent local service [--workspace path] [--json] [--limit n]
   agent local logs [--workspace path] [--json] [--limit n]
