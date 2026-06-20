@@ -156,6 +156,10 @@ type SessionInspectionSnapshot = {
     modelTotalTokens: number;
     finalAnswerChars: number;
     finalAnswerState: "visible" | "empty" | "missing";
+    runtimeStops: number;
+    lastRuntimeStopKind?: string;
+    lastRuntimeStopReason?: string;
+    resumeCommand?: string;
     reviewProfile: UnifiedDiffReviewProfile;
     nextActionStatuses: Record<string, number>;
     lastCommand?: SessionCommandSummary;
@@ -287,6 +291,8 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
   const pendingApprovals = approvals.filter((approval) => approval.status === "pending");
   const approvedApprovals = approvals.filter((approval) => approval.status === "approved");
   const deniedApprovals = approvals.filter((approval) => approval.status === "denied");
+  const runtimeStopEvents = auditEvents.filter(isRuntimeStoppedAuditEvent).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const lastRuntimeStop = runtimeStopEvents.at(-1);
 
   return {
     kind: "session_report" as const,
@@ -319,6 +325,10 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
       modelCompletionTokens: modelUsage.totals.completionTokens,
       modelTotalTokens: modelUsage.totals.totalTokens,
       modelDurationMs: modelUsage.totals.durationMs,
+      runtimeStops: runtimeStopEvents.length,
+      lastRuntimeStopKind: runtimeStopKind(lastRuntimeStop?.metadata),
+      lastRuntimeStopReason: runtimeStopReason(lastRuntimeStop?.metadata),
+      resumeCommand: runtimeStopResumeCommand(lastRuntimeStop?.metadata),
       auditEvents: auditEvents.length,
     },
     modelUsage,
@@ -1156,6 +1166,8 @@ async function buildSessionInspectionSnapshot(store: AgentStore, sessionId: stri
     .at(-1);
   const finalAnswerChars = finalAssistantMessage?.content.trim().length ?? 0;
   const finalAnswerState = finalAssistantMessage ? finalAnswerChars > 0 ? "visible" : "empty" : "missing";
+  const runtimeStopEvents = auditEvents.filter(isRuntimeStoppedAuditEvent).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const lastRuntimeStop = runtimeStopEvents.at(-1);
   const nextActions = buildSessionNextActions(sessionId, {
     outcome,
     sessionStatus: session.status,
@@ -1207,6 +1219,10 @@ async function buildSessionInspectionSnapshot(store: AgentStore, sessionId: stri
       modelTotalTokens: modelUsage.totals.totalTokens,
       finalAnswerChars,
       finalAnswerState,
+      runtimeStops: runtimeStopEvents.length,
+      lastRuntimeStopKind: runtimeStopKind(lastRuntimeStop?.metadata),
+      lastRuntimeStopReason: runtimeStopReason(lastRuntimeStop?.metadata),
+      resumeCommand: runtimeStopResumeCommand(lastRuntimeStop?.metadata),
       reviewProfile,
       nextActionStatuses: countNextActionStatuses(nextActions),
       lastCommand: commandSummaries.at(-1),
@@ -1658,6 +1674,22 @@ function sessionResultOutcome(sessionStatus: string, lastCommandExitCode: number
     return "in_progress";
   }
   return "unknown";
+}
+
+function isRuntimeStoppedAuditEvent(event: AuditEvent): boolean {
+  return event.type === "agent.event" && event.metadata?.eventType === "runtime_stopped";
+}
+
+function runtimeStopKind(metadata: Record<string, unknown> | undefined): string | undefined {
+  return typeof metadata?.stopKind === "string" ? metadata.stopKind : undefined;
+}
+
+function runtimeStopReason(metadata: Record<string, unknown> | undefined): string | undefined {
+  return typeof metadata?.reason === "string" ? metadata.reason : undefined;
+}
+
+function runtimeStopResumeCommand(metadata: Record<string, unknown> | undefined): string | undefined {
+  return typeof metadata?.resumeCommand === "string" ? metadata.resumeCommand : undefined;
 }
 
 function commandExitCode(metadata: Record<string, unknown> | undefined): number | null | undefined {

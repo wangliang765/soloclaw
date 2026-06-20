@@ -8,6 +8,7 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { AgentLoop } from "../core/agent-loop.js";
+import type { AgentRunEvent } from "../core/agent-events.js";
 import { AgentHealthService } from "../agents/agent-health-service.js";
 import { AuditExportService } from "../audit/audit-export-service.js";
 import type { ArtifactStore, DeleteArtifactContentInput, GetArtifactContentInput, GetArtifactContentResult, PutArtifactInput, PutArtifactResult } from "../artifacts/artifact-store.js";
@@ -55,7 +56,7 @@ import { LocalSchedulerService } from "../scheduler/local-scheduler-service.js";
 import { MemoryAgentStore } from "../store/memory-agent-store.js";
 import { SqliteAgentStore } from "../store/sqlite-agent-store.js";
 import { SpecificationService } from "../specifications/specification-service.js";
-import { buildSessionVerificationView } from "../sessions/session-inspection-view.js";
+import { buildSessionReportView, buildSessionVerificationView } from "../sessions/session-inspection-view.js";
 import { TaskAssignmentService } from "../tasks/task-assignment-service.js";
 import { TaskOperationsService } from "../tasks/task-operations-service.js";
 import { startLocalRoomWebServer } from "../web/local-room-web-server.js";
@@ -4966,8 +4967,9 @@ test("session verification fails when the final assistant answer is empty", asyn
   assert.equal(verification.checks.find((check) => check.id === "final-answer-visible")?.status, "fail");
 });
 
-test("agent loop step budget stop points to the recorded session timeline", async () => {
+test("agent loop step budget stop records a resumable runtime stop", async () => {
   const store = new MemoryAgentStore();
+  const events: AgentRunEvent[] = [];
   const model: ModelClient = {
     async complete() {
       return {
@@ -4990,6 +4992,9 @@ test("agent loop step budget stop points to the recorded session timeline", asyn
     store,
     actor: { type: "user", id: "operator", displayName: "Operator" },
     maxSteps: 1,
+    onProgress: (event) => {
+      events.push(event as AgentRunEvent);
+    },
   });
 
   const answer = await agent.run("keep calling tools forever");
@@ -4997,8 +5002,116 @@ test("agent loop step budget stop points to the recorded session timeline", asyn
 
   assert.match(answer, /Stopped after 1 steps without a final answer/);
   assert.match(answer, new RegExp(`session: ${session.id}`));
-  assert.match(answer, new RegExp(`agent session timeline ${session.id}`));
+  assert.match(answer, new RegExp(`resume: agent resume ${session.id}`));
   assert.equal(session.status, "failed");
+  assert.equal(events.some((event) => event.type === "step_limit_reached" && event.maxSteps === 1), true);
+  assert.equal(
+    events.some((event) =>
+      event.type === "runtime_stopped" &&
+      event.stopKind === "step_budget" &&
+      event.targetMode === "build" &&
+      event.resumeCommand === `agent resume ${session.id}`
+    ),
+    true,
+  );
+  const auditEvents = await store.listAuditEvents({ sessionId: session.id, limit: 20 });
+  assert.equal(
+    auditEvents.some((event) =>
+      event.summary === "agent.event.runtime_stopped" &&
+      event.metadata?.stopKind === "step_budget" &&
+      event.metadata?.resumeCommand === `agent resume ${session.id}`
+    ),
+    true,
+  );
+});
+
+test("agent loop resume adds explicit continuation context", async () => {
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
+  const session = await store.createSession({
+    objective: "finish the original long task",
+    targetMode: "goal",
+    status: "failed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await store.appendMessage({ sessionId: session.id, message: { role: "system", content: "system" } });
+  await store.appendMessage({ sessionId: session.id, message: { role: "user", content: "finish the original long task" } });
+  await store.appendMessage({
+    sessionId: session.id,
+    message: {
+      role: "assistant",
+      content: "Stopped after 1 steps without a final answer.\nsession: " + session.id,
+    },
+  });
+
+  let prompt = "";
+  const model: ModelClient = {
+    async complete(request) {
+      prompt = request.messages.map((message) => message.content).join("\n---\n");
+      return { type: "message", content: "continued final answer" };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    store,
+    actor,
+    targetMode: "goal",
+  });
+
+  const answer = await agent.resume(session.id);
+  const messages = await store.getMessages(session.id);
+
+  assert.equal(answer, "continued final answer");
+  assert.match(prompt, /Continue this existing Soloclaw session/);
+  assert.match(prompt, /Previous objective:\s*finish the original long task/);
+  assert.match(prompt, /Continuation reason:\s*CLI resume/);
+  assert.match(prompt, /Do not restart project discovery unless needed/);
+  assert.equal(messages.some((message) => message.role === "user" && /Continue this existing Soloclaw session/.test(message.content)), true);
+});
+
+test("session report exposes runtime stop evidence", async () => {
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
+  const session = await store.createSession({
+    objective: "resume this stopped goal",
+    targetMode: "goal",
+    status: "failed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await store.recordAuditEvent({
+    id: "audit_runtime_stop",
+    type: "agent.event",
+    actor,
+    sessionId: session.id,
+    summary: "agent.event.runtime_stopped",
+    metadata: {
+      eventType: "runtime_stopped",
+      stopKind: "step_budget",
+      targetMode: "goal",
+      maxSteps: 3,
+      reason: "The agent reached its step budget before the model returned a final response.",
+      resumeCommand: `agent resume ${session.id}`,
+    },
+    artifactRefs: [],
+    createdAt: new Date().toISOString(),
+  });
+
+  const report = await buildSessionReportView(store, session.id);
+  const summary = report.summary as typeof report.summary & {
+    runtimeStops?: number;
+    lastRuntimeStopKind?: string;
+    lastRuntimeStopReason?: string;
+    resumeCommand?: string;
+  };
+
+  assert.equal(summary.runtimeStops, 1);
+  assert.equal(summary.lastRuntimeStopKind, "step_budget");
+  assert.match(summary.lastRuntimeStopReason ?? "", /step budget/);
+  assert.equal(summary.resumeCommand, `agent resume ${session.id}`);
 });
 
 test("model usage service summarizes audit metadata and optional cost estimates", async () => {
@@ -8705,6 +8818,151 @@ test("agent phase2 checklist prints manual rich TUI and real-provider closure st
   assert.match(result.stdout, /C3 evidence:/);
   assert.doesNotMatch(result.stdout, /sk-[A-Za-z0-9_-]{12,}/);
   assert.doesNotMatch(result.stdout, /Authorization:\s*Bearer/i);
+});
+
+test("agent phase3 checklist and gate expose runtime reliability checks", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-gate-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-fixture", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>Phase 3 fixture</title>\n<main>ready</main>\n", "utf8");
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+
+  const checklist = await run(process.execPath, [cli, "phase3", "checklist"], dir);
+  assert.equal(checklist.exitCode, 0, checklist.stderr);
+  assert.match(checklist.stdout, /Phase 3 runtime reliability checklist/);
+  assert.match(checklist.stdout, /C4.*real project build/i);
+  assert.match(checklist.stdout, /C5.*resume/i);
+  assert.match(checklist.stdout, /C6.*recovery/i);
+
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.exitCode, 0, gate.stderr);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    phase?: string;
+    status?: string;
+    workspace?: string;
+    secretMatches?: number;
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+  assert.equal(parsed.phase, "phase3");
+  assert.equal(parsed.status, "pass");
+  assert.equal(parsed.workspace, dir);
+  assert.equal(parsed.secretMatches, 0);
+  assert.equal(parsed.checks?.some((check) => check.id === "C4" && check.status === "pass"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "C5" && check.status === "pass"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "C6" && check.status === "pass"), true);
+});
+
+test("agent phase3 gate C4 runs a reversible build smoke against a real workspace", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-c4-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-c4-fixture", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>C4 fixture</title>\n<main>ready</main>\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    checks?: Array<{
+      id?: string;
+      status?: string;
+      summary?: string;
+      sessionId?: string;
+      targetMode?: string;
+      changedPaths?: number;
+      verificationStatus?: string;
+      cleanup?: { markerPresentAfterCleanup?: boolean };
+    }>;
+  };
+  const c4 = parsed.checks?.find((check) => check.id === "C4");
+
+  assert.equal(c4?.status, "pass");
+  assert.match(c4?.sessionId ?? "", /^sess_/);
+  assert.equal(c4?.targetMode, "build");
+  assert.ok((c4?.changedPaths ?? 0) > 0);
+  assert.equal(c4?.verificationStatus, "pass");
+  assert.equal(c4?.cleanup?.markerPresentAfterCleanup, false);
+  assert.doesNotMatch(await fs.readFile(path.join(dir, "index.html"), "utf8"), /soloclaw-phase3-c4-marker/);
+});
+
+test("agent phase3 gate C5 resumes a goal session after a step-budget stop", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-c5-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-c5-fixture", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>C5 fixture</title>\n<main>resume ready</main>\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    checks?: Array<{
+      id?: string;
+      status?: string;
+      summary?: string;
+      sessionId?: string;
+      resumedSessionId?: string;
+      targetMode?: string;
+      runtimeStops?: number;
+      stopKind?: string;
+      resumeCommand?: string;
+      verificationStatus?: string;
+      finalAnswerChars?: number;
+    }>;
+  };
+  const c5 = parsed.checks?.find((check) => check.id === "C5");
+
+  assert.equal(c5?.status, "pass");
+  assert.match(c5?.sessionId ?? "", /^sess_/);
+  assert.equal(c5?.resumedSessionId, c5?.sessionId);
+  assert.equal(c5?.targetMode, "goal");
+  assert.ok((c5?.runtimeStops ?? 0) >= 1);
+  assert.equal(c5?.stopKind, "step_budget");
+  assert.equal(c5?.resumeCommand?.includes(c5?.sessionId ?? "missing"), true);
+  assert.equal(c5?.verificationStatus, "pass");
+  assert.ok((c5?.finalAnswerChars ?? 0) > 0);
+});
+
+test("agent phase3 gate C6 records command failure recovery evidence", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-c6-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-c6-fixture", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>C6 fixture</title>\n<main>recovery ready</main>\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    checks?: Array<{
+      id?: string;
+      status?: string;
+      summary?: string;
+      sessionId?: string;
+      targetMode?: string;
+      commandsFinished?: number;
+      failedCommands?: number;
+      recovered?: boolean;
+      verificationStatus?: string;
+      finalAnswerChars?: number;
+    }>;
+  };
+  const c6 = parsed.checks?.find((check) => check.id === "C6");
+
+  assert.equal(c6?.status, "pass");
+  assert.match(c6?.sessionId ?? "", /^sess_/);
+  assert.equal(c6?.targetMode, "build");
+  assert.ok((c6?.commandsFinished ?? 0) >= 2);
+  assert.ok((c6?.failedCommands ?? 0) >= 1);
+  assert.equal(c6?.recovered, true);
+  assert.equal(c6?.verificationStatus, "pass");
+  assert.ok((c6?.finalAnswerChars ?? 0) > 0);
 });
 
 test("agent phase2 closeout-guide prints a step-by-step manual acceptance path", async (t) => {

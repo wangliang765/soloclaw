@@ -686,6 +686,59 @@ test("rich TUI projects agent events into safe activity and step status", async 
   applyAgentRunEventToRichState(state, { type: "step_limit_reached", runId: "run_test", maxSteps: 30 });
 
   assert.equal(state.currentActivity, "Stopped");
+
+  applyAgentRunEventToRichState(state, {
+    type: "runtime_stopped",
+    runId: "run_test",
+    sessionId: "sess_goal_stop",
+    stopKind: "step_budget",
+    targetMode: "goal",
+    maxSteps: 30,
+    reason: "The agent reached its step budget before the model returned a final response.",
+    resumeCommand: "agent resume sess_goal_stop",
+  });
+
+  assert.equal(state.runHealth, "Stopped");
+  assert.equal(state.currentActivity, "Stopped");
+  assert.equal(state.lastEventTitle, "Step budget reached: 30");
+  assert.equal(state.projectedAssistantMessages?.some((message) =>
+    message.parts.some((part) => part.type === "status" && part.status === "stopped" && /Step budget reached: 30/.test(part.title))
+  ), true);
+});
+
+test("rich TUI renders runtime stop rows with resume guidance", async () => {
+  const { applyAgentRunEventToRichState, createStatusMessage } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Goal",
+    input: "",
+    messages: [{ role: "user", text: "Finish this long task" }],
+    events: [],
+    activeSessionId: "sess_goal_stop",
+  };
+  const event = {
+    type: "runtime_stopped" as const,
+    runId: "run_test",
+    sessionId: "sess_goal_stop",
+    stopKind: "step_budget" as const,
+    targetMode: "goal" as const,
+    maxSteps: 30,
+    reason: "The agent reached its step budget before the model returned a final response.",
+    resumeCommand: "agent resume sess_goal_stop",
+  };
+
+  applyAgentRunEventToRichState(state, event);
+
+  const row = renderEventRow(event);
+  const screen = renderConversationScreen(state, { columns: 120, rows: 28 });
+  assert.match(row, /Step budget reached: 30/);
+  assert.match(row, /Next: \/continue or \/resume/);
+  assert.match(createStatusMessage(state), /Next: \/continue or \/resume/);
+  assert.match(screen, /Run: Stopped/);
+  assert.match(screen, /Step budget reached: 30/);
 });
 
 test("rich TUI renders current activity and step in conversation chrome", () => {

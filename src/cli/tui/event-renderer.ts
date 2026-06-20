@@ -43,6 +43,11 @@ export function renderEventRow(event: AgentRunEvent, width = 100): string {
       return clip(`${ansi.purple}FILE${ansi.reset} ${event.change} ${event.path}`, width);
     case "step_limit_reached":
       return clip(`${ansi.orange}!${ansi.reset} Step budget reached: ${event.maxSteps}`, width);
+    case "runtime_stopped": {
+      const title = event.stopKind === "step_budget" ? `Step budget reached: ${event.maxSteps ?? "-"}` : event.reason;
+      const tail = event.resumeCommand ? "Next: /continue or /resume" : undefined;
+      return clip(`${ansi.orange}!${ansi.reset} ${title}${tail ? ` (${tail})` : ""}`, width);
+    }
     case "run_failed":
       return clip(`${ansi.orange}ERR${ansi.reset} ${event.message}`, width);
   }

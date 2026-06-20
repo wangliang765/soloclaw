@@ -7,6 +7,7 @@ import { TaskOperationsService } from "../tasks/task-operations-service.js";
 import { redactAgentEventText, summarizeToolInput } from "./agent-event-redaction.js";
 import type { AgentRunEvent, AgentRunEventSink } from "./agent-events.js";
 import { withEventDefaults } from "./agent-events.js";
+import { formatRuntimeStopAnswer, stepBudgetRuntimeStop } from "./agent-runtime-stop.js";
 import { ContextManager } from "./context-manager.js";
 
 export type AgentContextAttachment = {
@@ -121,7 +122,14 @@ export class AgentLoop {
     const actor = this.actor ?? session.createdBy;
     const tasks = new TaskOperationsService(this.store);
     const resumed = await tasks.markResumed({ sessionId, actor, reason: "CLI resume" });
-    return this.runContext(ContextManager.fromMessages(messages), resumed);
+    const continuation = formatResumeContinuationPrompt(session, "CLI resume");
+    const context = ContextManager.fromMessages(messages);
+    context.addUser(continuation);
+    await this.store.appendMessage({
+      sessionId,
+      message: { role: "user", content: continuation },
+    });
+    return this.runContext(context, resumed);
   }
 
   private async runPlan(userTask: string, existingSession?: Session): Promise<string> {
@@ -309,8 +317,22 @@ export class AgentLoop {
     if (session) {
       await this.store?.updateSessionStatus(session.id, "failed");
     }
+    const stop = stepBudgetRuntimeStop({
+      sessionId: session?.id,
+      targetMode: this.targetMode,
+      maxSteps: this.maxSteps,
+    });
     await this.emitProgress({ type: "step_limit_reached", maxSteps: this.maxSteps, sessionId: session?.id });
-    return this.formatStepLimitStop(session);
+    await this.emitProgress({
+      type: "runtime_stopped",
+      sessionId: session?.id,
+      stopKind: stop.kind,
+      targetMode: stop.targetMode,
+      maxSteps: stop.maxSteps,
+      reason: stop.reason,
+      resumeCommand: stop.resumeCommand,
+    });
+    return formatRuntimeStopAnswer(stop);
   }
 
   private async requestVisibleFinalAnswer(context: ContextManager, session?: Session, step?: number): Promise<void> {
@@ -370,19 +392,6 @@ export class AgentLoop {
       artifactRefs: [],
       createdAt: event.createdAt ?? new Date().toISOString(),
     });
-  }
-
-  private formatStepLimitStop(session?: Session): string {
-    const lines = [
-      `Stopped after ${this.maxSteps} steps without a final answer.`,
-      "The agent reached its step budget before the model returned a final response.",
-    ];
-    if (session) {
-      lines.push(`session: ${session.id}`);
-      lines.push(`timeline: agent session timeline ${session.id}`);
-      lines.push(`review: agent session review ${session.id}`);
-    }
-    return lines.join("\n");
   }
 
   private enrichUserTask(userTask: string): string {
@@ -681,6 +690,15 @@ function safeAgentRunEventMetadata(event: AgentRunEvent): Record<string, unknown
         ...base,
         maxSteps: event.maxSteps,
       };
+    case "runtime_stopped":
+      return {
+        ...base,
+        stopKind: event.stopKind,
+        targetMode: event.targetMode,
+        maxSteps: event.maxSteps,
+        reason: redactAgentEventText(event.reason),
+        resumeCommand: event.resumeCommand,
+      };
     case "run_failed":
       return {
         ...base,
@@ -707,6 +725,16 @@ Do not execute tools. Do not modify files. Produce a concrete implementation pla
 const EMPTY_FINAL_RESPONSE_REPAIR_PROMPT =
   "Your previous response had no visible final answer. Return a concise visible final answer now. Do not call tools.";
 
+const RESUME_CONTINUATION_PROMPT = `Continue this existing Soloclaw session.
+
+Previous objective:
+{objective}
+
+Continuation reason:
+{reason}
+
+Continue from the existing transcript. Do not restart project discovery unless needed. Verify the remaining task before claiming completion.`;
+
 const BUILD_MODE_TASK_PREFIX = `Target mode: build.
 Execute the user's current request using available tools when needed. Keep the scope tied to the current prompt.
 Use file tools such as create_file, replace_range, and apply_patch for workspace file changes; reserve run_command for verification or commands that cannot be expressed with file tools.
@@ -719,4 +747,10 @@ When you verify work with a command, choose a command that must exit 0 when the 
 
 function formatPlanTask(userTask: string): string {
   return `Create an implementation plan for this objective. Do not execute tools or make changes.\n\nObjective:\n${userTask}`;
+}
+
+function formatResumeContinuationPrompt(session: Session, reason: string): string {
+  return RESUME_CONTINUATION_PROMPT
+    .replace("{objective}", session.objective)
+    .replace("{reason}", reason);
 }

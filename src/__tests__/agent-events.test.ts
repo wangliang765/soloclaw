@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentLoop } from "../core/agent-loop.js";
 import type { AgentRunEvent } from "../core/agent-events.js";
+import { withEventDefaults } from "../core/agent-events.js";
 import { redactAgentEventText, summarizeToolInput } from "../core/agent-event-redaction.js";
 import { projectAgentRunEventsToAssistantMessages } from "../core/agent-message-projector.js";
 import type { ModelClient } from "../model/model-client.js";
@@ -49,6 +50,27 @@ test("agent run event type supports folded tool rows", () => {
   };
   assert.equal(event.type, "tool_finished");
   assert.equal(event.detailsHidden, true);
+});
+
+test("runtime stopped events keep safe resumability metadata", () => {
+  const event = withEventDefaults({
+    type: "runtime_stopped",
+    runId: "run_phase3",
+    sessionId: "sess_phase3",
+    stopKind: "step_budget",
+    targetMode: "goal",
+    maxSteps: 2,
+    reason: "Step budget reached before final answer.",
+    resumeCommand: "agent resume sess_phase3",
+  });
+
+  assert.equal(event.type, "runtime_stopped");
+  assert.equal(event.sessionId, "sess_phase3");
+  assert.equal(event.stopKind, "step_budget");
+  assert.equal(event.targetMode, "goal");
+  assert.equal(event.maxSteps, 2);
+  assert.equal(event.resumeCommand, "agent resume sess_phase3");
+  assert.equal(typeof event.createdAt, "string");
 });
 
 test("projects agent events into replayable safe assistant parts", () => {

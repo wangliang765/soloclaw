@@ -190,6 +190,16 @@ export function projectAgentRunEventsToAssistantMessages(events: readonly AgentR
           createdAt: event.createdAt,
         });
         break;
+      case "runtime_stopped":
+        message.parts.push({
+          type: "status",
+          title: event.stopKind === "step_budget"
+            ? `Step budget reached: ${event.maxSteps ?? "-"}`
+            : redactAgentEventText(event.reason),
+          status: "stopped",
+          createdAt: event.createdAt,
+        });
+        break;
       case "run_failed":
         message.parts.push({
           type: "error",

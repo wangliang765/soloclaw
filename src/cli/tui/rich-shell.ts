@@ -1010,6 +1010,7 @@ function updateRunHealthFromEvent(state: RichTuiState, event: AgentRunEvent): vo
       state.runHealth = "Working";
       break;
     case "step_limit_reached":
+    case "runtime_stopped":
       state.runHealth = "Stopped";
       break;
     case "model_failed":
@@ -1072,6 +1073,10 @@ function updateActivityFromEvent(state: RichTuiState, event: AgentRunEvent): voi
     case "step_limit_reached":
       state.currentActivity = "Stopped";
       state.lastEventTitle = `Step budget reached: ${event.maxSteps}`;
+      break;
+    case "runtime_stopped":
+      state.currentActivity = "Stopped";
+      state.lastEventTitle = event.stopKind === "step_budget" ? `Step budget reached: ${event.maxSteps ?? "-"}` : event.reason;
       break;
     case "assistant_note":
       state.lastEventTitle = event.text;

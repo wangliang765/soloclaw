@@ -1,5 +1,6 @@
 import type { ModelResponse, ModelUsage } from "../protocol/types.js";
 import type { ExecutionTargetMode } from "../domain/index.js";
+import type { AgentRuntimeStopKind } from "./agent-runtime-stop.js";
 
 export type AgentRunEventBase = {
   runId: string;
@@ -51,6 +52,14 @@ export type AgentRunEvent =
     })
   | (AgentRunEventBase & { type: "file_changed"; step: number; path: string; change: "create" | "modify" | "delete" | "patch" })
   | (AgentRunEventBase & { type: "step_limit_reached"; maxSteps: number })
+  | (AgentRunEventBase & {
+      type: "runtime_stopped";
+      stopKind: AgentRuntimeStopKind;
+      targetMode?: ExecutionTargetMode;
+      maxSteps?: number;
+      reason: string;
+      resumeCommand?: string;
+    })
   | (AgentRunEventBase & { type: "run_failed"; message: string });
 
 export type AgentRunEventSink = (event: AgentRunEvent) => void | Promise<void>;
