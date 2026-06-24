@@ -157,7 +157,7 @@ function parseModelProviderName(value: string): ModelProviderName {
 }
 
 function parseProtocol(value: unknown): ModelProviderProfile["protocol"] {
-  if (value === "openai_chat" || value === "anthropic_messages" || value === "mock") {
+  if (value === "openai_chat" || value === "openai_responses" || value === "anthropic_messages" || value === "mock") {
     return value;
   }
   throw new Error(`Invalid model provider protocol: ${String(value)}.`);

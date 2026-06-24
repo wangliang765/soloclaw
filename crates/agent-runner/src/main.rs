@@ -9,7 +9,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_OUTPUT: usize = 20_000;
 
@@ -194,9 +194,10 @@ fn search_text(root: &Path, query: String, glob: Option<String>) -> Result<Value
         command.arg("--glob").arg(glob);
     }
     command.arg(query).arg(root);
-    let output = command
-        .output()
-        .map_err(|error| format!("rg failed: {error}"))?;
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(_) => return Ok(json!(search_text_fallback(root, &query, glob.as_deref()))),
+    };
     if output.status.code() == Some(1) {
         return Ok(json!(""));
     }
@@ -208,6 +209,128 @@ fn search_text(root: &Path, query: String, glob: Option<String>) -> Result<Value
     Ok(json!(truncate(&text)))
 }
 
+fn search_text_fallback(root: &Path, query: &str, glob: Option<&str>) -> String {
+    let mut matches = Vec::new();
+    walk_search(root, Path::new(""), query, glob, &mut matches);
+    truncate(&matches.join("\n"))
+}
+
+fn walk_search(
+    root: &Path,
+    relative_dir: &Path,
+    query: &str,
+    glob: Option<&str>,
+    matches: &mut Vec<String>,
+) {
+    if matches.join("\n").chars().count() >= MAX_OUTPUT {
+        return;
+    }
+    let absolute_dir = root.join(relative_dir);
+    let Ok(entries) = fs::read_dir(&absolute_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let relative_path = relative_dir.join(&name);
+        let normalized = normalize_output_path(&relative_path);
+        if normalized.is_empty() {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if name == "node_modules" || name == ".git" || name == ".agent" {
+                continue;
+            }
+            walk_search(root, &relative_path, query, glob, matches);
+            continue;
+        }
+        if !file_type.is_file() || !glob_matches(glob, &normalized) {
+            continue;
+        }
+        search_file(&entry.path(), &normalized, query, matches);
+    }
+}
+
+fn search_file(absolute_path: &Path, relative_path: &str, query: &str, matches: &mut Vec<String>) {
+    let Ok(content) = fs::read_to_string(absolute_path) else {
+        return;
+    };
+    for (index, line) in split_lines_like_typescript(&content).iter().enumerate() {
+        if line.contains(query) {
+            matches.push(format!("{relative_path}:{}:{line}", index + 1));
+            if matches.join("\n").chars().count() >= MAX_OUTPUT {
+                return;
+            }
+        }
+    }
+}
+
+fn glob_matches(glob: Option<&str>, input_path: &str) -> bool {
+    let Some(glob) = glob else {
+        return true;
+    };
+    wildcard_match(&normalize_glob_path(glob), input_path)
+}
+
+fn normalize_output_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn normalize_glob_path(value: &str) -> String {
+    value.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn wildcard_match(pattern: &str, input: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let input = input.as_bytes();
+    let (mut p, mut i) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_match = 0usize;
+    while i < input.len() {
+        if p < pattern.len() && (pattern[p] == b'?' && input[i] != b'/' || pattern[p] == input[i]) {
+            p += 1;
+            i += 1;
+        } else if p + 1 < pattern.len() && pattern[p] == b'*' && pattern[p + 1] == b'*' {
+            star = Some(p);
+            star_match = i;
+            p += 2;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            star_match = i;
+            p += 1;
+        } else if let Some(star_index) = star {
+            if pattern[star_index] != b'*' || (star_index + 1 >= pattern.len() || pattern[star_index + 1] != b'*') && input[star_match] == b'/' {
+                return false;
+            }
+            p = if star_index + 1 < pattern.len() && pattern[star_index + 1] == b'*' {
+                star_index + 2
+            } else {
+                star_index + 1
+            };
+            star_match += 1;
+            i = star_match;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += if p + 1 < pattern.len() && pattern[p + 1] == b'*' {
+            2
+        } else {
+            1
+        };
+    }
+    p == pattern.len()
+}
+
 fn run_command(
     root: &Path,
     command: String,
@@ -216,42 +339,68 @@ fn run_command(
 ) -> Result<Value, String> {
     let started_at = Instant::now();
     let profile = command_execution_profile(execution_profile.as_deref().unwrap_or("local-safe"))?;
+    let stdout_path = temp_output_path("stdout");
+    let stderr_path = temp_output_path("stderr");
+    let stdout_file = fs::File::create(&stdout_path)
+        .map_err(|error| format!("stdout capture failed: {error}"))?;
+    let stderr_file = fs::File::create(&stderr_path)
+        .map_err(|error| format!("stderr capture failed: {error}"))?;
     let mut child = shell_command(&command)
         .current_dir(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .map_err(|error| format!("spawn failed: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
+    let exit_code;
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("wait failed: {error}"))?
-            .is_some()
         {
+            exit_code = status.code();
             break;
         }
         if Instant::now() >= deadline {
             timed_out = true;
             let _ = child.kill();
+            exit_code = child.wait().ok().and_then(|status| status.code());
             break;
         }
         thread::sleep(Duration::from_millis(10));
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("output failed: {error}"))?;
+    let stdout = read_command_output_file(&stdout_path);
+    let stderr = read_command_output_file(&stderr_path);
     Ok(json!({
-        "stdout": truncate(&String::from_utf8_lossy(&output.stdout)),
-        "stderr": truncate(&String::from_utf8_lossy(&output.stderr)),
-        "exitCode": output.status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "exitCode": exit_code,
         "timedOut": timed_out,
         "durationMs": started_at.elapsed().as_millis() as u64,
         "executionProfile": profile,
     }))
+}
+
+fn temp_output_path(kind: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    env::temp_dir().join(format!(
+        "agent-runner-{}-{stamp}-{kind}.log",
+        std::process::id()
+    ))
+}
+
+fn read_command_output_file(path: &Path) -> String {
+    let output = fs::read(path)
+        .map(|bytes| truncate(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default();
+    let _ = fs::remove_file(path);
+    output
 }
 
 fn create_file(
@@ -548,6 +697,30 @@ mod tests {
         assert_eq!(allowed["path"], ".agent/tmp/runtime-smoke.txt");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_returns_after_shell_exits_when_background_child_keeps_stdio_open() {
+        let root = temp_root();
+        fs::write(
+            root.join("hold-open.cmd"),
+            "@echo off\r\nping 127.0.0.1 -n 4 >nul\r\n",
+        )
+        .unwrap();
+
+        let started_at = Instant::now();
+        let result =
+            run_command(&root, "start /B \"\" hold-open.cmd".to_string(), 200, None).unwrap();
+
+        assert_eq!(result["timedOut"], false);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "background child kept command open for {:?}: {result}",
+            started_at.elapsed()
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_root() -> PathBuf {

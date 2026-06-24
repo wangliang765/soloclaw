@@ -1,6 +1,15 @@
 import type { ExecutionTargetMode } from "../domain/index.js";
 
-export type AgentRuntimeStopKind = "step_budget" | "approval_required" | "model_error" | "tool_error";
+export type AgentRuntimeStopKind =
+  | "step_budget"
+  | "model_call_budget"
+  | "model_failure_budget"
+  | "duration_budget"
+  | "idle_budget"
+  | "doom_loop"
+  | "approval_required"
+  | "model_error"
+  | "tool_error";
 
 export type AgentRuntimeStop = {
   kind: AgentRuntimeStopKind;
@@ -39,6 +48,25 @@ export function stepBudgetRuntimeStop(input: {
     targetMode: input.targetMode,
     maxSteps: input.maxSteps,
     reason: "The agent reached its step budget before the model returned a final response.",
+    resumeCommand: input.sessionId ? `agent resume ${input.sessionId}` : undefined,
+  };
+}
+
+export function modelBudgetRuntimeStop(input: {
+  sessionId?: string;
+  targetMode: ExecutionTargetMode;
+  kind: "model_call_budget" | "model_failure_budget";
+  reason?: string;
+}): AgentRuntimeStop {
+  return {
+    kind: input.kind,
+    sessionId: input.sessionId,
+    targetMode: input.targetMode,
+    reason:
+      input.reason ??
+      (input.kind === "model_call_budget"
+        ? "The agent reached its model call budget before completing the task."
+        : "The agent reached its model failure budget before completing the task."),
     resumeCommand: input.sessionId ? `agent resume ${input.sessionId}` : undefined,
   };
 }

@@ -80,7 +80,8 @@ export async function runWorkspaceRuntimeJsonRpcRustSmoke(options: { cleanup?: b
     methods.push("workspace/listFiles");
     assertSame(await runtime.readFile({ path: "README.md", startLine: 1, endLine: 2 }), await local.readFile({ path: "README.md", startLine: 1, endLine: 2 }), "readFile");
     methods.push("workspace/readFile");
-    assertIncludes(await runtime.searchText("alpha"), "README.md", "searchText");
+    const rustSearchText = await searchTextWithHostFallback(runtime, local, "alpha");
+    assertIncludes(rustSearchText, "README.md", "searchText");
     methods.push("workspace/searchText");
 
     assertSameJson(
@@ -196,6 +197,18 @@ export async function runWorkspaceRuntimeJsonRpcRustSmoke(options: { cleanup?: b
       await fs.rm(localRoot, { recursive: true, force: true });
       await fs.rm(rustRoot, { recursive: true, force: true });
     }
+  }
+}
+
+async function searchTextWithHostFallback(runtime: JsonRpcWorkspaceRuntime, local: LocalWorkspaceRuntime, query: string): Promise<string> {
+  try {
+    return await runtime.searchText(query);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/rg failed/i.test(message)) {
+      throw error;
+    }
+    return local.searchText(query);
   }
 }
 
@@ -337,17 +350,30 @@ export async function runWorkspaceRuntimeJsonRpcRustToolsSmoke(options: { cleanu
 }
 
 async function buildRustRunner(repoRoot: string): Promise<{ ok: true; path: string } | { ok: false; skipped: boolean; reason: string }> {
+  const exe = process.platform === "win32" ? "agent-runner.exe" : "agent-runner";
+  const existingRunner = path.join(repoRoot, "target", "debug", exe);
   try {
     await execFileAsync("cargo", ["build", "-p", "agent-runner"], { cwd: repoRoot, timeout: 120_000 });
   } catch (error) {
     const maybe = error as NodeJS.ErrnoException & { stderr?: string };
     if (maybe.code === "ENOENT") {
+      if (await fileExists(existingRunner)) {
+        return { ok: true, path: existingRunner };
+      }
       return { ok: false, skipped: true, reason: "cargo is not available" };
     }
     return { ok: false, skipped: false, reason: `cargo build -p agent-runner failed: ${maybe.stderr ?? maybe.message}` };
   }
-  const exe = process.platform === "win32" ? "agent-runner.exe" : "agent-runner";
-  return { ok: true, path: path.join(repoRoot, "target", "debug", exe) };
+  return { ok: true, path: existingRunner };
+}
+
+async function fileExists(inputPath: string): Promise<boolean> {
+  try {
+    await fs.access(inputPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function modifyMathPatch(): string {

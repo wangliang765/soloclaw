@@ -1,5 +1,7 @@
 export const ansi = {
   clear: "\x1b[2J\x1b[H",
+  home: "\x1b[H",
+  clearToEnd: "\x1b[J",
   hideCursor: "\x1b[?25l",
   showCursor: "\x1b[?25h",
   reset: "\x1b[0m",

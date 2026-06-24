@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, RoomDeliveryAckEnvelope } from "../domain/index.js";
+import { DaemonLifecycleController } from "../daemon/daemon-lifecycle.js";
+import type { DaemonLifecycleSnapshot, DaemonLoopMetrics } from "../daemon/daemon-lifecycle.js";
+import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, RoomDeliveryAckEnvelope, RoomMessage, RoomMessageIntentEnvelope, RoomMessageKind } from "../domain/index.js";
 import type { RoomActivationContext } from "../rooms/message-routing.js";
 
 export type RemoteRoomInboxMessage = {
@@ -37,6 +39,30 @@ export type RemoteAgentHeartbeatResult = {
   };
 };
 
+export type RemoteAgentHeartbeatInput = {
+  status: AgentHeartbeatStatus;
+  ttlSeconds?: number;
+  lastPollStopReason?: string;
+  messagesProcessed?: number;
+  errorCount?: number;
+  lastError?: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type RemoteRoomHeartbeatSummary = {
+  agentId: string;
+  machineId: string;
+  status?: AgentHeartbeatStatus;
+  lastHeartbeatAt?: string;
+  heartbeatExpiresAt?: string;
+  lastRoomId?: string;
+  lastError?: string;
+};
+
+export type RemoteRoomSayResult = {
+  message: RoomMessage;
+};
+
 export type RemoteRoomPollResult = {
   roomId: string;
   agentId: string;
@@ -53,7 +79,7 @@ export type RemoteRoomPollResult = {
 export type RemoteRoomRunResult = {
   roomId: string;
   agentId: string;
-  stopReason: "max_cycles" | "idle" | "max_errors" | "aborted";
+  stopReason: "max_cycles" | "idle" | "max_errors" | "aborted" | "shutdown_requested";
   cycles: number;
   idleCycles: number;
   errors: Array<{
@@ -64,11 +90,15 @@ export type RemoteRoomRunResult = {
   messagesProcessed: number;
   acknowledgements: RemoteRoomPollResult["acknowledgements"];
   polls: RemoteRoomPollResult[];
+  lastHeartbeat?: RemoteRoomHeartbeatSummary;
+  lifecycle: DaemonLifecycleSnapshot;
+  metrics: DaemonLoopMetrics;
 };
 
 export type RemoteRoomRunnerIdentity = {
   signRoomDeliveryAckEnvelope(envelope: Omit<RoomDeliveryAckEnvelope, "signature">): Promise<string | undefined>;
   signAgentHeartbeatEnvelope(envelope: Omit<AgentHeartbeatEnvelope, "signature">): Promise<string | undefined>;
+  signRoomMessageIntentEnvelope(envelope: Omit<RoomMessageIntentEnvelope, "signature">): Promise<string | undefined>;
 };
 
 export type RemoteRoomRunnerAgent = {
@@ -138,15 +168,7 @@ export class RemoteRoomRunner {
     );
   }
 
-  async heartbeat(input: {
-    status: AgentHeartbeatStatus;
-    ttlSeconds?: number;
-    lastPollStopReason?: string;
-    messagesProcessed?: number;
-    errorCount?: number;
-    lastError?: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<RemoteAgentHeartbeatResult> {
+  async heartbeat(input: RemoteAgentHeartbeatInput): Promise<RemoteAgentHeartbeatResult> {
     const actor = agentActor(this.options.localAgent);
     const now = new Date();
     const heartbeatAt = now.toISOString();
@@ -191,11 +213,42 @@ export class RemoteRoomRunner {
     );
   }
 
+  async say(input: { kind?: RoomMessageKind; body: string }): Promise<RemoteRoomSayResult> {
+    const actor = agentActor(this.options.localAgent);
+    const kind = input.kind ?? "chat";
+    const unsigned: Omit<RoomMessageIntentEnvelope, "signature"> = {
+      version: 1,
+      roomId: this.options.roomId as RoomMessageIntentEnvelope["roomId"],
+      agentId: this.options.localAgent.id as RoomMessageIntentEnvelope["agentId"],
+      kind,
+      body: input.body,
+      sentAt: new Date().toISOString(),
+      sentBy: actor,
+      nonce: randomUUID(),
+    };
+    const signature = await this.options.identity.signRoomMessageIntentEnvelope(unsigned);
+    if (!signature) {
+      throw new Error("Failed to sign remote room message intent envelope.");
+    }
+    const messageEnvelope: RoomMessageIntentEnvelope = { ...unsigned, signature };
+    return controlPlanePostJson<RemoteRoomSayResult>(
+      this.options.controlUrl,
+      `/api/rooms/${encodeURIComponent(this.options.roomId)}/messages`,
+      this.options.token,
+      {
+        actor: `agent:${this.options.localAgent.id}`,
+        kind,
+        body: input.body,
+        messageEnvelope,
+      },
+    );
+  }
+
   async poll(input: {
     maxMessages: number;
     maxIdlePolls: number;
     idleIntervalMs: number;
-    onMessage?: (message: RemoteRoomInboxMessage, ack: RemoteRoomAckResult) => void;
+    onMessage?: (message: RemoteRoomInboxMessage, ack: RemoteRoomAckResult) => void | Promise<void>;
     signal?: AbortSignal;
   }): Promise<RemoteRoomPollResult> {
     const acknowledgements: RemoteRoomPollResult["acknowledgements"] = [];
@@ -231,7 +284,7 @@ export class RemoteRoomRunner {
           signatureStatus: message.signatureStatus,
           ackSignature: ack.cursor.lastAckEnvelope?.signature,
         });
-        input.onMessage?.(message, ack);
+        await input.onMessage?.(message, ack);
       }
     }
 
@@ -250,38 +303,66 @@ export class RemoteRoomRunner {
     maxBackoffMs: number;
     maxErrors: number;
     heartbeatTtlSeconds?: number;
-    onPoll?: (poll: RemoteRoomPollResult) => void;
-    onError?: (error: Error, cycle: number) => void;
+    onMessage?: (message: RemoteRoomInboxMessage, ack: RemoteRoomAckResult) => void | Promise<void>;
+    onPoll?: (poll: RemoteRoomPollResult) => void | Promise<void>;
+    onError?: (error: Error, cycle: number) => void | Promise<void>;
     signal?: AbortSignal;
+    lifecycle?: DaemonLifecycleController;
   }): Promise<RemoteRoomRunResult> {
+    const lifecycle = input.lifecycle ?? new DaemonLifecycleController("remote-room-runner");
     const polls: RemoteRoomPollResult[] = [];
     const acknowledgements: RemoteRoomPollResult["acknowledgements"] = [];
     const errors: RemoteRoomRunResult["errors"] = [];
     let cycles = 0;
     let idleCycles = 0;
     let consecutiveErrors = 0;
+    let lastHeartbeat: RemoteRoomHeartbeatSummary | undefined;
+    const recordHeartbeat = async (heartbeatInput: RemoteAgentHeartbeatInput) => {
+      const heartbeat = await this.heartbeat(heartbeatInput);
+      lastHeartbeat = summarizeHeartbeat(heartbeat.agent);
+      return heartbeat;
+    };
 
-    await this.heartbeat({ status: "online", ttlSeconds: input.heartbeatTtlSeconds, metadata: { phase: "remote-run-start" } });
+    await lifecycle.start();
+    if (lifecycle.isShutdownRequested) {
+      await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-shutdown-requested" } });
+      await lifecycle.stop("shutdown_requested");
+      return this.runResult("shutdown_requested", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
+    }
+    await recordHeartbeat({ status: "online", ttlSeconds: input.heartbeatTtlSeconds, metadata: { phase: "remote-run-start" } });
 
     while (cycles < input.maxCycles) {
+      if (lifecycle.isShutdownRequested) {
+        await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-shutdown-requested" } });
+        await lifecycle.stop("shutdown_requested");
+        return this.runResult("shutdown_requested", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
+      }
       if (input.signal?.aborted) {
-        await this.heartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-aborted" } });
-        return this.runResult("aborted", { cycles, idleCycles, errors, polls, acknowledgements });
+        await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-aborted" } });
+        await lifecycle.stop("aborted");
+        return this.runResult("aborted", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
       }
 
       cycles += 1;
+      const cycleStartedAtMs = Date.now();
       try {
         const poll = await this.poll({
           maxMessages: input.maxMessagesPerPoll,
           maxIdlePolls: input.maxIdlePolls,
           idleIntervalMs: input.idleIntervalMs,
+          onMessage: input.onMessage,
           signal: input.signal,
         });
         polls.push(poll);
         acknowledgements.push(...poll.acknowledgements);
-        input.onPoll?.(poll);
+        await input.onPoll?.(poll);
+        await lifecycle.recordTick({
+          messagesProcessed: poll.messagesProcessed,
+          failures: 0,
+          loopLatencyMs: Date.now() - cycleStartedAtMs,
+        });
         consecutiveErrors = 0;
-        await this.heartbeat({
+        await recordHeartbeat({
           status: poll.messagesProcessed > 0 ? "running" : "idle",
           ttlSeconds: input.heartbeatTtlSeconds,
           lastPollStopReason: poll.stopReason,
@@ -290,15 +371,24 @@ export class RemoteRoomRunner {
         });
 
         if (poll.stopReason === "aborted") {
-          await this.heartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-aborted" } });
-          return this.runResult("aborted", { cycles, idleCycles, errors, polls, acknowledgements });
+          await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, errorCount: errors.length, metadata: { phase: "remote-run-aborted" } });
+          await lifecycle.stop("aborted");
+          return this.runResult("aborted", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
+        }
+
+        if (lifecycle.isShutdownRequested) {
+          await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-shutdown-requested" } });
+          await lifecycle.stop("shutdown_requested");
+          return this.runResult("shutdown_requested", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
         }
 
         if (poll.messagesProcessed === 0 && poll.stopReason === "idle") {
           idleCycles += 1;
+          await lifecycle.recordIdle();
           if (input.stopWhenIdle && idleCycles >= input.maxIdleCycles) {
-            await this.heartbeat({ status: "idle", ttlSeconds: input.heartbeatTtlSeconds, lastPollStopReason: poll.stopReason, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-idle-stop" } });
-            return this.runResult("idle", { cycles, idleCycles, errors, polls, acknowledgements });
+            await recordHeartbeat({ status: "idle", ttlSeconds: input.heartbeatTtlSeconds, lastPollStopReason: poll.stopReason, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-idle-stop" } });
+            await lifecycle.stop("idle");
+            return this.runResult("idle", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
           }
         } else {
           idleCycles = 0;
@@ -314,9 +404,14 @@ export class RemoteRoomRunner {
           message: normalized.message,
           occurredAt: new Date().toISOString(),
         });
-        input.onError?.(normalized, cycles);
+        await input.onError?.(normalized, cycles);
+        await lifecycle.recordTick({
+          messagesProcessed: 0,
+          failures: 1,
+          loopLatencyMs: Date.now() - cycleStartedAtMs,
+        });
         consecutiveErrors += 1;
-        await this.heartbeat({
+        await recordHeartbeat({
           status: "error",
           ttlSeconds: input.heartbeatTtlSeconds,
           messagesProcessed: acknowledgements.length,
@@ -324,16 +419,23 @@ export class RemoteRoomRunner {
           lastError: normalized.message,
         });
         if (consecutiveErrors >= input.maxErrors) {
-          await this.heartbeat({ status: "error", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, lastError: normalized.message, metadata: { phase: "remote-run-max-errors" } });
-          return this.runResult("max_errors", { cycles, idleCycles, errors, polls, acknowledgements });
+          await recordHeartbeat({ status: "error", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, lastError: normalized.message, metadata: { phase: "remote-run-max-errors" } });
+          await lifecycle.stop("max_errors");
+          return this.runResult("max_errors", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
+        }
+        if (lifecycle.isShutdownRequested) {
+          await recordHeartbeat({ status: "offline", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-shutdown-requested" } });
+          await lifecycle.stop("shutdown_requested");
+          return this.runResult("shutdown_requested", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
         }
         const backoff = Math.min(input.maxBackoffMs, input.baseBackoffMs * 2 ** Math.max(0, consecutiveErrors - 1));
         await sleepMilliseconds(backoff, input.signal);
       }
     }
 
-    await this.heartbeat({ status: "idle", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-max-cycles" } });
-    return this.runResult("max_cycles", { cycles, idleCycles, errors, polls, acknowledgements });
+    await recordHeartbeat({ status: "idle", ttlSeconds: input.heartbeatTtlSeconds, messagesProcessed: acknowledgements.length, errorCount: errors.length, metadata: { phase: "remote-run-max-cycles" } });
+    await lifecycle.stop("max_cycles");
+    return this.runResult("max_cycles", { cycles, idleCycles, errors, polls, acknowledgements, lastHeartbeat, lifecycle });
   }
 
   private pollResult(
@@ -359,8 +461,11 @@ export class RemoteRoomRunner {
       errors: RemoteRoomRunResult["errors"];
       polls: RemoteRoomPollResult[];
       acknowledgements: RemoteRoomPollResult["acknowledgements"];
+      lastHeartbeat?: RemoteRoomHeartbeatSummary;
+      lifecycle: DaemonLifecycleController;
     },
   ): RemoteRoomRunResult {
+    const lifecycle = input.lifecycle.snapshot();
     return {
       roomId: this.options.roomId,
       agentId: this.options.localAgent.id,
@@ -371,6 +476,9 @@ export class RemoteRoomRunner {
       messagesProcessed: input.acknowledgements.length,
       acknowledgements: input.acknowledgements,
       polls: input.polls,
+      lastHeartbeat: input.lastHeartbeat,
+      lifecycle,
+      metrics: lifecycle.metrics,
     };
   }
 }
@@ -408,6 +516,18 @@ async function controlPlanePostJson<T>(controlUrl: string, path: string, token: 
 
 function agentActor(agent: RemoteRoomRunnerAgent) {
   return { type: "agent" as const, id: agent.id, displayName: agent.displayName };
+}
+
+function summarizeHeartbeat(agent: RemoteAgentHeartbeatResult["agent"]): RemoteRoomHeartbeatSummary {
+  return {
+    agentId: agent.id,
+    machineId: agent.machineId,
+    status: agent.heartbeatStatus,
+    lastHeartbeatAt: agent.lastHeartbeatAt,
+    heartbeatExpiresAt: agent.heartbeatExpiresAt,
+    lastRoomId: agent.lastRoomId,
+    lastError: agent.lastError,
+  };
 }
 
 async function sleepMilliseconds(ms: number, signal?: AbortSignal): Promise<void> {

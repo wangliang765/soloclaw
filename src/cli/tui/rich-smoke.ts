@@ -32,7 +32,7 @@ const REAL_PROVIDER_SMOKE_TASK = "Inspect package.json and report only the npm s
 const REAL_PROVIDER_LONG_TASK = [
   "Perform a read-only multi-step verification of this Soloclaw workspace.",
   "Before answering, inspect package.json, tsconfig.json, src/cli/tui/layout.ts, src/cli/tui/rich-shell.ts, and docs/superpowers/plans/2026-06-18-soloclaw-rich-tui-event-stream.md.",
-  "Report: 1) the command that opens the TUI, 2) the Work Ledger UI sections, 3) the test/check commands that verify the TUI, and 4) whether any file modifications are needed.",
+  "Report: 1) the command that opens the TUI, 2) the chat-first UI surfaces, 3) the test/check commands that verify the TUI, and 4) whether any file modifications are needed.",
   "Do not modify files.",
 ].join(" ");
 
@@ -99,17 +99,25 @@ export async function runRichTuiSmoke(input: {
 
   await tick();
   const saw = new Set<string>();
-  if (terminalOutput.plainText().includes("soloclaw")) {
+  if (isChatFirstWelcomeFrame(terminalOutput.latestPlainFrame())) {
     saw.add("welcome");
   }
   terminalInput.emitKey("", { name: "f2" });
-  if (terminalOutput.plainText().includes("Goal")) {
+  await waitFor(
+    () => terminalOutput.latestPlainFrame().includes("Goal"),
+    "mode switch",
+    () => terminalOutput.latestPlainFrame(),
+  );
+  if (terminalOutput.latestPlainFrame().includes("Goal")) {
     saw.add("mode");
   }
   await typeSmokeText(terminalInput, "Inspect workspace");
-  if (terminalOutput.plainText().includes("Inspect workspace")) {
-    saw.add("input");
-  }
+  await waitFor(
+    () => terminalOutput.latestPlainFrame().includes("Inspect workspace"),
+    "initial input",
+    () => terminalOutput.latestPlainFrame(),
+  );
+  saw.add("input");
   terminalInput.emitKey("\r", { name: "return" });
   await waitFor(() => terminalOutput.plainText().includes(answer), "initial answer");
   const plain = terminalOutput.plainText();
@@ -130,12 +138,14 @@ export async function runRichTuiSmoke(input: {
   if (terminalOutput.plainText().includes("Resuming session sess_rich_smoke") && terminalOutput.plainText().includes(resumeAnswer)) {
     saw.add("resume");
   }
+  await waitFor(() => terminalOutput.latestPlainFrame().includes("Ask Soloclaw"), "prompt after resume");
   await typeSmokeText(terminalInput, "/phase2 status");
   await waitFor(
     () => terminalOutput.latestPlainFrame().includes("/phase2 status"),
     "phase2 status input",
     () => terminalOutput.latestPlainFrame(),
   );
+  await tick(250);
   terminalInput.emitKey("\r", { name: "return" });
   await waitFor(
     () => terminalOutput.plainText().includes("status=pending_manual_evidence"),
@@ -143,12 +153,12 @@ export async function runRichTuiSmoke(input: {
     () => terminalOutput.latestPlainFrame(),
   );
   const phaseTwoPlain = terminalOutput.plainText();
-  if (phaseTwoPlain.includes("Phase 2 closure status") && phaseTwoPlain.includes("C1 external terminal rich TUI: pending")) {
+  if (phaseTwoPlain.includes("Phase 2 closure status") && phaseTwoPlain.includes("status=pending_manual_evidence")) {
     saw.add("phase2");
   }
   await typeSmokeText(terminalInput, "/clear");
   terminalInput.emitKey("\r", { name: "return" });
-  await waitFor(() => terminalOutput.latestPlainFrame().includes("INPUT DOCK"), "clear before evidence-record");
+  await waitFor(() => terminalOutput.latestPlainFrame().includes("Ask Soloclaw"), "clear before evidence-record");
   const evidenceFile = path.join(input.workspace, ".agent", "tmp", "rich-tui-smoke-evidence.md");
   await fs.mkdir(path.dirname(evidenceFile), { recursive: true });
   await fs.writeFile(evidenceFile, [
@@ -181,7 +191,7 @@ export async function runRichTuiSmoke(input: {
   await fs.rm(evidenceFile, { force: true });
   await typeSmokeText(terminalInput, "/clear");
   terminalInput.emitKey("\r", { name: "return" });
-  await waitFor(() => terminalOutput.latestPlainFrame().includes("INPUT DOCK"), "clear transcript");
+  await waitFor(() => terminalOutput.latestPlainFrame().includes("Ask Soloclaw"), "clear transcript");
   await typeSmokeText(terminalInput, "/phase2 evidence-check");
   terminalInput.emitKey("\r", { name: "return" });
   await waitFor(() => terminalOutput.plainText().includes("Phase 2 evidence check"), "phase2 evidence-check");
@@ -189,7 +199,7 @@ export async function runRichTuiSmoke(input: {
   if (evidenceCheckPlain.includes("Phase 2 evidence check") && evidenceCheckPlain.includes("secretMatches=0")) {
     saw.add("evidence-check");
   }
-  terminalInput.emitKey("", { name: "escape" });
+  terminalInput.emitKey("", { ctrl: true, name: "c" });
   await run;
   if (terminalInput.rawModes.at(-1) === false && terminalOutput.text.includes(ansi.showCursor)) {
     saw.add("exit");
@@ -274,7 +284,7 @@ export async function runRichTuiRealProviderSmoke(input: {
 
   await tick();
   const saw = new Set<string>();
-  if (terminalOutput.plainText().includes("soloclaw")) {
+  if (isChatFirstWelcomeFrame(terminalOutput.latestPlainFrame())) {
     saw.add("welcome");
   }
   for (const char of "/phase2 readiness") {
@@ -292,9 +302,12 @@ export async function runRichTuiRealProviderSmoke(input: {
   for (const char of task) {
     terminalInput.emitKey(char, { name: char });
   }
-  if (terminalOutput.plainText().includes(inputProbe(task))) {
-    saw.add("input");
-  }
+  await waitFor(
+    () => terminalOutput.latestPlainFrame().includes(inputProbe(task)),
+    "real-provider task input",
+    () => terminalOutput.latestPlainFrame(),
+  );
+  saw.add("input");
   terminalInput.emitKey("\r", { name: "return" });
   await waitFor(() => answer.length > 0, "real-provider answer");
   await tick(25);
@@ -305,7 +318,7 @@ export async function runRichTuiRealProviderSmoke(input: {
   if (containsAnswerProbe(postRunPlain, answer)) {
     saw.add("answer");
   }
-  terminalInput.emitKey("", { name: "escape" });
+  terminalInput.emitKey("", { ctrl: true, name: "c" });
   await run;
   if (terminalInput.rawModes.at(-1) === false && terminalOutput.text.includes(ansi.showCursor)) {
     saw.add("exit");
@@ -397,7 +410,8 @@ class SmokeOutput extends EventEmitter implements RichTuiOutputStream {
   }
 
   latestPlainFrame(): string {
-    return stripAnsi(this.text.split(ansi.clear).at(-1) ?? this.text);
+    const afterFullClear = this.text.split(ansi.clear).at(-1) ?? this.text;
+    return stripAnsi(afterFullClear.split(ansi.home).at(-1) ?? afterFullClear);
   }
 }
 
@@ -416,7 +430,7 @@ async function waitFor(predicate: () => boolean, label = "condition", debugText?
 async function typeSmokeText(input: SmokeInput, text: string): Promise<void> {
   for (const char of text) {
     input.emitKey(char, { name: char });
-    await tick();
+    await tick(2);
   }
 }
 
@@ -446,6 +460,18 @@ function redactSmokeText(text: string): string {
 
 function inputProbe(text: string): string {
   return text.split(/\s+/).slice(0, 3).join(" ");
+}
+
+function isChatFirstWelcomeFrame(frame: string): boolean {
+  return (
+    /Soloclaw/i.test(frame) &&
+    frame.includes("Ask Soloclaw") &&
+    frame.includes("Plan") &&
+    frame.includes("Model") &&
+    frame.includes("Run") &&
+    frame.includes("Workspace") &&
+    !/MISSION|LEDGER|CHECKS|INPUT DOCK/.test(frame)
+  );
 }
 
 function containsAnswerProbe(renderedText: string, answer: string): boolean {

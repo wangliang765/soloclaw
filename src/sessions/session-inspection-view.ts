@@ -1,4 +1,4 @@
-import type { AuditEvent, FileChange, PolicyAction, Session } from "../domain/index.js";
+import type { AuditEvent, FileChange, GoalCheckpoint, GoalRun, PolicyAction, Session, SessionTodo } from "../domain/index.js";
 import { ModelUsageService } from "../model/model-usage-service.js";
 import type { AgentStore } from "../store/agent-store.js";
 import type { CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
@@ -249,6 +249,29 @@ export type SessionBundleOptions = SessionVerificationOptions & {
   limit?: number;
 };
 
+type SessionReportGoalSummary = {
+  id: string;
+  objective: string;
+  status: GoalRun["status"];
+  tokenBudget?: number;
+  tokenUsed: number;
+  modelCalls: number;
+  repeatedBlockerKey?: string;
+  repeatedBlockers: number;
+  checkpoints: number;
+  blockerCheckpoints: number;
+  verificationCheckpoints: number;
+  updatedAt: string;
+  completedAt?: string;
+};
+
+type SessionReportGoal = Omit<SessionReportGoalSummary, "checkpoints" | "blockerCheckpoints" | "verificationCheckpoints">;
+
+type SessionReportGoalCheckpoint = Pick<
+  GoalCheckpoint,
+  "id" | "goalId" | "sessionId" | "kind" | "summary" | "blockerKey" | "metadata" | "createdAt"
+>;
+
 export async function buildSessionReportView(store: AgentStore, sessionId: string) {
   const session = await store.getSession(sessionId);
   if (!session) {
@@ -256,6 +279,9 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
   }
   const messages = await store.getMessages(sessionId);
   const toolResults = await store.getToolResults(sessionId);
+  const todos = await store.listSessionTodos(sessionId);
+  const goal = await store.getGoalRunBySession(sessionId);
+  const goalCheckpoints = goal ? await store.listGoalCheckpoints(goal.id, 20) : [];
   const fileChanges = await store.listFileChanges(sessionId);
   const auditEvents = await store.listAuditEvents({ sessionId, limit: 100 });
   const modelUsage = await new ModelUsageService(store).summarize({ filters: { sessionId, limit: 1000 } });
@@ -302,6 +328,8 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
       messages: messages.length,
       toolResults: toolResults.length,
       failedToolResults: failedToolResults.length,
+      todos: summarizeSessionTodos(todos),
+      goal: summarizeSessionGoal(goal, goalCheckpoints),
       fileChanges: fileChanges.length,
       changedPaths,
       commandEvents: commandEvents.length,
@@ -362,6 +390,9 @@ export async function buildSessionReportView(store: AgentStore, sessionId: strin
       outputExcerpt: toolOutputExcerpt(result.output),
       truncated: result.truncated,
     })),
+    todos,
+    goal: goal ? summarizeGoalRunForReport(goal) : undefined,
+    goalCheckpoints: goalCheckpoints.map(summarizeGoalCheckpointForReport),
     recentAuditEvents: auditEvents.slice(0, 20).map((event) => ({
       type: event.type,
       actor: event.actor,
@@ -1738,6 +1769,60 @@ function toolOutputExcerpt(output?: string): string | undefined {
     return undefined;
   }
   return output.length > 1000 ? `${output.slice(0, 1000)}\n[truncated]` : output;
+}
+
+function summarizeSessionTodos(todos: SessionTodo[]): Record<SessionTodo["status"] | "total", number> {
+  const counts: Record<SessionTodo["status"] | "total", number> = {
+    total: todos.length,
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    cancelled: 0,
+  };
+  for (const todo of todos) {
+    counts[todo.status] += 1;
+  }
+  return counts;
+}
+
+function summarizeSessionGoal(goal: GoalRun | undefined, checkpoints: GoalCheckpoint[]): SessionReportGoalSummary | undefined {
+  if (!goal) {
+    return undefined;
+  }
+  return {
+    ...summarizeGoalRunForReport(goal),
+    checkpoints: checkpoints.length,
+    blockerCheckpoints: checkpoints.filter((checkpoint) => checkpoint.kind === "blocker").length,
+    verificationCheckpoints: checkpoints.filter((checkpoint) => checkpoint.kind === "verification").length,
+  };
+}
+
+function summarizeGoalRunForReport(goal: GoalRun): SessionReportGoal {
+  return {
+    id: goal.id,
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+    tokenUsed: goal.tokenUsed,
+    modelCalls: goal.modelCalls,
+    repeatedBlockerKey: goal.repeatedBlockerKey,
+    repeatedBlockers: goal.repeatedBlockers,
+    updatedAt: goal.updatedAt,
+    completedAt: goal.completedAt,
+  };
+}
+
+function summarizeGoalCheckpointForReport(checkpoint: GoalCheckpoint): SessionReportGoalCheckpoint {
+  return {
+    id: checkpoint.id,
+    goalId: checkpoint.goalId,
+    sessionId: checkpoint.sessionId,
+    kind: checkpoint.kind,
+    summary: checkpoint.summary,
+    blockerKey: checkpoint.blockerKey,
+    metadata: checkpoint.metadata,
+    createdAt: checkpoint.createdAt,
+  };
 }
 
 function sessionCommandSummaryFromAuditEvent(event: AuditEvent, ordinal: number): SessionCommandSummary {

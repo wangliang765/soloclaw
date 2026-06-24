@@ -147,6 +147,32 @@ export class OpenAICompatibleChatClient implements ModelClient {
   }
 }
 
+export class OpenAIResponsesClient implements ModelClient {
+  constructor(private readonly options: HttpModelClientOptions) {}
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    const apiKey = await resolveApiKey(this.options.apiKey);
+    const response = await fetchWithRetry("openai_compatible", this.options, request.provider, `${trimTrailingSlash(request.provider?.baseUrl ?? this.options.baseUrl)}/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+        ...this.options.headers,
+        ...request.provider?.headers,
+      },
+      body: JSON.stringify({
+        model: request.provider?.model ?? this.options.defaultModel,
+        input: toOpenAIResponsesInput(request.messages),
+        tools: request.tools.map(toOpenAIResponsesTool),
+        tool_choice: request.tools.length > 0 ? "auto" : undefined,
+      }),
+    });
+
+    const data = (await response.json()) as OpenAIResponsesResponse;
+    return openAIResponsesToModelResponse(response, data);
+  }
+}
+
 export class AnthropicCompatibleMessagesClient implements ModelClient {
   constructor(private readonly options: HttpModelClientOptions) {}
 
@@ -383,6 +409,15 @@ function openAIResponseMetadata(response: Response, data: OpenAIChatCompletionRe
   });
 }
 
+function openAIResponsesMetadata(response: Response, data: OpenAIResponsesResponse): ModelResponseMetadata {
+  return compactMetadata({
+    providerRequestId: firstHeader(response.headers, ["x-request-id", "request-id", "openai-request-id"]),
+    providerResponseId: typeof data.id === "string" ? data.id : undefined,
+    providerModel: typeof data.model === "string" ? data.model : undefined,
+    usage: openAIResponsesUsage(data.usage),
+  });
+}
+
 function anthropicResponseMetadata(response: Response, data: AnthropicMessagesResponse): ModelResponseMetadata {
   return compactMetadata({
     providerRequestId: firstHeader(response.headers, ["request-id", "x-request-id", "anthropic-request-id"]),
@@ -415,6 +450,35 @@ function openAIChatCompletionToModelResponse(response: Response, data: OpenAICha
   return {
     type: "message",
     content: typeof message?.content === "string" ? message.content : "",
+    metadata,
+  };
+}
+
+function openAIResponsesToModelResponse(response: Response, data: OpenAIResponsesResponse): ModelResponse {
+  const metadata = openAIResponsesMetadata(response, data);
+  const output = Array.isArray(data.output) ? data.output : [];
+  const toolCalls = output
+    .filter((item): item is OpenAIResponsesFunctionCall => item.type === "function_call")
+    .map((item, index): ToolCall => ({
+      id: item.call_id ?? item.id ?? `call_${index}`,
+      name: item.name ?? "",
+      input: parseJsonObject(item.arguments ?? "{}"),
+    }))
+    .filter((call) => call.name.length > 0);
+  const content = extractOpenAIResponsesText(data);
+
+  if (toolCalls.length > 0) {
+    return {
+      type: "tool_calls",
+      content,
+      toolCalls,
+      metadata,
+    };
+  }
+
+  return {
+    type: "message",
+    content,
     metadata,
   };
 }
@@ -528,6 +592,17 @@ function openAIUsage(usage: OpenAIChatCompletionResponse["usage"]): ModelUsage |
   });
 }
 
+function openAIResponsesUsage(usage: OpenAIResponsesResponse["usage"]): ModelUsage | undefined {
+  if (!usage) {
+    return undefined;
+  }
+  return compactUsage({
+    promptTokens: finiteNumber(usage.input_tokens),
+    completionTokens: finiteNumber(usage.output_tokens),
+    totalTokens: finiteNumber(usage.total_tokens),
+  });
+}
+
 function anthropicUsage(usage: AnthropicMessagesResponse["usage"]): ModelUsage | undefined {
   if (!usage) {
     return undefined;
@@ -605,6 +680,51 @@ function toOpenAITool(tool: ToolDefinition) {
   };
 }
 
+function toOpenAIResponsesInput(messages: AgentMessage[]): unknown[] {
+  const input: unknown[] = [];
+  for (const message of messages) {
+    if (message.role === "tool") {
+      input.push({
+        type: "function_call_output",
+        call_id: message.toolResult.callId,
+        output: message.content,
+      });
+      continue;
+    }
+    if (message.role === "assistant") {
+      if (message.content) {
+        input.push({
+          role: "assistant",
+          content: message.content,
+        });
+      }
+      for (const toolCall of message.toolCalls ?? []) {
+        input.push({
+          type: "function_call",
+          call_id: toolCall.id,
+          name: toolCall.name,
+          arguments: JSON.stringify(toolCall.input),
+        });
+      }
+      continue;
+    }
+    input.push({
+      role: message.role,
+      content: message.content,
+    });
+  }
+  return input;
+}
+
+function toOpenAIResponsesTool(tool: ToolDefinition) {
+  return {
+    type: "function",
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.inputSchema,
+  };
+}
+
 function toAnthropicMessages(messages: AgentMessage[]) {
   const system = messages
     .filter((message) => message.role === "system")
@@ -662,6 +782,46 @@ function toAnthropicTool(tool: ToolDefinition) {
   };
 }
 
+function extractOpenAIResponsesText(data: OpenAIResponsesResponse): string {
+  if (typeof data.output_text === "string") {
+    return data.output_text;
+  }
+  const parts: string[] = [];
+  for (const item of data.output ?? []) {
+    if (isOpenAIResponsesMessageOutput(item)) {
+      for (const block of item.content ?? []) {
+        const text = textFromResponsesContent(block);
+        if (text) {
+          parts.push(text);
+        }
+      }
+      continue;
+    }
+    if (isOpenAIResponsesTextOutput(item) && typeof item.text === "string") {
+      parts.push(item.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function isOpenAIResponsesMessageOutput(item: OpenAIResponsesOutputItem): item is OpenAIResponsesMessageOutput {
+  return item.type === "message";
+}
+
+function isOpenAIResponsesTextOutput(item: OpenAIResponsesOutputItem): item is OpenAIResponsesTextOutput {
+  return item.type === "output_text";
+}
+
+function textFromResponsesContent(block: OpenAIResponsesMessageContent): string | undefined {
+  if (typeof block.text === "string") {
+    return block.text;
+  }
+  if (typeof block.output_text === "string") {
+    return block.output_text;
+  }
+  return undefined;
+}
+
 function parseJsonObject(value: string): JsonObject {
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -710,6 +870,44 @@ type OpenAIChatCompletionChunk = {
       }>;
     };
   }>;
+};
+
+type OpenAIResponsesMessageContent = {
+  type?: string;
+  text?: string;
+  output_text?: string;
+};
+
+type OpenAIResponsesFunctionCall = {
+  type: "function_call";
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+};
+
+type OpenAIResponsesMessageOutput = {
+  type: "message";
+  content?: OpenAIResponsesMessageContent[];
+};
+
+type OpenAIResponsesTextOutput = {
+  type: "output_text";
+  text?: string;
+};
+
+type OpenAIResponsesOutputItem = OpenAIResponsesFunctionCall | OpenAIResponsesMessageOutput | OpenAIResponsesTextOutput | { type?: string };
+
+type OpenAIResponsesResponse = {
+  id?: string;
+  model?: string;
+  output_text?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+  output?: OpenAIResponsesOutputItem[];
 };
 
 type AnthropicTextBlock = {

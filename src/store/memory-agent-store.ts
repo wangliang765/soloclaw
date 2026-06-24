@@ -7,6 +7,8 @@ import type {
   AuditEvent,
   CapabilityGrant,
   FileChange,
+  GoalCheckpoint,
+  GoalRun,
   KnowledgeChunk,
   KnowledgeEvalRun,
   KnowledgeEvalSet,
@@ -23,9 +25,11 @@ import type {
   RoomInvite,
   RoomMember,
   RoomMessage,
+  RoomMessageIntentNonce,
   RetentionPolicy,
   Session,
   SessionLink,
+  SessionTodo,
   SessionSummary,
   Skill,
   SkillUsageEvent,
@@ -49,6 +53,7 @@ export class MemoryAgentStore implements AgentStore {
   readonly sessions = new Map<string, Session>();
   readonly messages = new Map<string, AgentMessage[]>();
   readonly toolResults = new Map<string, ToolResult[]>();
+  readonly sessionTodos = new Map<string, SessionTodo[]>();
   readonly auditEvents: AuditEvent[] = [];
   readonly organizations = new Map<string, Organization>();
   readonly projects = new Map<string, Project>();
@@ -56,6 +61,8 @@ export class MemoryAgentStore implements AgentStore {
   readonly capabilityGrants: CapabilityGrant[] = [];
   readonly artifacts = new Map<string, ArtifactRecord>();
   readonly fileChanges: FileChange[] = [];
+  readonly goalRuns = new Map<string, GoalRun>();
+  readonly goalCheckpoints = new Map<string, GoalCheckpoint[]>();
   readonly knowledgeSources = new Map<string, KnowledgeSource>();
   readonly knowledgeChunks = new Map<string, KnowledgeChunk>();
   readonly knowledgeEvalSets = new Map<string, KnowledgeEvalSet>();
@@ -68,6 +75,7 @@ export class MemoryAgentStore implements AgentStore {
   readonly workerHeartbeatNonces = new Map<string, WorkerHeartbeatNonce>();
   readonly taskLeaseNonces = new Map<string, TaskLeaseNonce>();
   readonly roomDeliveryAckNonces = new Map<string, RoomDeliveryAckNonce>();
+  readonly roomMessageIntentNonces = new Map<string, RoomMessageIntentNonce>();
   readonly rooms = new Map<string, Room>();
   readonly roomMembers = new Map<string, RoomMember[]>();
   readonly roomMessages = new Map<string, RoomMessage[]>();
@@ -120,6 +128,14 @@ export class MemoryAgentStore implements AgentStore {
     return [...(this.toolResults.get(sessionId) ?? [])];
   }
 
+  async replaceSessionTodos(sessionId: string, todos: SessionTodo[]): Promise<void> {
+    this.sessionTodos.set(sessionId, todos.map((todo) => ({ ...todo })));
+  }
+
+  async listSessionTodos(sessionId: string): Promise<SessionTodo[]> {
+    return (this.sessionTodos.get(sessionId) ?? []).map((todo) => ({ ...todo }));
+  }
+
   async updateSessionStatus(sessionId: string, status: Session["status"]): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (session) {
@@ -147,6 +163,41 @@ export class MemoryAgentStore implements AgentStore {
     return this.fileChanges
       .filter((change) => !sessionId || change.sessionId === sessionId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async createGoalRun(goal: GoalRun): Promise<void> {
+    this.goalRuns.set(goal.id, goal);
+  }
+
+  async updateGoalRun(goal: GoalRun): Promise<void> {
+    this.goalRuns.set(goal.id, goal);
+  }
+
+  async getGoalRun(goalId: string): Promise<GoalRun | undefined> {
+    return this.goalRuns.get(goalId);
+  }
+
+  async getGoalRunBySession(sessionId: string): Promise<GoalRun | undefined> {
+    return [...this.goalRuns.values()].find((goal) => goal.sessionId === sessionId);
+  }
+
+  async listGoalRuns(input: import("./agent-store.js").ListGoalRunsInput = {}): Promise<GoalRun[]> {
+    return [...this.goalRuns.values()]
+      .filter((goal) => !input.status || goal.status === input.status)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, input.limit ?? 50);
+  }
+
+  async addGoalCheckpoint(checkpoint: GoalCheckpoint): Promise<void> {
+    const checkpoints = this.goalCheckpoints.get(checkpoint.goalId) ?? [];
+    checkpoints.push(checkpoint);
+    this.goalCheckpoints.set(checkpoint.goalId, checkpoints);
+  }
+
+  async listGoalCheckpoints(goalId: string, limit = 50): Promise<GoalCheckpoint[]> {
+    return [...(this.goalCheckpoints.get(goalId) ?? [])]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit);
   }
 
   async createKnowledgeSource(source: KnowledgeSource): Promise<void> {
@@ -513,6 +564,29 @@ export class MemoryAgentStore implements AgentStore {
     return expired.length;
   }
 
+  async recordRoomMessageIntentNonce(input: import("./agent-store.js").RecordRoomMessageIntentNonceInput): Promise<boolean> {
+    const key = roomMessageIntentNonceKey(input.agentId, input.nonce);
+    if (this.roomMessageIntentNonces.has(key)) {
+      return false;
+    }
+    this.roomMessageIntentNonces.set(key, input);
+    return true;
+  }
+
+  async getRoomMessageIntentNonce(agentId: string, nonce: string): Promise<RoomMessageIntentNonce | undefined> {
+    return this.roomMessageIntentNonces.get(roomMessageIntentNonceKey(agentId, nonce));
+  }
+
+  async deleteRoomMessageIntentNoncesBefore(input: { before: string; limit?: number }): Promise<number> {
+    const expired = [...this.roomMessageIntentNonces.entries()]
+      .filter(([, nonce]) => Boolean(nonce.expiresAt) && nonce.expiresAt! <= input.before)
+      .slice(0, input.limit ?? Number.POSITIVE_INFINITY);
+    for (const [key] of expired) {
+      this.roomMessageIntentNonces.delete(key);
+    }
+    return expired.length;
+  }
+
   async createRoom(room: Room): Promise<void> {
     this.rooms.set(room.id, room);
   }
@@ -802,6 +876,7 @@ export class MemoryAgentStore implements AgentStore {
     const existed = this.sessions.delete(sessionId);
     this.messages.delete(sessionId);
     this.toolResults.delete(sessionId);
+    this.sessionTodos.delete(sessionId);
     this.sessionSummaries.delete(sessionId);
     this.pendingToolCalls.forEach((call, id) => {
       if (call.sessionId === sessionId) {
@@ -846,5 +921,9 @@ function taskLeaseNonceKey(claimedById: string, nonce: string): string {
 }
 
 function roomDeliveryAckNonceKey(agentId: string, nonce: string): string {
+  return `${agentId}:${nonce}`;
+}
+
+function roomMessageIntentNonceKey(agentId: string, nonce: string): string {
   return `${agentId}:${nonce}`;
 }

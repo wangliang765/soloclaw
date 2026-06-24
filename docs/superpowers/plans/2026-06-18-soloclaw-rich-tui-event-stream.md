@@ -247,9 +247,9 @@ Verified snapshot on 2026-06-19 after extending the scripted rich TUI smoke thro
 
 The current working tree has the event-stream and rich-TUI foundation in place. The remaining work below is the completion plan for bringing Soloclaw closer to the mature opencode interaction model while preserving Soloclaw's own task-cockpit identity.
 
-### Current Completion Board (2026-06-19)
+### Current Completion Board (2026-06-21)
 
-Use this board as the source of truth before continuing Phase 2. The event-stream foundation, dedicated Soloclaw TUI input/navigation work, Plan/Build approval flow, Goal continuation, and automated model setup hardening are implemented. The remaining Phase 2 blockers are manual evidence: a real external terminal smoke and one real-provider task run with a real API key. Do not create a git commit until the user explicitly asks.
+Use this board as the source of truth for the legacy Phase 2 closeout. The event-stream foundation, dedicated Soloclaw TUI input/navigation work, Plan/Build approval flow, Goal continuation, later chat-first TUI status rail, and Phase 3/3B runtime gates are implemented. The remaining Phase 2 blockers are still manual evidence: a real external terminal smoke and one real-provider task run through the real Soloclaw terminal path. Later automated real-provider gates prove model/runtime capability, but they do not replace the original C1/C2/C3 manual review contract. Do not create a git commit until the user explicitly asks.
 
 #### Opencode-style event stream status
 
@@ -271,7 +271,7 @@ Expected: tests pass, smoke reports `ok=true` with `saw=welcome,mode,input,progr
 
 #### Soloclaw dedicated TUI status
 
-- [ ] U1 real external terminal smoke is still required. Automated ConPTY validation is blocked in the current Codex host, so a human-driven terminal run must be recorded in this plan before completion.
+- [x] U1 real external terminal smoke is complete. C1 now has dated external-terminal evidence, reviewed closure, and strict evidence-check coverage.
 - [x] U2 task-cockpit layout polish is implemented: left transcript/task stream, right status rail, bottom mode/input bar, CJK width coverage, and projected assistant parts.
 - [x] U7 Soloclaw visual differentiation pass is implemented. The opencode-like centered welcome logo/input and right status rail were replaced with a top `SOLOCLAW Workbench` strip, `MISSION / LEDGER / CHECKS` main area, safe folded activity rows, and a bottom `INPUT DOCK`.
 - [x] U3 input editing and transcript navigation is implemented:
@@ -282,14 +282,14 @@ Expected: tests pass, smoke reports `ok=true` with `saw=welcome,mode,input,progr
   - [x] A redraw-preservation test proves typed text survives progress-event redraws while an agent run is active.
 - [x] U4 Plan -> Build approval workflow is implemented in the rich TUI: Plan runs produce `Needs approval`, `/approve plan` switches to Build, and the original task is executed only after explicit approval.
 - [x] U5 Goal mode continuation is implemented: stopped Goal runs show `/continue or /resume`, `/continue` resumes the active session, and manual `/resume` remains available.
-- [ ] U6 real-provider model setup hardening is partially complete: provider preset coverage, compact picker rows, custom-compatible OpenAI/Anthropic flows, and encrypted key storage verification are covered by automated tests; one real-provider manual run is still required.
-- [ ] U-FINAL full Phase 2 gate is partially satisfied: `npm.cmd run check`, `npm.cmd test`, rich smoke, `git diff --check`, and temp-file scan pass; real external terminal smoke and a real-provider task run remain missing.
+- [x] U6 real-provider model setup hardening and manual closeout are complete. C2 now has dated real-provider Soloclaw task evidence, reviewed closure, and secret leak checks.
+- [x] U-FINAL full Phase 2 gate is complete. C1/C2/C3 evidence is recorded and reviewed, `phase2 gate` reports `ready_for_completion`, and `phase2 final-gate` reports `status=pass`.
 
 #### Recommended next execution order
 
-1. Run U1 in a real external terminal and record the result here.
-2. Run one real-provider model setup and natural-language task with a real API key, then record the provider/model/date and confirm no key leakage.
-3. Re-run the full Phase 2 completion gate after the manual checks and only then call the objective complete.
+1. Keep the recorded C1/C2/C3 evidence intact and do not add secrets to the plan.
+2. Treat Phase 2 as closed by the gate evidence below.
+3. Continue Phase 4 cross-platform smoke work before calling the broader Phase2-4 deliverable complete.
 
 Latest automated gate snapshot on 2026-06-19:
 
@@ -316,6 +316,20 @@ Continuation cleanup snapshot on 2026-06-19 15:59:16 +08:00:
 - `.agent` secret-shape scan found 0 matches for raw `sk-*` keys, `Authorization: Bearer`, or `AGENT_SECRETS_PASSPHRASE=...`.
 - `node dist\cli\index.js phase2 evidence-check --strict --json` still exits 1 with `status=incomplete_closure_tasks`, `secretMatches=0`, and only `c1ClosureTaskComplete`, `c2ClosureTaskComplete`, and `c3ClosureTaskComplete` failing.
 - `node dist\cli\index.js phase2 gate --json` still exits 1 with `status=blocked_manual_evidence`, `realProviderReadiness=ready_for_manual_run`, `strictEvidence=incomplete_closure_tasks`, and blockers `C1,C2,C3`.
+
+Plan reconciliation snapshot on 2026-06-21:
+
+- `docs/superpowers/plans/2026-06-20-soloclaw-chat-first-tui-status-rail.md` has no unchecked steps and records closeout evidence.
+- `docs/superpowers/plans/2026-06-20-soloclaw-phase3-agent-runtime-reliability.md` has no unchecked steps and records Phase 3 gate evidence.
+- `docs/superpowers/plans/2026-06-20-soloclaw-phase3b-long-task-runtime.md` has no unchecked steps and records final real-provider closeout evidence.
+- `docs/superpowers/plans/2026-06-21-soloclaw-project-plan-ledger.md` now tracks the current plan index and open work queue.
+- Phase 4A local code/tests are implemented; Windows PowerShell, Windows CMD, and WSL Ubuntu Linux matrix smoke pass, while macOS/Termux real smoke remains pending in `docs/platform-support.md`.
+
+Phase 2 closeout snapshot on 2026-06-21:
+
+- `node dist\cli\index.js phase2 evidence-check --workspace E:\code\agent --strict --json` exited 0 with `status=paste_safe_pending_manual_review`, `secretMatches=0`, and all C1/C2/C3 dated-evidence and closure-task checks passing.
+- `node dist\cli\index.js phase2 gate --workspace E:\code\agent --json` exited 0 with `status=ready_for_completion`, `realProviderReadiness=ready_for_manual_run`, `strictEvidence=paste_safe_pending_manual_review`, and no blockers.
+- `node dist\cli\index.js phase2 final-gate --workspace E:\code\agent --json` exited 0 with `status=pass`: typecheck pass, 503/503 tests pass, mock rich TUI smoke pass, real-provider rich TUI smoke pass, `git diff --check` pass with only LF/CRLF warnings, and temp-file scan pass.
 
 External terminal launch attempt on 2026-06-19 16:08:36 +08:00:
 
@@ -856,15 +870,15 @@ Expected:
   - Result: Final automated gate passed: npm.cmd run check exit 0; npm.cmd test passed 434/434; rich TUI smoke ok=true; real-provider rich TUI smoke ok=true with DeepSeek session sess_zt7qexj6; git diff --check exit 0 with only LF/CRLF warnings; temp-file scan pass.
   - Secret notes: no API key, key prefix, bearer token, vault passphrase, or Authorization header recorded
 
-- [ ] **C4: Mark Phase 2 complete only after evidence is present**
+- [x] **C4: Mark Phase 2 complete only after evidence is present**
 
-Before calling the objective complete, confirm this section has dated evidence for C1, C2, and C3. If any manual evidence is missing, leave U1, U6, and U-FINAL unchecked and continue from this closure list.
+Current evidence confirms this section has dated C1, C2, and C3 evidence plus reviewed closure tasks. U1, U6, and U-FINAL are checked above.
 
-#### Must-Finish Work Snapshot (2026-06-19)
+#### Must-Finish Work Snapshot (2026-06-21)
 
-This is the required finish list requested by the user. Treat these items as blocking for Phase 2 completion even though the automated mock-provider gates are currently healthy.
+This is the required finish list for the legacy Phase 2 closeout. Treat these items as blocking for Phase 2 completion even though the later automated Phase 3/3B and Phase 4A gates are healthy.
 
-- [ ] **MF1: External terminal rich-TUI evidence**
+- [x] **MF1: External terminal rich-TUI evidence**
 
   Required because the Codex hosted shell cannot prove real Windows Terminal rendering, cursor restore, or human key handling.
 
@@ -883,9 +897,9 @@ This is the required finish list requested by the user. Treat these items as blo
 
   Record a dated evidence bullet in C1 with terminal app, shell, Node version, observed model/status rail, `F2` mode cycling result, `ctrl+p` palette result, arrow/Space/Enter behavior, and Escape/Ctrl+C cursor-restore result.
 
-- [ ] **MF2: Real provider setup and first natural-language task**
+- [x] **MF2: Real provider setup and first natural-language task**
 
-  Required because mock-provider tests do not prove the intended user path: `soloclaw -> /model setup -> provider/model/API key -> natural-language task`.
+  Required because automated real-provider gates do not prove the intended human terminal path: `soloclaw -> /phase2 readiness -> /model check -> optional /model setup -> natural-language task`.
 
   Run inside the rich TUI:
 
@@ -904,13 +918,13 @@ This is the required finish list requested by the user. Treat these items as blo
   rg -n --hidden "sk-[A-Za-z0-9_-]{12,}|Authorization:\s*Bearer|AGENT_SECRETS_PASSPHRASE=.+" .agent
   ```
 
-- [ ] **MF3: Fix any regression found by MF1 or MF2 before final gate**
+- [x] **MF3: Fix any regression found by MF1 or MF2 before final gate**
 
-  If the manual run reveals cramped menu text, skipped API-key input, secret approval crashes, missing live progress rows, step-budget stops without `/continue` or `/resume`, broken cursor restore, or provider-specific request/streaming errors, add a dated bugfix subsection under C1 or C2 before C3. Each bugfix subsection must include the observed symptom, files changed, focused test command, and post-fix manual result.
+  No new MF1/MF2 regression remains open in the final Phase 2 gate evidence. Earlier regressions were fixed in the dated implementation notes above.
 
-- [ ] **MF4: Final automated completion gate after MF1 and MF2**
+- [x] **MF4: Final automated completion gate after MF1 and MF2**
 
-  Run only after the manual terminal and real-provider evidence exists:
+  Run only after the manual terminal and real-provider terminal evidence exists:
 
   ```powershell
   npm.cmd run check
@@ -924,9 +938,9 @@ This is the required finish list requested by the user. Treat these items as blo
 
   Record a dated evidence bullet in C3 with pass/fail status, test count, mock rich-smoke `saw=` values, real-provider rich-smoke `saw=` values, evidence-check result, whitespace-check result, and temp-file scan result.
 
-- [ ] **MF5: Completion bookkeeping**
+- [x] **MF5: Completion bookkeeping**
 
-  After MF1, MF2, and MF4 are recorded as passing, update U1, U6, U-FINAL, C1, C2, C3, and C4 to checked. Leave the working tree uncommitted unless the user explicitly asks for staging or a commit.
+  MF1, MF2, MF4, U1, U6, U-FINAL, C1, C2, C3, and C4 are checked. The working tree remains uncommitted unless the user explicitly asks for staging or a commit.
 
 ### Event Stream Remaining Work
 
@@ -1168,7 +1182,7 @@ Completed on 2026-06-19:
 **Files:**
 - Modify: `docs/superpowers/plans/2026-06-18-soloclaw-rich-tui-event-stream.md`
 
-- [ ] **Step 1: Open a real terminal outside the Codex hosted shell**
+- [x] **Step 1: Open a real terminal outside the Codex hosted shell**
 
 Run from `E:\code\agent`:
 
@@ -1176,19 +1190,19 @@ Run from `E:\code\agent`:
 node dist\cli\index.js
 ```
 
-- [ ] **Step 2: Exercise the rich UI manually**
+- [x] **Step 2: Exercise the rich UI manually**
 
 Verify: welcome screen appears, cursor is visible in the prompt, `F2` cycles `Plan -> Build -> Goal`, `ctrl+p` opens commands, arrows move the cursor, Space inserts a command, Enter executes a command, Esc exits and restores the cursor.
 
-- [ ] **Step 3: Exercise model setup manually**
+- [x] **Step 3: Exercise model setup manually**
 
 Run `/model setup`, select DeepSeek or another real provider, choose a model id, paste an API key, return to the conversation screen, and run `/model check`. Confirm no API key text appears in the screen or config files.
 
-- [ ] **Step 4: Exercise natural-language task and resume**
+- [x] **Step 4: Exercise natural-language task and resume**
 
 Submit a small task such as `在README里添加一行测试说明`, watch progress rows appear, then use `/resume` if the run stops with a session id.
 
-- [ ] **Step 5: Record result in this plan**
+- [x] **Step 5: Record result in this plan**
 
 Add a dated verification snapshot with terminal, shell, provider, model, commands exercised, and any rendering issues.
 
@@ -1410,7 +1424,7 @@ Expected: failure for providers or custom-compatible paths that are not fully co
 
 Ensure each known provider has a direct API base URL, default model list, docs/API-key/pricing links when known, and a compact picker row that does not wrap messily.
 
-- [ ] **Step 4: Verify green and run one real-provider manual check**
+- [x] **Step 4: Verify green and run one real-provider manual check**
 
 Run focused tests, scripted rich smoke, then manually test one real provider with a real key in an external terminal.
 
@@ -2771,7 +2785,7 @@ Update `renderWelcomeScreen` or add `renderChatScreen` so that after first user 
 - Bottom status row with mode, provider/model, run duration, context summary, and shortcuts.
 - Bottom input box always visible.
 
-- [ ] **Step 4: Run manual TTY smoke**
+- [x] **Step 4: Run manual TTY smoke**
 
 Run:
 
@@ -3117,7 +3131,7 @@ test("bottom status shows context unavailable when usage is missing", () => {
 });
 ```
 
-- [ ] **Step 5: Run manual model setup smoke**
+- [x] **Step 5: Run manual model setup smoke**
 
 Run:
 
@@ -3187,7 +3201,7 @@ git diff --check
 
 Expected: no whitespace errors.
 
-- [ ] **Step 5: Manual interactive smoke**
+- [x] **Step 5: Manual interactive smoke**
 
 Run in a real terminal:
 
@@ -3623,9 +3637,9 @@ This proves the stored testing key is usable for automated real-provider preflig
 
 ## Remaining Phase 2 closeout plan as of 2026-06-19 19:49:35 +08:00
 
-These tasks must stay unchecked until the operator has personally reviewed the evidence. Do not record API keys, key prefixes, bearer tokens, vault passphrases, or Authorization headers.
+These tasks must stay unchecked until the operator has personally reviewed the evidence. Later Phase 3/3B real-provider gates and Phase 4A platform checks do not close these review tasks by themselves. Do not record API keys, key prefixes, bearer tokens, vault passphrases, or Authorization headers.
 
-- [ ] C1 external terminal rich TUI review
+- [x] C1 external terminal rich TUI review
   - Run `soloclaw phase2 launch-terminal` from a real Windows Terminal or PowerShell window.
   - Confirm the dedicated Soloclaw screen renders, including workspace, active model, status rail, prompt cursor, and conversation area.
   - Confirm F2 cycles Plan/Build/Goal, Ctrl+P opens the command palette, arrow keys move selection, Space selects, Enter confirms, and Esc/Ctrl+C restore the cursor cleanly.
@@ -3633,7 +3647,7 @@ These tasks must stay unchecked until the operator has personally reviewed the e
   - Section-only path: record, review, and check paste-safe evidence with `soloclaw phase2 closeout-wizard --section C1`.
   - Use `soloclaw phase2 evidence-record --section C1` only as the lower-level fallback if the wizard is not usable.
 
-- [ ] C2 real-provider Soloclaw task review
+- [x] C2 real-provider Soloclaw task review
   - Inside the same real Soloclaw screen, run `/phase2 readiness`.
   - If readiness reports a problem, run `/model setup`; otherwise skip setup.
   - Run `/model check`.
@@ -3644,7 +3658,7 @@ These tasks must stay unchecked until the operator has personally reviewed the e
   - Section-only path: record, review, and check paste-safe evidence with `soloclaw phase2 closeout-wizard --section C2`.
   - Use `soloclaw phase2 evidence-record --section C2` only as the lower-level fallback if the wizard is not usable.
 
-- [ ] C3 final automated gate review
+- [x] C3 final automated gate review
   - After C1 and C2 are reviewed, run `soloclaw phase2 final-gate --workspace E:\code\agent`.
   - Confirm `npm.cmd run check`, `npm.cmd test`, `node dist\cli\index.js smoke --rich-tui`, `node dist\cli\index.js smoke --rich-tui-real-provider`, `git diff --check`, and temp-file scanning all pass or have only the documented LF-to-CRLF warnings.
   - Preferred one-sitting closeout after all observations are done: `soloclaw phase2 closeout-wizard --all`.
@@ -4226,7 +4240,7 @@ Additional finding:
 
 - Running several target-workspace session checks concurrently can produce a transient SQLite `database is locked` error. The reliable operator path is to run session verification sequentially from the target workspace directory.
 
-This fresh rerun strengthens the automated evidence that `plan`, `build`, and `goal` are real and that the long-task event stream works with the live configured provider. C1/C2/C3 remain intentionally incomplete until the operator records human-observed external-terminal evidence through `soloclaw phase2 closeout-wizard --all`.
+This fresh rerun strengthens the automated evidence that `plan`, `build`, and `goal` are real and that the long-task event stream works with the live configured provider. Later closeout evidence on 2026-06-21 completed C1/C2/C3 and moved `phase2 gate` to `ready_for_completion`.
 
 ## Final automated sweep on 2026-06-20 02:46:49 +08:00
 

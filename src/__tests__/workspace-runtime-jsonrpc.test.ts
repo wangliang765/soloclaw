@@ -7,12 +7,45 @@ import { JsonRpcWorkspaceRuntime, StdioJsonRpcWorkspaceRuntimeTransport, type Wo
 import { LocalWorkspaceRuntime } from "../workspace/local-workspace-runtime.js";
 import { runWorkspaceRuntimeJsonRpcRustSmoke, runWorkspaceRuntimeJsonRpcRustToolsSmoke } from "../workspace/workspace-runtime-jsonrpc-smoke.js";
 import type { WorkspaceRuntime } from "../workspace/workspace-runtime.js";
+import { parseWorkspaceRuntimeMode, resolveWorkspaceRuntime } from "../workspace/workspace-runtime-selector.js";
 import { WORKSPACE_RUNTIME_JSONRPC_METHODS, WORKSPACE_RUNTIME_JSONRPC_SCHEMA } from "../workspace/workspace-runtime-jsonrpc-schema.js";
 
 test("workspace runtime JSON-RPC schema covers the WorkspaceRuntime method set", () => {
   assert.deepEqual(Object.keys(WORKSPACE_RUNTIME_JSONRPC_SCHEMA.methods).sort(), [...WORKSPACE_RUNTIME_JSONRPC_METHODS].sort());
   assert.equal(WORKSPACE_RUNTIME_JSONRPC_SCHEMA.protocolVersion, "workspace-runtime-jsonrpc.v1");
   assert.equal(WORKSPACE_RUNTIME_JSONRPC_SCHEMA.framing.protocol, "jsonrpc-2.0");
+});
+
+test("WorkspaceRuntime resolver supports TypeScript default auto fallback and explicit Rust failure", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-runtime-selector-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  assert.equal(parseWorkspaceRuntimeMode("typescript"), "typescript");
+  assert.equal(parseWorkspaceRuntimeMode("rust"), "rust");
+  assert.equal(parseWorkspaceRuntimeMode("auto"), "auto");
+
+  const typescript = await resolveWorkspaceRuntime(dir, { mode: "typescript" });
+  assert.equal(typescript.selection.requestedMode, "typescript");
+  assert.equal(typescript.selection.selectedMode, "typescript");
+
+  const missingRunner = path.join(dir, "missing-agent-runner");
+  const auto = await resolveWorkspaceRuntime(dir, {
+    mode: "auto",
+    env: { SOLOCLAW_AGENT_RUNNER: missingRunner },
+  });
+  assert.equal(auto.selection.requestedMode, "auto");
+  assert.equal(auto.selection.selectedMode, "typescript");
+  assert.match(auto.selection.fallbackReason ?? "", /SOLOCLAW_AGENT_RUNNER/);
+
+  await assert.rejects(
+    resolveWorkspaceRuntime(dir, {
+      mode: "rust",
+      env: { SOLOCLAW_AGENT_RUNNER: missingRunner },
+    }),
+    /Rust workspace runtime requested/,
+  );
 });
 
 test("JsonRpcWorkspaceRuntime is interchangeable with LocalWorkspaceRuntime through the protocol method set", async (t) => {
@@ -94,6 +127,26 @@ test("StdioJsonRpcWorkspaceRuntimeTransport exchanges newline-delimited JSON-RPC
 
   assert.deepEqual(await runtime.listFiles("."), ["file mocked.txt"]);
   assert.equal(await runtime.readFile({ path: "mocked.txt" }), "1: mocked");
+});
+
+test("LocalWorkspaceRuntime resolves when a Windows background command keeps stdio open", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows start /B stdio inheritance regression");
+    return;
+  }
+
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-local-runtime-bg-"));
+  await fs.writeFile(path.join(dir, "hold-open.cmd"), "@echo off\r\nping 127.0.0.1 -n 4 >nul\r\n", "utf8");
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  });
+
+  const runtime = new LocalWorkspaceRuntime(dir);
+  const startedAt = Date.now();
+  const result = await runtime.runCommand({ command: 'start /B "" hold-open.cmd', timeoutMs: 200 });
+
+  assert.equal(result.timedOut, false);
+  assert.ok(Date.now() - startedAt < 1000, `background child kept command open for ${Date.now() - startedAt}ms`);
 });
 
 test("Rust agent-runner satisfies the WorkspaceRuntime JSON-RPC compatibility smoke", async (t) => {

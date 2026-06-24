@@ -1,6 +1,7 @@
 import type { AgentRunEvent } from "../core/agent-events.js";
+import type { PlatformEvent } from "./event-stream.js";
 
-export type LocalEvent = AgentRunEvent;
+export type LocalEvent = AgentRunEvent | PlatformEvent;
 export type LocalEventListener = (event: LocalEvent) => void;
 
 export class LocalEventBus {

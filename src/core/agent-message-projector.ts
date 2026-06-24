@@ -182,6 +182,31 @@ export function projectAgentRunEventsToAssistantMessages(events: readonly AgentR
       case "reasoning_finished":
         updateReasoningStatusPart(message, event.step, redactAgentEventText(event.publicSummary), event.durationMs, event.createdAt, "finished");
         break;
+      case "goal_updated":
+        message.parts.push({
+          type: "status",
+          title: `Goal ${event.status}: ${redactAgentEventText(event.summary)}`,
+          status: event.status === "complete" ? "finished" : event.status === "active" ? "started" : "stopped",
+          createdAt: event.createdAt,
+        });
+        break;
+      case "run_budget_checkpoint":
+        message.parts.push({
+          type: "status",
+          title: `Budget checkpoint: ${event.steps} steps, ${event.modelCalls} model calls`,
+          status: "finished",
+          durationMs: event.elapsedMs,
+          createdAt: event.createdAt,
+        });
+        break;
+      case "guardrail_tripped":
+        message.parts.push({
+          type: "status",
+          title: `Guardrail: ${redactAgentEventText(event.reason)}`,
+          status: "stopped",
+          createdAt: event.createdAt,
+        });
+        break;
       case "step_limit_reached":
         message.parts.push({
           type: "status",

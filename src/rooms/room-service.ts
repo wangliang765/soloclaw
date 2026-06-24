@@ -16,6 +16,20 @@ export type CreateRoomInviteInput = {
   maxUses?: number;
 };
 
+export type InviteRoomAgentInput = {
+  roomId: string;
+  agentId: string;
+  invitedBy: ActorRef;
+  role?: RoomMember["role"];
+  aliases?: string[];
+};
+
+export type AcceptRoomAgentInvitationInput = {
+  roomId: string;
+  actor: ActorRef;
+  aliases?: string[];
+};
+
 export type CreatedRoomInvite = {
   invite: RoomInvite;
   token: string;
@@ -29,6 +43,8 @@ export interface RoomService {
   createInvite(input: CreateRoomInviteInput): Promise<CreatedRoomInvite>;
   listInvites(roomId: string): Promise<RoomInvite[]>;
   revokeInvite(roomId: string, inviteId: string, revokedBy: ActorRef): Promise<RoomInvite>;
+  inviteAgent(input: InviteRoomAgentInput): Promise<RoomMember>;
+  acceptAgentInvitation(input: AcceptRoomAgentInvitationInput): Promise<RoomMember>;
   requestJoin(roomId: string, actor: ActorRef, role: RoomMember["role"], aliases?: string[]): Promise<RoomMember>;
   joinWithInvite(roomId: string, token: string, actor: ActorRef, aliases?: string[]): Promise<RoomMember>;
   verifyInvite(invite: RoomInvite): Promise<"valid" | "unsigned" | "unknown_agent" | "invalid">;

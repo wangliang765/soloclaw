@@ -31,6 +31,10 @@ export class ContextManager {
     });
   }
 
+  replace(messages: AgentMessage[]) {
+    this.messages.splice(0, this.messages.length, ...messages);
+  }
+
   snapshot(): AgentMessage[] {
     return [...this.messages];
   }

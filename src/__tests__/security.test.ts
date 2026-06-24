@@ -1,5 +1,5 @@
 ﻿import assert from "node:assert/strict";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,6 +8,8 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { AgentLoop } from "../core/agent-loop.js";
+import type { AgentLoopOptions } from "../core/agent-loop.js";
+import { AgentRunSupervisor } from "../core/agent-run-supervisor.js";
 import type { AgentRunEvent } from "../core/agent-events.js";
 import { AgentHealthService } from "../agents/agent-health-service.js";
 import { AuditExportService } from "../audit/audit-export-service.js";
@@ -25,7 +27,8 @@ import type { MigrationApplyInput, MigrationApplyResult, MigrationPlan, Migratio
 import type { ModelClient } from "../model/model-client.js";
 import { FallbackModelClient } from "../model/fallback-model-client.js";
 import { GuardedModelClient, ModelBudgetExceededError, ModelCircuitOpenError } from "../model/guarded-model-client.js";
-import { AnthropicCompatibleMessagesClient, NonRetryableModelProviderError, OpenAICompatibleChatClient, TransientModelProviderError } from "../model/http-model-clients.js";
+import { GlobalModelProfileStore } from "../model/global-model-profile-store.js";
+import { AnthropicCompatibleMessagesClient, NonRetryableModelProviderError, OpenAICompatibleChatClient, OpenAIResponsesClient, TransientModelProviderError } from "../model/http-model-clients.js";
 import { LocalProviderProfileStore } from "../model/local-provider-profile-store.js";
 import { ModelUsageService } from "../model/model-usage-service.js";
 import { McpConnectionPlanner } from "../mcp/mcp-connection-planner.js";
@@ -48,6 +51,7 @@ import { ensureLocalSecretVaultPassphraseFile } from "../secrets/encrypted-file-
 import { MemorySecretStore } from "../secrets/memory-secret-store.js";
 import { PolicySecretBroker } from "../secrets/policy-secret-broker.js";
 import { LocalGitService } from "../git/local-git-service.js";
+import { GoalService } from "../goals/goal-service.js";
 import { LocalAgentIdentityService } from "../identity/local-agent-identity-service.js";
 import { shouldActorRespondToRoomMessage } from "../rooms/message-routing.js";
 import { buildRoomRoster } from "../rooms/room-roster.js";
@@ -62,6 +66,7 @@ import { TaskOperationsService } from "../tasks/task-operations-service.js";
 import { startLocalRoomWebServer } from "../web/local-room-web-server.js";
 import { LocalWorkerRunner } from "../workers/local-worker-runner.js";
 import { scanExecutionHygiene } from "../hygiene/execution-hygiene.js";
+import { formatPhaseThreeReadOnlyGoalPrompt } from "../cli/phase3-long-task-prompts.js";
 import { LocalWorkspaceRuntime } from "../workspace/local-workspace-runtime.js";
 import { collectWorkspaceSnapshot, renderWorkspaceSnapshot } from "../workspace/workspace-snapshot.js";
 import { WorkerHealthService } from "../workers/worker-health-service.js";
@@ -340,6 +345,86 @@ test("known OpenAI-compatible provider profiles send real chat requests with def
   platform.store.close();
 });
 
+test("OpenAI Responses client sends response requests and maps function calls", async (t) => {
+  const previousKey = process.env.RESPONSES_TEST_API_KEY;
+  process.env.RESPONSES_TEST_API_KEY = "responses-test-key";
+  t.after(() => {
+    if (previousKey === undefined) {
+      delete process.env.RESPONSES_TEST_API_KEY;
+    } else {
+      process.env.RESPONSES_TEST_API_KEY = previousKey;
+    }
+  });
+
+  let seenPath = "";
+  let seenAuthorization = "";
+  let seenModel = "";
+  let seenToolType = "";
+  const server = createServer((request, response) => {
+    seenPath = request.url ?? "";
+    seenAuthorization = request.headers.authorization ?? "";
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+        model?: string;
+        tools?: Array<{ type?: string }>;
+      };
+      seenModel = body.model ?? "";
+      seenToolType = body.tools?.[0]?.type ?? "";
+      response.writeHead(200, { "content-type": "application/json", connection: "close" });
+      response.end(JSON.stringify({
+        id: "resp_test",
+        model: "gpt-5.5",
+        output: [
+          {
+            type: "function_call",
+            call_id: "call_read",
+            name: "read_file",
+            arguments: "{\"path\":\"README.md\"}",
+          },
+        ],
+        usage: {
+          input_tokens: 11,
+          output_tokens: 7,
+          total_tokens: 18,
+        },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Expected TCP test server address.");
+  }
+
+  const client = new OpenAIResponsesClient({
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    defaultModel: "gpt-5.5",
+    apiKey: () => Promise.resolve(process.env.RESPONSES_TEST_API_KEY ?? ""),
+  });
+  const result = await client.complete({
+    messages: [{ role: "user", content: "inspect README" }],
+    tools: [{ name: "read_file", description: "Read a file", inputSchema: { type: "object", properties: { path: { type: "string" } } } }],
+  });
+
+  assert.equal(seenPath, "/v1/responses");
+  assert.equal(seenAuthorization, "Bearer responses-test-key");
+  assert.equal(seenModel, "gpt-5.5");
+  assert.equal(seenToolType, "function");
+  assert.equal(result.type, "tool_calls");
+  if (result.type === "tool_calls") {
+    assert.deepEqual(result.toolCalls, [{ id: "call_read", name: "read_file", input: { path: "README.md" } }]);
+  }
+  assert.equal(result.metadata?.usage?.promptTokens, 11);
+  assert.equal(result.metadata?.usage?.completionTokens, 7);
+  assert.equal(result.metadata?.usage?.totalTokens, 18);
+});
+
 test("known provider profiles support API key environment aliases", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-model-provider-alias-"));
   const previousXai = process.env.XAI_API_KEY;
@@ -470,7 +555,7 @@ test("package exposes soloclaw as the primary CLI command", async () => {
 test("soloclaw init prepares the current workspace and editable model config", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-soloclaw-init-"));
   t.after(async () => {
-    await fs.rm(dir, { recursive: true, force: true });
+    await removeTreeWithRetry(dir);
   });
   await fs.writeFile(path.join(dir, "README.md"), "# Init Workspace\n", "utf8");
 
@@ -1341,6 +1426,17 @@ test("agent run can emit session evidence and verify the completed run", async (
   assert.match(sessionsText.stdout, /review: agent session review sess_/);
   assert.match(sessionsText.stdout, /next: agent session next sess_/);
 
+  const sessionsFromOtherCwd = await run(process.execPath, [cli, "sessions", "--workspace", dir, "--json", "--limit", "5"], process.cwd());
+  assert.equal(sessionsFromOtherCwd.exitCode, 0, sessionsFromOtherCwd.stderr);
+  const otherCwdSessions = JSON.parse(sessionsFromOtherCwd.stdout) as typeof sessions;
+  assert.equal(otherCwdSessions.sessions?.some((entry) => entry.session?.id === parsed.session?.id), true);
+
+  const nextFromOtherCwd = await run(process.execPath, [cli, "session", "next", parsed.session?.id ?? "", "--workspace", dir, "--json"], process.cwd());
+  assert.equal(nextFromOtherCwd.exitCode, 0, nextFromOtherCwd.stderr);
+  const nextParsed = JSON.parse(nextFromOtherCwd.stdout) as { session?: { id?: string }; nextActions?: unknown[] };
+  assert.equal(nextParsed.session?.id, parsed.session?.id);
+  assert.equal(Array.isArray(nextParsed.nextActions), true);
+
   const failedGate = await run(process.execPath, [cli, "run", "--verify-session", "--require-change", "inspect", "this", "workspace"], dir);
   assert.equal(failedGate.exitCode, 1);
   assert.match(failedGate.stdout, /Session verification:/);
@@ -1362,6 +1458,7 @@ test("agent run can require model readiness before opening a session", async (t)
     await fs.rm(dir, { recursive: true, force: true });
   });
   await fs.writeFile(path.join(dir, "README.md"), "# Run Model Ready Gate\n", "utf8");
+  await configureGlobalOpenAiCompatibleSecretRefProfile(dir, "sec_runmodelreadygate");
 
   const cli = path.join(process.cwd(), "dist", "cli", "index.js");
   const blocked = await run(process.execPath, [
@@ -1404,6 +1501,35 @@ test("agent run can require model readiness before opening a session", async (t)
   assert.equal(parsed.modelReadiness?.model, "qwen-local");
   assert.deepEqual(parsed.modelReadiness?.missingApiKeyEnvNames, [envName]);
   assert.equal(parsed.modelReadiness?.usesApiKeySecretRef, false);
+  assert.equal(await exists(path.join(dir, ".agent", "agent.db")), false);
+
+  const explicitSecret = await run(process.execPath, [
+    cli,
+    "model",
+    "check",
+    "--json",
+    "--provider",
+    "openai_compatible",
+    "--base-url",
+    "http://localhost:11434/v1",
+    "--model",
+    "qwen-local",
+    "--api-key-env",
+    envName,
+    "--api-key-secret",
+    "sec_explicitreadygate",
+  ], dir);
+  assert.equal(explicitSecret.exitCode, 0, explicitSecret.stderr);
+  const explicitParsed = JSON.parse(explicitSecret.stdout) as {
+    ready?: boolean;
+    status?: string;
+    missingApiKeyEnvNames?: string[];
+    usesApiKeySecretRef?: boolean;
+  };
+  assert.equal(explicitParsed.ready, true);
+  assert.equal(explicitParsed.status, "ready");
+  assert.deepEqual(explicitParsed.missingApiKeyEnvNames, []);
+  assert.equal(explicitParsed.usesApiKeySecretRef, true);
   assert.equal(await exists(path.join(dir, ".agent", "agent.db")), false);
 
   const text = await run(process.execPath, [
@@ -1462,6 +1588,7 @@ test("agent resume can require model readiness before continuing a session", asy
     await fs.rm(dir, { recursive: true, force: true });
   });
   await fs.writeFile(path.join(dir, "README.md"), "# Resume Model Ready Gate\n", "utf8");
+  await configureGlobalOpenAiCompatibleSecretRefProfile(dir, "sec_resumemodelreadygate");
 
   const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
   const platform = await createLocalPlatform(dir, { provider: "mock" });
@@ -1505,6 +1632,7 @@ test("agent resume can require model readiness before continuing a session", asy
       ready?: boolean;
       status?: string;
       missingApiKeyEnvNames?: string[];
+      usesApiKeySecretRef?: boolean;
     };
   };
   assert.equal(parsed.status, "blocked");
@@ -1514,6 +1642,7 @@ test("agent resume can require model readiness before continuing a session", asy
   assert.equal(parsed.modelReadiness?.ready, false);
   assert.equal(parsed.modelReadiness?.status, "missing_api_key");
   assert.deepEqual(parsed.modelReadiness?.missingApiKeyEnvNames, [envName]);
+  assert.equal(parsed.modelReadiness?.usesApiKeySecretRef, false);
 
   const blockedPlatform = await createLocalPlatform(dir, { provider: "mock" });
   const stillPaused = await blockedPlatform.store.getSession(session.id);
@@ -4184,6 +4313,170 @@ test("model reliability guard enforces call budgets before invoking providers", 
   assert.equal(calls, 1);
 });
 
+test("agent loop converts model call budget exhaustion into a resumable runtime stop", async () => {
+  const store = new MemoryAgentStore();
+  const events: AgentRunEvent[] = [];
+  let calls = 0;
+  const inner: ModelClient = {
+    async complete() {
+      calls += 1;
+      return calls === 1
+        ? {
+            type: "tool_calls",
+            content: "need a second model call",
+            toolCalls: [{ id: "call_progress", name: "progress_marker", input: {} }],
+          }
+        : { type: "message", content: "not reached" };
+    },
+  };
+  const agent = new AgentLoop({
+    model: new GuardedModelClient(inner, { maxCalls: 1 }),
+    tools: [
+      {
+        name: "progress_marker",
+        description: "Records safe progress.",
+        inputSchema: {},
+        handler: async () => ({ callId: "call_progress", ok: true, output: "ok" }),
+      },
+    ],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "budget-user", displayName: "Budget User" },
+    targetMode: "goal",
+    onProgress: (event) => {
+      events.push(event as AgentRunEvent);
+    },
+  });
+
+  const answer = await agent.run("stop safely when model budget is exhausted");
+  const session = (await store.listSessions(1))[0];
+
+  assert.match(answer, /model call budget/i);
+  assert.match(answer, new RegExp(`session: ${session.id}`));
+  assert.match(answer, new RegExp(`resume: agent resume ${session.id}`));
+  assert.equal(session.status, "failed");
+  assert.equal(calls, 1);
+  assert.equal(
+    events.some((event) =>
+      event.type === "runtime_stopped" &&
+      (event.stopKind as string) === "model_call_budget" &&
+      event.targetMode === "goal" &&
+      event.resumeCommand === `agent resume ${session.id}`
+    ),
+    true,
+  );
+});
+
+test("agent loop run budget stops before exceeding configured model calls", async () => {
+  const store = new MemoryAgentStore();
+  const events: AgentRunEvent[] = [];
+  let calls = 0;
+  const model: ModelClient = {
+    async complete() {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          type: "tool_calls",
+          content: "use one tool before continuing",
+          toolCalls: [{ id: "call_progress", name: "progress_marker", input: {} }],
+        };
+      }
+      return { type: "message", content: "not reached" };
+    },
+  };
+  const options = {
+    model,
+    tools: [
+      {
+        name: "progress_marker",
+        description: "Records safe progress.",
+        inputSchema: {},
+        handler: async () => ({ callId: "call_progress", ok: true, output: "ok" }),
+      },
+    ],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user" as const, id: "run-budget-user", displayName: "Run Budget User" },
+    targetMode: "goal" as const,
+    runBudget: { maxModelCalls: 1 },
+    onProgress: (event: AgentRunEvent) => {
+      events.push(event);
+    },
+  } satisfies AgentLoopOptions & { runBudget: { maxModelCalls: number } };
+  const agent = new AgentLoop(options);
+
+  const answer = await agent.run("stop before a second model call");
+  const session = (await store.listSessions(1))[0];
+
+  assert.match(answer, /model call budget/i);
+  assert.equal(calls, 1);
+  assert.equal(session.status, "failed");
+  assert.equal(
+    events.some((event) =>
+      event.type === "runtime_stopped" &&
+      (event.stopKind as string) === "model_call_budget" &&
+      event.resumeCommand === `agent resume ${session.id}`
+    ),
+    true,
+  );
+});
+
+test("repeated identical tool calls stop with doom-loop guardrail", async () => {
+  const store = new MemoryAgentStore();
+  const events: AgentRunEvent[] = [];
+  let calls = 0;
+  const model: ModelClient = {
+    async complete() {
+      calls += 1;
+      if (calls <= 5) {
+        return {
+          type: "tool_calls",
+          content: "repeat the same safe marker",
+          toolCalls: [{ id: `call_repeat_${calls}`, name: "progress_marker", input: { path: "package.json" } }],
+        };
+      }
+      return { type: "message", content: "not reached" };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [
+      {
+        name: "progress_marker",
+        description: "Records safe progress.",
+        inputSchema: {},
+        handler: async () => ({ callId: "call_progress", ok: true, output: "ok" }),
+      },
+    ],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "doom-loop-user", displayName: "Doom Loop User" },
+    targetMode: "build",
+    onProgress: (event) => {
+      events.push(event as AgentRunEvent);
+    },
+  });
+
+  const answer = await agent.run("repeat the same tool call");
+  const session = (await store.listSessions(1))[0];
+
+  assert.match(answer, /repeated identical tool call/i);
+  assert.equal(calls, 3);
+  assert.equal(session.status, "failed");
+  assert.equal(
+    events.some((event) => {
+      const candidate = event as AgentRunEvent & { guardrail?: string; count?: number; resumeCommand?: string };
+      return (
+        (candidate.type as string) === "guardrail_tripped" &&
+        candidate.guardrail === "doom_loop" &&
+        candidate.count === 3 &&
+        candidate.resumeCommand === `agent resume ${session.id}`
+      );
+    }),
+    true,
+  );
+});
+
 test("model reliability guard opens circuit after consecutive failures", async () => {
   let calls = 0;
   let now = Date.parse("2026-06-01T00:00:00.000Z");
@@ -4222,7 +4515,8 @@ test("platform model call budget is audited without storing prompt text", async 
     provider: "mock",
     modelMaxCalls: 0,
   });
-  await assert.rejects(() => platform.agent.run("secret prompt text should not leak"), /Model call budget exhausted/);
+  const answer = await platform.agent.run("secret prompt text should not leak");
+  assert.match(answer, /model call budget/i);
 
   const audits = await platform.store.listAuditEvents({ type: "model.called" });
   assert.equal(audits.length, 1);
@@ -4417,6 +4711,99 @@ test("workspace tools record patch file changes and command audit by session", a
   assert.equal(commandAudits.some((event) => event.type === "command.finished" && event.metadata?.timedOut === true), true);
   assert.equal(commandAudits.some((event) => event.type === "command.finished" && typeof event.metadata?.durationMs === "number"), true);
   assert.equal(commandAudits.some((event) => event.type === "command.finished" && event.metadata?.executionProfile === "local-safe"), true);
+});
+
+test("workspace todowrite tool persists ordered session todos for long tasks", async () => {
+  const store = new MemoryAgentStore();
+  const session = await store.createSession({
+    objective: "track a long build task",
+    status: "running",
+    risk: "medium",
+    createdBy: { type: "user", id: "todo-user", displayName: "Todo User" },
+    targetMode: "build",
+  });
+  const tools = createWorkspaceTools(new LocalWorkspaceRuntime(process.cwd()), {
+    store,
+    actor: { type: "user", id: "todo-user", displayName: "Todo User" },
+    sessionId: session.id,
+  });
+  const todowrite = tools.find((tool) => tool.name === "todowrite");
+
+  assert.ok(todowrite);
+  const result = await todowrite.handler({
+    todos: [
+      { content: "Read project structure", status: "completed", priority: "high" },
+      { content: "Implement long-task continuation", status: "in_progress", priority: "high" },
+      { content: "Run verification gate", status: "pending", priority: "medium" },
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.output ?? "", /Implement long-task continuation/);
+  assert.deepEqual(await store.listSessionTodos(session.id), [
+    { content: "Read project structure", status: "completed", priority: "high" },
+    { content: "Implement long-task continuation", status: "in_progress", priority: "high" },
+    { content: "Run verification gate", status: "pending", priority: "medium" },
+  ]);
+});
+
+test("session report exposes persisted todo ledger summary", async () => {
+  const store = new MemoryAgentStore();
+  const session = await store.createSession({
+    objective: "report todo state",
+    status: "completed",
+    risk: "medium",
+    createdBy: { type: "user", id: "todo-report-user", displayName: "Todo Report User" },
+    targetMode: "build",
+  });
+  await store.replaceSessionTodos(session.id, [
+    { content: "Plan change", status: "completed", priority: "high" },
+    { content: "Run gate", status: "pending", priority: "medium" },
+  ]);
+
+  const report = await buildSessionReportView(store, session.id);
+
+  assert.equal(report.summary.todos.total, 2);
+  assert.equal(report.summary.todos.completed, 1);
+  assert.equal(report.summary.todos.pending, 1);
+  assert.deepEqual(report.todos.map((todo) => todo.content), ["Plan change", "Run gate"]);
+});
+
+test("session report exposes durable goal ledger and recent checkpoints", async () => {
+  const store = new MemoryAgentStore();
+  const session = await store.createSession({
+    objective: "ship a true long task",
+    status: "running",
+    risk: "medium",
+    createdBy: { type: "user", id: "goal-report-user", displayName: "Goal Report User" },
+    targetMode: "goal",
+  });
+  const service = new GoalService(store);
+  const goal = await service.startForSession(session, { tokenBudget: 5000 });
+  await service.updateUsage(goal.id, { tokenUsed: 1200, modelCalls: 4 });
+  await service.recordCheckpoint(goal.id, {
+    kind: "progress",
+    sessionId: session.id,
+    summary: "Read project files and identified the runtime boundary.",
+    metadata: { filesRead: 7 },
+  });
+  await service.recordBlocker(goal.id, "approval:appr_1", "Waiting for an approval decision.");
+
+  const report = await buildSessionReportView(store, session.id);
+
+  assert.equal(report.summary.goal?.status, "active");
+  assert.equal(report.summary.goal?.objective, "ship a true long task");
+  assert.equal(report.summary.goal?.tokenBudget, 5000);
+  assert.equal(report.summary.goal?.tokenUsed, 1200);
+  assert.equal(report.summary.goal?.modelCalls, 4);
+  assert.equal(report.summary.goal?.checkpoints, 3);
+  assert.equal(report.summary.goal?.blockerCheckpoints, 1);
+  assert.equal(report.goal?.id, goal.id);
+  assert.equal(report.goalCheckpoints.some((checkpoint) => checkpoint.kind === "progress"), true);
+  assert.equal(
+    report.goalCheckpoints.some((checkpoint) => checkpoint.summary.includes("runtime boundary")),
+    true,
+  );
 });
 
 test("workspace command policy separates dependency installs, git mutations, and high-risk shell", async (t) => {
@@ -4852,6 +5239,199 @@ test("build and goal mode prompts guide safe file writes and zero-exit verificat
   }
 });
 
+test("build and goal modes do not have low default step caps", async () => {
+  class CountingToolModel implements ModelClient {
+    calls = 0;
+
+    constructor(
+      private readonly toolTurns: number,
+      private readonly final: string,
+    ) {}
+
+    async complete(): Promise<Awaited<ReturnType<ModelClient["complete"]>>> {
+      this.calls += 1;
+      if (this.calls <= this.toolTurns) {
+        return {
+          type: "tool_calls",
+          content: `progress turn ${this.calls}`,
+          toolCalls: [{ id: `call_${this.calls}`, name: "progress_marker", input: { turn: this.calls } }],
+        };
+      }
+      return { type: "message", content: this.final };
+    }
+  }
+
+  const tools: RegisteredTool[] = [
+    {
+      name: "progress_marker",
+      description: "Records safe long-task progress.",
+      inputSchema: {},
+      handler: async (input) => ({
+        callId: `progress_${String(input.turn ?? "unknown")}`,
+        ok: true,
+        output: `turn=${String(input.turn ?? "unknown")}`,
+        display: { title: "Record progress", detailsHidden: true },
+      }),
+    },
+  ];
+
+  const buildModel = new CountingToolModel(35, "completed after many build steps");
+  const buildAgent = new AgentLoop({
+    model: buildModel,
+    tools,
+    systemPrompt: "system",
+    store: new MemoryAgentStore(),
+    actor: { type: "user", id: "long-build", displayName: "Long Build" },
+    targetMode: "build",
+  });
+  const buildAnswer = await buildAgent.run("exercise more than thirty tool turns");
+  assert.equal(buildAnswer, "completed after many build steps");
+  assert.equal(buildModel.calls, 36);
+
+  const goalModel = new CountingToolModel(85, "goal completed after many steps");
+  const goalAgent = new AgentLoop({
+    model: goalModel,
+    tools,
+    systemPrompt: "system",
+    store: new MemoryAgentStore(),
+    actor: { type: "user", id: "long-goal", displayName: "Long Goal" },
+    targetMode: "goal",
+  });
+  const goalAnswer = await goalAgent.run("complete a durable objective over many steps");
+  assert.equal(goalAnswer, "goal completed after many steps");
+  assert.equal(goalModel.calls, 86);
+});
+
+test("goal ledger marks complete only with explicit completion evidence", async () => {
+  const store = new MemoryAgentStore();
+  const service = new GoalService(store);
+  const session = await store.createSession({
+    objective: "finish a verified change",
+    targetMode: "goal",
+    status: "running",
+    risk: "medium",
+    createdBy: { type: "user", id: "u1" },
+  });
+  const goal = await service.startForSession(session, { tokenBudget: 1000 });
+  await service.recordCheckpoint(goal.id, {
+    kind: "progress",
+    summary: "read project files",
+    sessionId: session.id,
+  });
+
+  const beforeVerify = await service.tryMarkComplete(goal.id, { verified: false, summary: "model claimed done" });
+  assert.equal(beforeVerify.status, "active");
+
+  const afterVerify = await service.tryMarkComplete(goal.id, { verified: true, summary: "session verification passed" });
+  assert.equal(afterVerify.status, "complete");
+});
+
+test("goal ledger marks blocked after the same blocker repeats three times", async () => {
+  const store = new MemoryAgentStore();
+  const service = new GoalService(store);
+  const session = await store.createSession({
+    objective: "wait for missing approval",
+    targetMode: "goal",
+    status: "running",
+    risk: "medium",
+    createdBy: { type: "user", id: "u1" },
+  });
+  const goal = await service.startForSession(session);
+
+  await service.recordBlocker(goal.id, "approval:appr_1", "Approval appr_1 is required.");
+  await service.recordBlocker(goal.id, "approval:appr_1", "Approval appr_1 is still required.");
+  const blocked = await service.recordBlocker(goal.id, "approval:appr_1", "Approval appr_1 is still required.");
+
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.repeatedBlockers, 3);
+});
+
+test("sqlite goal ledger persists runs and checkpoints", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-goal-ledger-"));
+  const store = new SqliteAgentStore(path.join(dir, "agent.db"));
+  t.after(() => store.close());
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const service = new GoalService(store);
+  const session = await store.createSession({
+    objective: "persist a goal",
+    targetMode: "goal",
+    status: "running",
+    risk: "medium",
+    createdBy: { type: "user", id: "u1" },
+  });
+  const goal = await service.startForSession(session, { tokenBudget: 1234 });
+  await service.recordCheckpoint(goal.id, {
+    kind: "progress",
+    summary: "made progress",
+    sessionId: session.id,
+    metadata: { step: 1 },
+  });
+
+  const persisted = await store.getGoalRunBySession(session.id);
+  const checkpoints = await store.listGoalCheckpoints(goal.id);
+
+  assert.equal(persisted?.id, goal.id);
+  assert.equal(persisted?.tokenBudget, 1234);
+  const progress = checkpoints.find((checkpoint) => checkpoint.kind === "progress");
+  assert(progress);
+  assert.equal(progress.summary, "made progress");
+  assert.deepEqual(progress.metadata, { step: 1 });
+});
+
+test("goal mode creates and updates a durable goal run", async () => {
+  const store = new MemoryAgentStore();
+  const events: AgentRunEvent[] = [];
+  let calls = 0;
+  const model: ModelClient = {
+    async complete() {
+      calls += 1;
+      if (calls <= 2) {
+        return {
+          type: "tool_calls",
+          content: `progress ${calls}`,
+          toolCalls: [{ id: `call_goal_${calls}`, name: "progress_marker", input: { turn: calls } }],
+        };
+      }
+      return { type: "message", content: "verified goal complete" };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [
+      {
+        name: "progress_marker",
+        description: "Records safe progress.",
+        inputSchema: {},
+        handler: async (input) => ({ callId: `call_goal_${String(input.turn ?? "unknown")}`, ok: true, output: "ok" }),
+      },
+    ],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user", id: "goal-loop-user", displayName: "Goal Loop User" },
+    targetMode: "goal",
+    onProgress: (event) => {
+      events.push(event as AgentRunEvent);
+    },
+  });
+
+  const answer = await agent.run("make a verified tiny change");
+  const session = (await store.listSessions(1))[0];
+  const goal = await store.getGoalRunBySession(session.id);
+
+  assert.equal(answer, "verified goal complete");
+  assert.equal(goal?.status, "complete");
+  assert.equal(goal?.modelCalls, 3);
+  assert.equal(
+    events.some((event) => {
+      const candidate = event as AgentRunEvent & { status?: string; goalId?: string };
+      return (candidate.type as string) === "goal_updated" && candidate.status === "complete" && candidate.goalId === goal?.id;
+    }),
+    true,
+  );
+});
+
 test("agent loop audits model calls without storing prompt or response text", async () => {
   const store = new MemoryAgentStore();
   const model: ModelClient = {
@@ -5070,6 +5650,106 @@ test("agent loop resume adds explicit continuation context", async () => {
   assert.match(prompt, /Continuation reason:\s*CLI resume/);
   assert.match(prompt, /Do not restart project discovery unless needed/);
   assert.equal(messages.some((message) => message.role === "user" && /Continue this existing Soloclaw session/.test(message.content)), true);
+});
+
+test("goal resume uses compacted summary and continues existing objective", async () => {
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "operator", displayName: "Operator" };
+  const session = await store.createSession({
+    objective: "finish the compacted long goal",
+    targetMode: "goal",
+    status: "failed",
+    risk: "medium",
+    createdBy: actor,
+  });
+  await store.appendMessage({ sessionId: session.id, message: { role: "system", content: "system" } });
+  await store.appendMessage({ sessionId: session.id, message: { role: "user", content: "finish the compacted long goal" } });
+  for (let index = 0; index < 80; index += 1) {
+    await store.appendMessage({
+      sessionId: session.id,
+      message: {
+        role: index % 2 === 0 ? "assistant" : "user",
+        content: `historical detail ${index} ${"x".repeat(220)}`,
+      },
+    });
+  }
+
+  let requestMessages: Array<{ role: string; content: string }> = [];
+  const model: ModelClient = {
+    async complete(request) {
+      requestMessages = request.messages.map((message) => ({ role: message.role, content: message.content }));
+      return { type: "message", content: "continued from compacted context" };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    store,
+    actor,
+    targetMode: "goal",
+  });
+
+  const answer = await agent.resume(session.id);
+  const requestText = requestMessages.map((message) => message.content).join("\n");
+  const summaries = await store.getSessionSummaries(session.id);
+
+  assert.equal(answer, "continued from compacted context");
+  assert.equal(requestMessages.length < 50, true);
+  assert.match(requestText, /Compacted prior context/);
+  assert.match(requestText, /Continue after context compaction/);
+  assert.match(requestText, /Continue this existing Soloclaw session/);
+  assert.match(requestText, /finish the compacted long goal/);
+  assert.equal(summaries.some((summary) => /historical detail/.test(summary.summary)), true);
+});
+
+test("goal supervisor auto-continues stopped chunks until complete", async () => {
+  const store = new MemoryAgentStore();
+  let calls = 0;
+  const model: ModelClient = {
+    async complete() {
+      calls += 1;
+      if (calls <= 6) {
+        return {
+          type: "tool_calls",
+          content: `chunk progress ${calls}`,
+          toolCalls: [{ id: `call_chunk_${calls}`, name: "progress_marker", input: { turn: calls } }],
+        };
+      }
+      return { type: "message", content: "goal complete after continuations" };
+    },
+  };
+  const createAgent = () =>
+    new AgentLoop({
+      model,
+      tools: [
+        {
+          name: "progress_marker",
+          description: "Records safe progress.",
+          inputSchema: {},
+          handler: async (input) => ({ callId: `call_chunk_${String(input.turn ?? "unknown")}`, ok: true, output: "ok" }),
+        },
+      ],
+      systemPrompt: "system",
+      store,
+      actor: { type: "user", id: "goal-supervisor-user", displayName: "Goal Supervisor User" },
+      targetMode: "goal",
+      maxSteps: 3,
+    });
+  const supervisor = new AgentRunSupervisor({ store, createAgent });
+
+  const result = await supervisor.run({
+    objective: "finish across chunks",
+    autoContinue: true,
+    maxContinuations: 5,
+  });
+
+  assert.equal(result.status, "complete");
+  assert.match(result.finalAnswer, /goal complete after continuations/);
+  assert.equal(result.continuations, 2);
+  assert(result.sessionId);
+  const goal = await store.getGoalRunBySession(result.sessionId);
+  assert.equal(goal?.status, "complete");
 });
 
 test("session report exposes runtime stop evidence", async () => {
@@ -8853,6 +9533,161 @@ test("agent phase3 checklist and gate expose runtime reliability checks", async 
   assert.equal(parsed.checks?.some((check) => check.id === "C4" && check.status === "pass"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "C5" && check.status === "pass"), true);
   assert.equal(parsed.checks?.some((check) => check.id === "C6" && check.status === "pass"), true);
+});
+
+test("agent phase3 gate falls back to a readable workspace file when index.html is absent", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-package-only-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const packageJson = JSON.stringify({ name: "phase3-package-only", type: "module" }, null, 2);
+  await fs.writeFile(path.join(dir, "package.json"), packageJson, "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.exitCode, 0, gate.stderr);
+  const parsed = JSON.parse(gate.stdout) as {
+    status?: string;
+    checks?: Array<{
+      id?: string;
+      status?: string;
+      cleanup?: { targetPath?: string; restored?: boolean; markerPresentAfterCleanup?: boolean };
+    }>;
+  };
+  const c4 = parsed.checks?.find((check) => check.id === "C4");
+
+  assert.equal(parsed.status, "pass");
+  assert.equal(c4?.status, "pass");
+  assert.equal(c4?.cleanup?.targetPath, "package.json");
+  assert.equal(c4?.cleanup?.restored, true);
+  assert.equal(c4?.cleanup?.markerPresentAfterCleanup, false);
+  assert.equal(await fs.readFile(path.join(dir, "package.json"), "utf8"), packageJson);
+  assert.doesNotMatch(await fs.readFile(path.join(dir, "package.json"), "utf8"), /soloclaw-phase3-c4-marker/);
+});
+
+test("agent phase3 gate fails with a readable target file error when no target file exists", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-no-readable-target-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.exitCode, 1);
+  const parsed = JSON.parse(gate.stdout) as {
+    status?: string;
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+  const summaries = parsed.checks?.map((check) => check.summary ?? "").join("\n") ?? "";
+
+  assert.equal(parsed.status, "fail");
+  assert.match(summaries, /no readable target file/i);
+  assert.doesNotMatch(summaries, /index\.html/);
+});
+
+test("agent phase3 long-task gate verifies no low step cap and continuation controls", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-long-task-gate-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-long-task-fixture", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>Long task fixture</title>\n<main>ready</main>\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "long-task-gate", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.exitCode, 0, gate.stderr);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    phase?: string;
+    gate?: string;
+    status?: string;
+    workspace?: string;
+    secretMatches?: number;
+    checks?: Array<{
+      id?: string;
+      status?: string;
+      targetMode?: string;
+      toolTurns?: number;
+      modelCalls?: number;
+      runtimeStops?: number;
+      stopKind?: string;
+      continuations?: number;
+      workerAssignmentStatus?: string;
+      visibleRows?: number;
+    }>;
+  };
+  const byId = (id: string) => parsed.checks?.find((check) => check.id === id);
+
+  assert.equal(parsed.phase, "phase3");
+  assert.equal(parsed.gate, "long-task");
+  assert.equal(parsed.status, "pass");
+  assert.equal(parsed.workspace, dir);
+  assert.equal(parsed.secretMatches, 0);
+  assert.equal(byId("L1")?.status, "pass");
+  assert.equal(byId("L1")?.targetMode, "build");
+  assert.equal(byId("L1")?.toolTurns, 35);
+  assert.equal(byId("L1")?.modelCalls, 36);
+  assert.equal(byId("L2")?.status, "pass");
+  assert.equal(byId("L2")?.targetMode, "goal");
+  assert.equal(byId("L2")?.toolTurns, 85);
+  assert.equal(byId("L2")?.modelCalls, 86);
+  assert.equal(byId("L3")?.status, "pass");
+  assert.equal(byId("L3")?.continuations, 2);
+  assert.ok((byId("L3")?.runtimeStops ?? 0) >= 2);
+  assert.equal(byId("L4")?.status, "pass");
+  assert.equal(byId("L4")?.stopKind, "doom_loop");
+  assert.equal(byId("L5")?.status, "pass");
+  assert.equal(byId("L5")?.workerAssignmentStatus, "running");
+  assert.equal(byId("L6")?.status, "pass");
+  assert.equal(byId("L6")?.visibleRows, 6);
+  assert.equal(byId("L7")?.status, "pass");
+});
+
+test("agent phase3 real-provider long-task gate fails closed without configured real provider", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-phase3-real-provider-blocked-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ name: "phase3-real-provider-blocked", type: "module" }, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "index.html"), "<!doctype html>\n<title>Blocked real provider fixture</title>\n", "utf8");
+
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const gate = await run(process.execPath, [cli, "phase3", "long-task-real-provider", "--workspace", dir, "--json"], dir);
+  assert.equal(gate.exitCode, 1);
+  assert.equal(gate.stderr.includes("sk-"), false);
+  const parsed = JSON.parse(gate.stdout) as {
+    phase?: string;
+    gate?: string;
+    status?: string;
+    readinessStatus?: string;
+    secretMatches?: number;
+    checks?: Array<{ id?: string; status?: string; summary?: string }>;
+  };
+
+  assert.equal(parsed.phase, "phase3");
+  assert.equal(parsed.gate, "long-task-real-provider");
+  assert.equal(parsed.status, "blocked");
+  assert.notEqual(parsed.readinessStatus, "ready_for_manual_run");
+  assert.equal(parsed.secretMatches, 0);
+  assert.equal(parsed.checks?.some((check) => check.id === "R0" && check.status === "blocked"), true);
+  assert.equal(parsed.checks?.some((check) => check.id === "R4" && check.status === "pass"), true);
+});
+
+test("phase3 real-provider read-only prompt prevents workspace-folder path drift", () => {
+  const prompt = formatPhaseThreeReadOnlyGoalPrompt("E:\\code\\tafang", [
+    "index.html",
+    "js/main.js",
+    "js/config.js",
+    "js/entities/Tower.js",
+  ]);
+
+  assert.match(prompt, /Do not modify files/);
+  assert.match(prompt, /read_file/);
+  assert.match(prompt, /path exactly as `index\.html`/);
+  assert.match(prompt, /path exactly as `js\/main\.js`/);
+  assert.match(prompt, /Do not prefix.*tafang/i);
+  assert.match(prompt, /Do not call `run_command`/);
+  assert.match(prompt, /If a `read_file` call fails.*`list_files`/s);
 });
 
 test("agent phase3 gate C4 runs a reversible build smoke against a real workspace", async (t) => {
@@ -15944,6 +16779,7 @@ test("remote room runner polls routed inbox and posts signed acknowledgements", 
     identity: {
       signRoomDeliveryAckEnvelope: async (envelope) => `ed25519:${envelope.messageId}:signature`,
       signAgentHeartbeatEnvelope: async (envelope) => `ed25519:${envelope.status}:heartbeat`,
+      signRoomMessageIntentEnvelope: async (envelope) => `ed25519:${envelope.agentId}:${envelope.nonce}:message`,
     },
   });
   const result = await runner.poll({ maxMessages: 2, maxIdlePolls: 1, idleIntervalMs: 0 });
@@ -16035,6 +16871,7 @@ test("remote room runner supervised run retries transient control-plane errors",
     identity: {
       signRoomDeliveryAckEnvelope: async (envelope) => `ed25519:${envelope.messageId}:loop-signature`,
       signAgentHeartbeatEnvelope: async (envelope) => `ed25519:${envelope.status}:loop-heartbeat`,
+      signRoomMessageIntentEnvelope: async (envelope) => `ed25519:${envelope.agentId}:${envelope.nonce}:loop-message`,
     },
   });
   const result = await runner.run({
@@ -19636,6 +20473,67 @@ test("local worker runner keeps paused sessions leased for later continuation", 
   assert.equal((await store.listAuditEvents({ type: "task.completed" })).length, 0);
 });
 
+test("local worker runner keeps resumable goal runtime stops leased for continuation", async () => {
+  const store = new MemoryAgentStore();
+  const workers = new WorkerRegistryService(store);
+  const assignments = new TaskAssignmentService(store);
+  const actor = { type: "agent" as const, id: "agent-worker", displayName: "Agent Worker" };
+  const session = await store.createSession({
+    objective: "runner stops on resumable goal budget",
+    status: "created",
+    targetMode: "goal",
+    risk: "medium",
+    projectId: "project-local",
+    createdBy: actor,
+  });
+  const worker = await workers.register({
+    actor,
+    agentId: actor.id,
+    machineId: "machine-local",
+    allowedProjects: ["project-local"],
+    ttlSeconds: 60,
+  });
+  const assigned = await assignments.assign({ actor, workerId: worker.id, sessionId: session.id, leaseTtlSeconds: 60 });
+  const runner = new LocalWorkerRunner({
+    store,
+    workers,
+    assignments,
+    createAgent: () =>
+      ({
+        resume: async (sessionId: string) => {
+          assert.equal(sessionId, session.id);
+          await store.updateSessionStatus(sessionId, "failed");
+          await store.recordAuditEvent({
+            id: "audit_resumable_runtime_stop" as never,
+            type: "agent.event",
+            actor,
+            sessionId,
+            summary: "agent.event.runtime_stopped",
+            metadata: {
+              eventType: "runtime_stopped",
+              stopKind: "step_budget",
+              targetMode: "goal",
+              reason: "The run reached the configured step budget.",
+              resumeCommand: `agent resume ${sessionId}`,
+            },
+            artifactRefs: [],
+            createdAt: new Date().toISOString(),
+          });
+          return `Stopped after 3 steps without a final answer.\nsession: ${sessionId}\nresume: agent resume ${sessionId}`;
+        },
+      }) as unknown as AgentLoop,
+  });
+
+  const result = await runner.runOnce({ workerId: worker.id, leaseTtlSeconds: 60, actor });
+
+  assert.equal(result.ran, true);
+  assert.equal(result.ran ? result.completed : true, false);
+  assert.equal((await assignments.get(assigned.id))?.status, "running");
+  assert.equal((await store.getSession(session.id))?.status, "failed");
+  assert.equal((await store.getWorkerRegistration(worker.id))?.currentLoad, 1);
+  assert.equal((await store.listAuditEvents({ type: "task.completed" })).length, 0);
+});
+
 test("local worker runner polls multiple assignments up to the configured limit", async () => {
   const store = new MemoryAgentStore();
   const workers = new WorkerRegistryService(store);
@@ -19948,13 +20846,17 @@ test("control plane web API requires the local access token", async (t) => {
   assert.match(html, /No persisted patches/);
   assert.match(html, /No file changes/);
   assert.match(html, /No recent audit events/);
-  assert.match(html, /Agent Event Stream/);
+  assert.match(html, /Room Events/);
   assert.match(html, /id="agent-event-stream"/);
   assert.match(html, /id="agent-event-stream-status"/);
   assert.match(html, /connectAgentEventStream/);
-  assert.match(html, /new EventSource\('\/api\/events\?token=' \+ encodeURIComponent\(controlToken\)\)/);
+  assert.match(html, /new URLSearchParams\(\{ token: controlToken \}\)/);
+  assert.match(html, /params\.set\('room', roomId\)/);
+  assert.match(html, /new EventSource\('\/api\/events\?' \+ params\.toString\(\)\)/);
   assert.match(html, /renderAgentEventStream/);
   assert.match(html, /projectAgentEventForWeb/);
+  assert.match(html, /eventScopeMeta/);
+  assert.match(html, /scheduleStateRefreshForEvent/);
   assert.match(html, /agent-event-row/);
   assert.match(html, /No agent events yet/);
   assert.match(html, /sessionInspectionItem/);
@@ -21171,6 +22073,20 @@ async function commandExists(command: string): Promise<boolean> {
   return result.exitCode === 0;
 }
 
+async function configureGlobalOpenAiCompatibleSecretRefProfile(workspace: string, apiKeySecretRef: string): Promise<void> {
+  const store = new GlobalModelProfileStore(path.join(workspace, ".agent"));
+  await store.set({
+    id: "openai_compatible",
+    provider: "openai_compatible",
+    protocol: "openai_chat",
+    defaultBaseUrl: "http://localhost:11434/v1",
+    defaultModel: "qwen-local",
+    apiKeyEnvNames: ["GLOBAL_READY_GATE_API_KEY"],
+    apiKeySecretRef,
+  });
+  await store.setDefaultProfile("openai_compatible");
+}
+
 async function exists(filePath: string): Promise<boolean> {
   try {
     await fs.access(filePath);
@@ -21187,7 +22103,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
 
 function run(command: string, args: string[], cwd: string): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true });
+    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: childProcessEnv(cwd, args) });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -21203,7 +22119,7 @@ function run(command: string, args: string[], cwd: string): Promise<{ exitCode: 
 
 function runWithInput(command: string, args: string[], cwd: string, input: string): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: childProcessEnv(cwd, args) });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -21220,7 +22136,7 @@ function runWithInput(command: string, args: string[], cwd: string, input: strin
 
 function runWithEnv(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: { ...process.env, ...env } });
+    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: childProcessEnv(cwd, args, env) });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -21234,10 +22150,60 @@ function runWithEnv(command: string, args: string[], cwd: string, env: NodeJS.Pr
   });
 }
 
+function childProcessEnv(cwd: string, args: string[] = [], env: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const workspace = workspaceArgForChild(cwd, args);
+  return {
+    ...process.env,
+    SOLOCLAW_HOME: process.env.SOLOCLAW_HOME ?? path.join(workspace, ".agent"),
+    ...env,
+  };
+}
+
+function workspaceArgForChild(cwd: string, args: string[]): string {
+  const workspaceFlagIndex = args.indexOf("--workspace");
+  if (workspaceFlagIndex >= 0 && args[workspaceFlagIndex + 1]) {
+    return path.resolve(cwd, args[workspaceFlagIndex + 1]);
+  }
+  const workspaceEquals = args.find((arg) => arg.startsWith("--workspace="));
+  if (workspaceEquals) {
+    return path.resolve(cwd, workspaceEquals.slice("--workspace=".length));
+  }
+  const historyPath = path.join(cwd, ".agent", "workspaces.json");
+  if (existsSync(historyPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(historyPath, "utf8")) as { activeWorkspace?: string };
+      if (parsed.activeWorkspace) {
+        return path.resolve(parsed.activeWorkspace);
+      }
+    } catch {
+      return cwd;
+    }
+  }
+  return cwd;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function removeTreeWithRetry(inputPath: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await fs.rm(inputPath, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4 || !isBusyFsError(error)) {
+        throw error;
+      }
+      await sleep(100 * (attempt + 1));
+    }
+  }
+}
+
+function isBusyFsError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && ((error as NodeJS.ErrnoException).code === "EBUSY" || (error as NodeJS.ErrnoException).code === "EPERM");
 }
 
 function escapeRegExp(value: string): string {

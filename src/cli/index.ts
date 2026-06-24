@@ -1,12 +1,16 @@
 ﻿#!/usr/bin/env node
-import { promises as fs } from "node:fs";
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { promises as fs, type Dirent } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface, type Interface as ReadlineInterface } from "node:readline/promises";
 import type {
   ActorRef,
+  AgentHeartbeatEnvelope,
   AgentHeartbeatStatus,
+  AgentTrustStatus,
   ApprovalRequest,
   ApprovalStatus,
   ArtifactKind,
@@ -21,6 +25,8 @@ import type {
   MemoryScope,
   PolicyAction,
   RetentionPolicy,
+  RoomMessageKind,
+  RoomMessageIntentEnvelope,
   RoomMemberStatus,
   RoomRoutingDiagnostic,
   RoomRole,
@@ -35,13 +41,22 @@ import type {
 } from "../domain/index.js";
 import { ControlPlaneService } from "../control-plane/control-plane-service.js";
 import { AgentLoop, type AgentLoopProgressEvent } from "../core/agent-loop.js";
-import { DEFAULT_ROOM_AGENT_RESPONSE_MODE, DEFAULT_ROOM_WIDE_MENTION_POLICY } from "../domain/index.js";
+import { AgentRunSupervisor } from "../core/agent-run-supervisor.js";
+import { DaemonLifecycleController, type DaemonLifecycleSnapshot } from "../daemon/daemon-lifecycle.js";
+import { DEFAULT_ROOM_AGENT_RESPONSE_MODE, DEFAULT_ROOM_WIDE_MENTION_POLICY, roomMessageIntentEnvelopeSigningPayload } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import { scanExecutionHygiene } from "../hygiene/execution-hygiene.js";
 import type { OperatorItemKind, OperatorItemView, OperatorSeverity, OperatorStatus, OperatorViewModel } from "../operator/operator-view-models.js";
 import { operatorSections, type OperatorDetailView } from "../operator/operator-detail.js";
 import { collectOperatorRows, hasOperatorFilters, operatorItemMatches, type OperatorRowView } from "../operator/operator-rows.js";
 import { LocalProviderProfileStore, type ModelProviderProfileView } from "../model/local-provider-profile-store.js";
+import {
+  ensureGlobalSecretVaultPassphraseFile,
+  GlobalModelProfileStore,
+  globalSecretVaultPassphraseFile,
+  globalSecretVaultPath,
+  type GlobalModelProfileView,
+} from "../model/global-model-profile-store.js";
 import type { ModelClient, ModelProviderName, ModelRequest } from "../model/model-client.js";
 import { ModelUsageService } from "../model/model-usage-service.js";
 import type { ModelUsageSummaryEntry } from "../model/model-usage-service.js";
@@ -54,22 +69,30 @@ import type { McpHealthCheckResult } from "../mcp/mcp-health-service.js";
 import { LocalMcpRegistry, parseMcpCapabilities } from "../mcp/local-mcp-registry.js";
 import { LocalMcpRuntime } from "../mcp/local-mcp-runtime.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
-import { RemoteRoomRunner } from "../remote/remote-room-runner.js";
+import { LocalEventBus } from "../events/local-event-bus.js";
+import { detectPlatformCapabilities, resolveSoloclawPaths, type SoloclawPlatformCapabilities } from "../platform/soloclaw-platform.js";
+import { RemoteRoomRunner, type RemoteRoomPollResult, type RemoteRoomRunResult } from "../remote/remote-room-runner.js";
 import type { SchedulerRunResult, SchedulerTickResult } from "../scheduler/local-scheduler-service.js";
 import type { PutSecretInput } from "../secrets/secret-store.js";
-import { EncryptedFileSecretStore, ensureLocalSecretVaultPassphraseFile, localSecretVaultPassphraseFile, localSecretVaultStoreOptions } from "../secrets/encrypted-file-secret-store.js";
+import { EncryptedFileSecretStore } from "../secrets/encrypted-file-secret-store.js";
 import { buildSessionInspectView, buildSessionNextView, buildSessionReportView, buildSessionVerificationView, type SessionVerificationOptions, type SessionVerificationPreset } from "../sessions/session-inspection-view.js";
 import type { KnowledgeEvalCase, KnowledgeEvalThresholds, KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { parseSpecificationClarificationStatus, parseSpecificationStatus, parseSpecificationTaskStatus } from "../specifications/specification-service.js";
 import type { SpecificationEvidenceConclusion, SpecificationEvidenceProvider, SpecificationVerificationStatus } from "../specifications/specification-service.js";
 import type { AgentStore, ListAuditEventsInput } from "../store/agent-store.js";
-import type { ToolResult } from "../protocol/types.js";
-import type { WorkerPollResult, WorkerRunOnceResult } from "../workers/local-worker-runner.js";
+import { MemoryAgentStore } from "../store/memory-agent-store.js";
+import type { RegisteredTool, ToolResult } from "../protocol/types.js";
+import { LocalWorkerRunner, type WorkerPollResult, type WorkerRunOnceResult } from "../workers/local-worker-runner.js";
 import { WorkerHealthService, type WorkerHealthSummary } from "../workers/worker-health-service.js";
+import { WorkerRegistryService } from "../workers/worker-registry-service.js";
+import { TaskAssignmentService } from "../tasks/task-assignment-service.js";
 import { collectWorkspaceKeyFilePreviews, collectWorkspaceSnapshot, renderWorkspaceFilePreviews, renderWorkspaceSnapshot } from "../workspace/workspace-snapshot.js";
 import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
 import { runWorkspaceRuntimeJsonRpcRustSmoke, runWorkspaceRuntimeJsonRpcRustToolsSmoke } from "../workspace/workspace-runtime-jsonrpc-smoke.js";
-import { renderAppHtml } from "../web/local-room-web-server.js";
+import { parseWorkspaceRuntimeMode, type WorkspaceRuntimeMode } from "../workspace/workspace-runtime-selector.js";
+import { renderAppHtml, startLocalRoomWebServer } from "../web/local-room-web-server.js";
+import { formatPhaseThreeReadOnlyGoalPrompt } from "./phase3-long-task-prompts.js";
+import { parseContextCompactionCliOptions } from "./context-compaction-options.js";
 import {
   buildPhaseTwoClosureStatus,
   buildPhaseTwoEvidenceCheck,
@@ -111,15 +134,15 @@ import {
   timelineKindOrder,
   type SessionTimelineItem,
 } from "../sessions/session-timeline-view.js";
-import { shouldUseRichTui, startRichTuiShell, type RichTuiModelSetupResult, type RichTuiSessionResumeInput, type RichTuiSessionsResult, type RichTuiTaskRunInput, type RichTuiTaskRunResult } from "./tui/rich-shell.js";
+import { agentMessagesToRichTuiTranscript, shouldUseRichTui, startRichTuiShell, type RichTuiBackgroundSessionInput, type RichTuiModelSetupResult, type RichTuiSessionControlInput, type RichTuiSessionResumeInput, type RichTuiSessionsResult, type RichTuiTaskRunInput, type RichTuiTaskRunResult } from "./tui/rich-shell.js";
 import type { RichModelSetupRequest } from "./tui/model-setup.js";
-import type { RichTuiMode, RichTuiWorkspaceStatus } from "./tui/state.js";
+import { TUI_COMMANDS } from "./tui/commands.js";
+import { renderConversationScreen } from "./tui/layout.js";
+import type { RichTuiMode, RichTuiState, RichTuiWorkspaceStatus } from "./tui/state.js";
 import { formatRichTuiRealProviderSmokeResult, formatRichTuiSmokeResult, runRichTuiRealProviderSmoke, runRichTuiSmoke } from "./tui/rich-smoke.js";
 
-const TUI_RUN_MAX_STEPS = 80;
-
 async function main() {
-  const [, , command, ...rest] = process.argv;
+  let [, , command, ...rest] = process.argv;
 
   if (!command) {
     await startTui(await resolveInitialWorkspace(process.cwd(), []), process.cwd());
@@ -135,6 +158,13 @@ async function main() {
     printHelp(rest);
     return;
   }
+
+  if (command === "room" && (!rest[0] || rest[0] === "help" || rest[0] === "--help" || rest[0] === "-h")) {
+    printRoomConvenienceHelp();
+    return;
+  }
+
+  ({ command, rest } = normalizeRoomConvenienceCommand(command, rest));
 
   if (command === "quickstart") {
     try {
@@ -199,6 +229,28 @@ async function main() {
         console.log(JSON.stringify(status, null, 2));
       } else {
         printSoloclawStatus(status);
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (command === "platform") {
+    const subcommand = rest[0] ?? "doctor";
+    if (subcommand !== "doctor" && subcommand !== "check") {
+      console.error("Usage: soloclaw platform doctor [--json]");
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const capabilities = await detectPlatformCapabilities();
+      if (rest.slice(1).includes("--json")) {
+        const profiles = new GlobalModelProfileStore();
+        console.log(JSON.stringify(buildPlatformDoctorView(capabilities, await profiles.usesLegacyConfig()), null, 2));
+      } else {
+        printPlatformDoctor(capabilities);
       }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -287,16 +339,15 @@ async function main() {
 
   if (command === "providers") {
     try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
       const args = stripWorkspaceOption(rest);
-      const profiles = new LocalProviderProfileStore(path.join(workspace, ".agent"));
+      const profiles = new GlobalModelProfileStore();
       const parsed = parseModelProfileArgs(args);
       const listed = await profiles.list();
-      const defaultProvider = await profiles.getDefaultProvider();
+      const defaultProfile = await profiles.getDefaultProfile();
       if (parsed.options.json) {
-        printModelProviderProfilesJson(listed, defaultProvider, profiles.filePath);
+        printGlobalModelProfilesJson(listed, defaultProfile, profiles.filePath);
       } else {
-        printModelProviderProfiles(listed, defaultProvider);
+        printGlobalModelProfiles(listed, defaultProfile);
       }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
@@ -360,26 +411,26 @@ async function main() {
       const workspace = await resolveInitialWorkspace(process.cwd(), rest);
       const args = stripWorkspaceOption(rest);
       const subcommand = args[0] ?? "list";
-      const profiles = new LocalProviderProfileStore(path.join(workspace, ".agent"));
+      const profiles = new GlobalModelProfileStore();
       if (subcommand === "list" || subcommand === "ls") {
         const parsed = parseModelProfileArgs(args.slice(1));
         const listed = await profiles.list();
-        const defaultProvider = await profiles.getDefaultProvider();
+        const defaultProfile = await profiles.getDefaultProfile();
         if (parsed.options.json) {
-          console.log(JSON.stringify({ profiles: listed, defaultProvider, configPath: profiles.filePath }, null, 2));
+          console.log(JSON.stringify({ profiles: listed, providers: listed, defaultProfile, defaultProvider: defaultProfile, configPath: profiles.filePath }, null, 2));
         } else {
-          printModelProviderProfiles(listed, defaultProvider);
+          printGlobalModelProfiles(listed, defaultProfile);
         }
         return;
       }
       if (subcommand === "providers" || subcommand === "presets") {
         const parsed = parseModelProfileArgs(args.slice(1));
         const listed = await profiles.list();
-        const defaultProvider = await profiles.getDefaultProvider();
+        const defaultProfile = await profiles.getDefaultProfile();
         if (parsed.options.json) {
-          printModelProviderProfilesJson(listed, defaultProvider, profiles.filePath);
+          printGlobalModelProfilesJson(listed, defaultProfile, profiles.filePath);
         } else {
-          printModelProviderProfiles(listed, defaultProvider);
+          printGlobalModelProfiles(listed, defaultProfile);
         }
         return;
       }
@@ -405,14 +456,15 @@ async function main() {
         return;
       }
       if (subcommand === "use" || subcommand === "default") {
-        const providerName = args[1];
-        if (!providerName) {
-          console.error("Usage: soloclaw model use <provider>");
+        const profileId = args[1];
+        if (!profileId) {
+          console.error("Usage: soloclaw model use <profile-id>");
           process.exitCode = 1;
           return;
         }
-        const selected = await selectDefaultModelProvider(profiles, providerName);
-        console.log(`default=${selected.defaultProvider}`);
+        const selected = await selectDefaultModelProfile(profiles, profileId);
+        console.log(`default=${selected.defaultProfile}`);
+        console.log(`provider=${selected.profile.provider}`);
         console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
         console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
         console.log(`config=${profiles.filePath}`);
@@ -420,53 +472,33 @@ async function main() {
       }
       if (subcommand === "setup") {
         const parsed = parseModelProfileArgs(args.slice(1));
-        const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-        let providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
-        if (!providerName && stdin.isTTY) {
-          const promptedProvider = (await promptLine("Provider [openai]: ")) || "openai";
+        if (!parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0] && stdin.isTTY) {
+          const promptedProvider = (await promptLine("Provider [openai_compatible]: ")) || "openai_compatible";
           parsed.options.providerInput = promptedProvider;
-          providerName = parseModelProviderName(promptedProvider);
+          parsed.options.provider = parseModelProviderName(promptedProvider);
         }
-        if (!providerName) {
-          console.error("Usage: soloclaw model setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
+        if (!parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0] && !parsed.options.profileId) {
+          console.error("Usage: soloclaw model setup <provider> [--profile id] [--protocol openai_chat|openai_responses|anthropic_messages|mock] [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
           process.exitCode = 1;
           return;
         }
-        const current = (await profiles.list()).find((profile) => profile.name === providerName);
-        if (!current) {
-          throw new Error(`Unknown model provider: ${providerName}`);
-        }
-        const profile = await profiles.set({
-          name: providerName,
-          protocol: parsed.options.protocol ?? current.protocol,
-          defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(parsed.options.providerInput ?? providerInput) ?? current.defaultBaseUrl,
-          defaultModel: parsed.options.model ?? current.defaultModel,
-          apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, parsed.options.providerInput ?? providerInput, current.apiKeyEnvNames),
-          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
-        });
-        if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
-          await profiles.setDefaultProvider(providerName);
-        }
-        const defaultProvider = await profiles.getDefaultProvider();
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
+        const profile = await setupGlobalModelProfile(profiles, parsed);
+        const defaultProfile = await profiles.getDefaultProfile();
+        console.log(formatGlobalModelProfileLine(profile, defaultProfile, "value"));
         console.log(`config=${profiles.filePath}`);
         return;
       }
-      if (tryParseModelProviderName(subcommand)) {
-        if (args.length > 1) {
-          console.error("Usage: soloclaw model <provider>");
-          process.exitCode = 1;
-          return;
-        }
-        const selected = await selectDefaultModelProvider(profiles, subcommand);
-        console.log(`default=${selected.defaultProvider}`);
-        console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
-        console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
-        console.log(`config=${profiles.filePath}`);
+      if (args.length > 1) {
+        console.error("Usage: soloclaw model <profile-id>");
+        process.exitCode = 1;
         return;
       }
-      console.error(`Unknown model command: ${subcommand}`);
-      process.exitCode = 1;
+      const selected = await selectDefaultModelProfile(profiles, subcommand);
+      console.log(`default=${selected.defaultProfile}`);
+      console.log(`provider=${selected.profile.provider}`);
+      console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
+      console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
+      console.log(`config=${profiles.filePath}`);
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
@@ -476,27 +508,47 @@ async function main() {
 
   if (command === "config") {
     try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
       const args = stripWorkspaceOption(rest);
       const subcommand = args[0] ?? "show";
-      const profiles = new LocalProviderProfileStore(path.join(workspace, ".agent"));
+      const profiles = new GlobalModelProfileStore();
       if (subcommand === "path") {
-        console.log(profiles.filePath);
+        if (args.slice(1).includes("--json")) {
+          const capabilities = await detectPlatformCapabilities();
+          console.log(JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            configPath: profiles.filePath,
+            legacyConfig: await profiles.usesLegacyConfig(),
+            platform: capabilities.platform,
+            paths: capabilities.paths,
+            capabilities,
+          }, null, 2));
+        } else {
+          console.log(profiles.filePath);
+        }
         return;
       }
       if (subcommand === "show") {
         const json = args.slice(1).includes("--json");
         const listed = await profiles.list();
-        const defaultProvider = await profiles.getDefaultProvider();
-        const view = { defaultProvider, configPath: profiles.filePath, profiles: listed };
+        const defaultProfile = await profiles.getDefaultProfile();
+        const capabilities = json ? await detectPlatformCapabilities() : undefined;
+        const view = {
+          defaultProfile,
+          defaultProvider: defaultProfile,
+          configPath: profiles.filePath,
+          legacyConfig: await profiles.usesLegacyConfig(),
+          profiles: listed,
+          providers: listed,
+          platform: capabilities?.platform,
+          paths: capabilities?.paths,
+          capabilities,
+        };
         if (json) {
           console.log(JSON.stringify(view, null, 2));
         } else {
           console.log(`config=${profiles.filePath}`);
-          console.log(`default=${defaultProvider ?? "-"}`);
-          for (const profile of listed) {
-            console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
-          }
+          console.log(`default=${defaultProfile ?? "-"}`);
+          printGlobalModelProfiles(listed, defaultProfile);
         }
         return;
       }
@@ -530,8 +582,9 @@ async function main() {
   }
 
   if (command === "sessions") {
-    const parsed = parseSessionListArgs(rest);
-    const { store } = await createLocalPlatform(process.cwd());
+    const workspace = await resolveInitialWorkspace(process.cwd(), rest);
+    const parsed = parseSessionListArgs(stripWorkspaceOption(rest));
+    const { store } = await createLocalPlatform(workspace);
     try {
       const list = await buildSessionList(store, parsed.options);
       if (parsed.options.json) {
@@ -555,7 +608,8 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const { store } = await createLocalPlatform(process.cwd());
+    const workspace = await resolveInitialWorkspace(process.cwd(), rest.slice(1));
+    const { store } = await createLocalPlatform(workspace);
     const session = await store.getSession(sessionId);
     if (!session) {
       console.error(`Session not found: ${sessionId}`);
@@ -679,13 +733,15 @@ async function main() {
 
   if (command === "pause" || command === "cancel") {
     const sessionId = rest[0];
-    const reason = rest.slice(1).join(" ").trim() || undefined;
+    const sessionArgs = rest.slice(1);
+    const workspace = await resolveInitialWorkspace(process.cwd(), sessionArgs);
+    const reason = stripWorkspaceOption(sessionArgs).join(" ").trim() || undefined;
     if (!sessionId) {
       console.error("Missing session id.");
       process.exitCode = 1;
       return;
     }
-    const { tasks, store } = await createLocalPlatform(process.cwd());
+    const { tasks, store } = await createLocalPlatform(workspace);
     const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
     try {
       const session =
@@ -736,7 +792,8 @@ async function main() {
   }
 
   if (command === "agents") {
-    const { store, agentHealth } = await createLocalPlatform(process.cwd());
+    const platform = await createLocalPlatform(process.cwd());
+    const { store, agentHealth } = platform;
     try {
       if (rest[0] === "health") {
         const args = rest.slice(1);
@@ -759,12 +816,90 @@ async function main() {
         }
         return;
       }
+      if (rest[0] === "recover-stale") {
+        const args = rest.slice(1);
+        const limit = Number(readOption(args, "--limit") ?? "1000");
+        const actor = args.includes("--local-agent")
+          ? agentActor(platform.localAgent)
+          : parseActorRef(readOption(args, "--actor"));
+        const result = await new ControlPlaneService(platform).recoverStaleAgents({
+          actor,
+          now: readOption(args, "--now"),
+          limit: Number.isFinite(limit) ? limit : 1000,
+        });
+        if (args.includes("--json")) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(
+            `stale recovery recovered=${result.summary.recovered} stale=${result.summary.stale} skipped=${result.summary.skipped}`,
+          );
+          for (const recovered of result.recovered) {
+            console.log(`${recovered.agentId}\troom=${recovered.roomId}\tmember=${recovered.memberStatusAfter}\theartbeat=${recovered.heartbeatStatusAfter}`);
+          }
+          for (const skipped of result.skipped) {
+            console.log(`${skipped.agentId}\tskipped=${skipped.reason}\troom=${skipped.roomId ?? "-"}`);
+          }
+        }
+        return;
+      }
+      if (rest[0] === "trust" || rest[0] === "set-trust") {
+        const args = rest.slice(1);
+        const agentId = args[0];
+        const trustStatus = args[1] ? parseAgentTrustStatus(args[1]) : undefined;
+        if (!agentId || !trustStatus) {
+          console.error("Usage: agent agents trust <agent-id> pending|trusted|suspended|revoked|expired [--reason text] [--local-agent|--actor user:id|agent:id] [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const actor = args.includes("--local-agent")
+          ? agentActor(platform.localAgent)
+          : parseActorRef(readOption(args, "--actor"));
+        const result = await new ControlPlaneService(platform).updateAgentTrustStatus({
+          actor,
+          agentId,
+          trustStatus,
+          reason: readOption(args, "--reason"),
+        });
+        if (args.includes("--json")) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`${result.agent.id}\t${result.previousTrustStatus}->${result.agent.trustStatus}\t${result.agent.fingerprint}\t${result.agent.displayName}`);
+        }
+        return;
+      }
+      if (rest[0] === "rotate-key") {
+        const args = rest.slice(1);
+        const agentId = args[0];
+        const publicKeyFile = readOption(args, "--public-key-file");
+        if (!agentId || !publicKeyFile) {
+          console.error("Usage: agent agents rotate-key <agent-id> --public-key-file path [--fingerprint fingerprint] [--reason text] [--local-agent|--actor user:id|agent:id] [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const actor = args.includes("--local-agent")
+          ? agentActor(platform.localAgent)
+          : parseActorRef(readOption(args, "--actor"));
+        const result = await new ControlPlaneService(platform).rotateAgentIdentityKey({
+          actor,
+          agentId,
+          publicKeyPem: await readUtf8(publicKeyFile),
+          fingerprint: readOption(args, "--fingerprint"),
+          reason: readOption(args, "--reason"),
+        });
+        if (args.includes("--json")) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`${result.agent.id}\t${result.previousFingerprint}->${result.agent.fingerprint}\ttrust=${result.agent.trustStatus}\t${result.agent.displayName}`);
+        }
+        return;
+      }
       const limit = Number(readOption(rest, "--limit") ?? "20");
       const agents = await store.listAgents(Number.isFinite(limit) ? limit : 20);
       for (const agent of agents) {
         console.log(`${agent.id}\t${agent.trustStatus}\t${agent.fingerprint}\t${agent.displayName}`);
       }
     } finally {
+      platform.locks.close();
       store.close();
     }
     return;
@@ -822,6 +957,54 @@ async function main() {
   if (command === "remote") {
     const subcommand = rest[0] ?? "help";
     const args = rest.slice(1);
+    if (subcommand === "register") {
+      const parsed = parseRemoteArgs(args);
+      if (!parsed.options.controlUrl) {
+        console.error("Usage: agent remote register --control-url url [--control-token token] [--display-name name] [--json]");
+        process.exitCode = 1;
+        return;
+      }
+      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+      if (!controlToken) {
+        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
+        process.exitCode = 1;
+        return;
+      }
+      const platform = await createLocalPlatform(process.cwd());
+      const { identity, localAgent, store, locks } = platform;
+      try {
+        const shown = await identity.show();
+        const displayName = parsed.options.displayName ?? localAgent.displayName;
+        const actor = `agent:${localAgent.id}`;
+        const registration = await controlPlaneJson<{ agent: typeof localAgent }>(parsed.options.controlUrl, "/api/agents/register", controlToken, {
+          actor,
+          agentId: localAgent.id,
+          machineId: localAgent.machineId,
+          orgId: localAgent.orgId,
+          displayName,
+          publicKeyPem: localAgent.publicKeyPem,
+          fingerprint: localAgent.fingerprint,
+          capabilities: localAgent.capabilities,
+          allowedProjects: localAgent.allowedProjects,
+        });
+        const result = {
+          agent: registration.agent,
+          privateKeyPath: shown.privateKeyPath,
+        };
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`agent\t${registration.agent.id}\t${registration.agent.trustStatus}\t${registration.agent.fingerprint}`);
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      } finally {
+        locks.close();
+        store.close();
+      }
+      return;
+    }
     if (subcommand === "enroll") {
       const parsed = parseRemoteArgs(args);
       if (!parsed.options.controlUrl || !parsed.options.roomId || !parsed.options.inviteToken) {
@@ -882,6 +1065,302 @@ async function main() {
       }
       return;
     }
+    if (subcommand === "join-bundle") {
+      const parsed = parseRemoteArgs(args);
+      if (!parsed.options.inviteBundlePath) {
+        console.error("Usage: agent remote join-bundle --invite-bundle path [--control-token token] [--alias alias] [--display-name name] [--run] [--status-file path] [--stop-file path] [run options] [--json]");
+        process.exitCode = 1;
+        return;
+      }
+      let platform: Awaited<ReturnType<typeof createLocalPlatform>> | undefined;
+      try {
+        const bundle = await readRemoteInviteBundle(parsed.options.inviteBundlePath);
+        const controlUrl = parsed.options.controlUrl ?? bundle.controlUrl;
+        const controlToken = parsed.options.controlToken ?? bundle.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+        const roomId = parsed.options.roomId ?? bundle.roomId;
+        const inviteToken = parsed.options.inviteToken ?? bundle.inviteToken;
+        if (!controlUrl || !roomId || !inviteToken) {
+          throw new Error("Invite bundle is missing controlUrl, roomId, or inviteToken.");
+        }
+        if (!controlToken) {
+          throw new Error("Missing control token. Use --control-token, AGENT_CONTROL_TOKEN, or a bundle with controlToken.");
+        }
+        const stopFileLifecycle = parsed.options.stopFilePath
+          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
+          : undefined;
+        platform = await createLocalPlatform(process.cwd());
+        const { identity, localAgent } = platform;
+        const displayName = parsed.options.displayName ?? bundle.displayName ?? localAgent.displayName;
+        const aliases = parsed.options.aliases?.length ? parsed.options.aliases : bundle.aliases ?? [];
+        const actor = `agent:${localAgent.id}`;
+        const registration = await controlPlaneJson<{ agent: typeof localAgent }>(controlUrl, "/api/agents/register", controlToken, {
+          actor,
+          agentId: localAgent.id,
+          machineId: localAgent.machineId,
+          orgId: localAgent.orgId,
+          displayName,
+          publicKeyPem: localAgent.publicKeyPem,
+          fingerprint: localAgent.fingerprint,
+          capabilities: localAgent.capabilities,
+          allowedProjects: localAgent.allowedProjects,
+        });
+        const join = await controlPlaneJson<{ member: { actor: ActorRef; role: string; status: string; aliases?: string[] } }>(
+          controlUrl,
+          `/api/rooms/${encodeURIComponent(roomId)}/join-invite`,
+          controlToken,
+          {
+            actor,
+            token: inviteToken,
+            aliases,
+          },
+        );
+        const runner = new RemoteRoomRunner({
+          controlUrl,
+          token: controlToken,
+          roomId,
+          identity,
+          localAgent,
+        });
+        const heartbeat = await runner.heartbeat({
+          status: parsed.options.heartbeatStatus ?? "online",
+          ttlSeconds: parsed.options.ttlSeconds ?? bundle.defaultRun?.heartbeatTtlSeconds ?? 60,
+        });
+        const statusReporter = parsed.options.statusFilePath
+          ? createRemoteRunnerStatusReporter({
+              cwd: process.cwd(),
+              statusFilePath: parsed.options.statusFilePath,
+              roomId,
+              agentId: localAgent.id,
+              machineId: localAgent.machineId,
+            })
+          : undefined;
+        await statusReporter?.write({ status: parsed.options.runAfterJoin ? "starting" : "joined", messagesProcessed: 0, errorCount: 0 });
+        let runResult: RemoteRoomRunResult | undefined;
+        if (parsed.options.runAfterJoin) {
+          await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+          runResult = await runner.run({
+            maxCycles: parsed.options.maxCycles ?? bundle.defaultRun?.cycles ?? 10,
+            maxMessagesPerPoll: parsed.options.limit ?? bundle.defaultRun?.limit ?? 10,
+            maxIdlePolls: parsed.options.maxIdlePolls ?? bundle.defaultRun?.idleLimit ?? 1,
+            idleIntervalMs: parsed.options.idleIntervalMs ?? bundle.defaultRun?.intervalMs ?? 1000,
+            intervalMs: parsed.options.loopIntervalMs ?? bundle.defaultRun?.loopIntervalMs ?? 1000,
+            stopWhenIdle: parsed.options.stopWhenIdle ?? bundle.defaultRun?.stopWhenIdle ?? true,
+            maxIdleCycles: parsed.options.maxIdleCycles ?? bundle.defaultRun?.idleCycles ?? 1,
+            baseBackoffMs: parsed.options.baseBackoffMs ?? bundle.defaultRun?.backoffMs ?? 1000,
+            maxBackoffMs: parsed.options.maxBackoffMs ?? bundle.defaultRun?.maxBackoffMs ?? 30000,
+            maxErrors: parsed.options.maxErrors ?? bundle.defaultRun?.maxErrors ?? 3,
+            heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? bundle.defaultRun?.heartbeatTtlSeconds ?? 60,
+            lifecycle: stopFileLifecycle?.lifecycle,
+            onMessage: parsed.options.replyTemplate
+              ? async (message) => {
+                  await runner.say({
+                    kind: "chat",
+                    body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
+                      roomId,
+                      agentId: localAgent.id,
+                    }),
+                  });
+                }
+              : undefined,
+            onPoll: async (poll) => {
+              await statusReporter?.recordPoll(poll);
+              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            },
+            onError: async (error, cycle) => {
+              await statusReporter?.recordError(error, cycle);
+              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            },
+          });
+          await statusReporter?.recordStop(runResult);
+        }
+        const bootstrapEvidence = {
+          inviteBundleKind: bundle.kind,
+          inviteSignatureStatus: bundle.inviteSignatureStatus ?? "unknown",
+          joinedFromInviteBundle: join.member.actor.id === localAgent.id && join.member.status === "active",
+          ranFromInviteBundle: Boolean(runResult),
+        };
+        const result = {
+          agent: registration.agent,
+          member: join.member,
+          heartbeat,
+          run: runResult,
+          bootstrapEvidence,
+        };
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`agent\t${registration.agent.id}\t${registration.agent.trustStatus}\t${registration.agent.fingerprint}`);
+          console.log(`member\t${join.member.actor.type}:${join.member.actor.id}\t${join.member.role}\t${join.member.status}\t${(join.member.aliases ?? []).join(",")}`);
+          console.log(`heartbeat\t${heartbeat.agent.id}\t${heartbeat.agent.heartbeatStatus ?? "-"}\texpires=${heartbeat.agent.heartbeatExpiresAt ?? "-"}`);
+          console.log(`bootstrap\tbundle=${bootstrapEvidence.inviteBundleKind}\tsignature=${bootstrapEvidence.inviteSignatureStatus}\tjoined=${bootstrapEvidence.joinedFromInviteBundle}\tran=${bootstrapEvidence.ranFromInviteBundle}`);
+          if (runResult) {
+            console.log(`run\t${runResult.agentId}\t${runResult.stopReason}\tcycles=${runResult.cycles}\tprocessed=${runResult.messagesProcessed}\terrors=${runResult.errors.length}`);
+          }
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      } finally {
+        platform?.locks.close();
+        platform?.store.close();
+      }
+      return;
+    }
+    if (subcommand === "invitations" || subcommand === "invites") {
+      const parsed = parseRemoteArgs(args);
+      if (!parsed.options.controlUrl) {
+        console.error("Usage: agent remote invitations --control-url url [--control-token token] [--json]");
+        process.exitCode = 1;
+        return;
+      }
+      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+      if (!controlToken) {
+        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
+        process.exitCode = 1;
+        return;
+      }
+      const platform = await createLocalPlatform(process.cwd());
+      const { localAgent, store, locks } = platform;
+      try {
+        const result = await controlPlaneGetJson<{
+          generatedAt: string;
+          agent: typeof localAgent;
+          invitations: Array<{ room: { id: string; name: string }; member: { role: string; status: string; aliases?: string[] } }>;
+        }>(parsed.options.controlUrl, `/api/agents/${encodeURIComponent(localAgent.id)}/room-invitations`, controlToken);
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          for (const invitation of result.invitations) {
+            console.log(`${invitation.room.id}\t${invitation.member.role}\t${invitation.member.status}\taliases=${invitation.member.aliases?.join(",") ?? ""}\t${invitation.room.name}`);
+          }
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      } finally {
+        locks.close();
+        store.close();
+      }
+      return;
+    }
+    if (subcommand === "accept-room") {
+      const parsed = parseRemoteArgs(args);
+      if (!parsed.options.controlUrl || !parsed.options.roomId) {
+        console.error("Usage: agent remote accept-room --control-url url [--control-token token] --room room-id [--alias alias] [--run] [--status-file path] [--stop-file path] [run options] [--json]");
+        process.exitCode = 1;
+        return;
+      }
+      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+      if (!controlToken) {
+        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
+        process.exitCode = 1;
+        return;
+      }
+      let platform: Awaited<ReturnType<typeof createLocalPlatform>> | undefined;
+      try {
+        const stopFileLifecycle = parsed.options.stopFilePath
+          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
+          : undefined;
+        platform = await createLocalPlatform(process.cwd());
+        const { identity, localAgent } = platform;
+        const accept = await controlPlaneJson<{ member: { actor: ActorRef; role: string; status: string; aliases?: string[] } }>(
+          parsed.options.controlUrl,
+          `/api/rooms/${encodeURIComponent(parsed.options.roomId)}/members/${encodeURIComponent(localAgent.id)}/accept-invitation`,
+          controlToken,
+          {
+            actor: `agent:${localAgent.id}`,
+            aliases: parsed.options.aliases,
+          },
+        );
+        const runner = new RemoteRoomRunner({
+          controlUrl: parsed.options.controlUrl,
+          token: controlToken,
+          roomId: parsed.options.roomId,
+          identity,
+          localAgent,
+        });
+        const heartbeat = await runner.heartbeat({
+          status: parsed.options.heartbeatStatus ?? "online",
+          ttlSeconds: parsed.options.ttlSeconds ?? parsed.options.heartbeatTtlSeconds ?? 60,
+        });
+        const statusReporter = parsed.options.statusFilePath
+          ? createRemoteRunnerStatusReporter({
+              cwd: process.cwd(),
+              statusFilePath: parsed.options.statusFilePath,
+              roomId: parsed.options.roomId,
+              agentId: localAgent.id,
+              machineId: localAgent.machineId,
+            })
+          : undefined;
+        await statusReporter?.write({ status: parsed.options.runAfterJoin ? "starting" : "joined", messagesProcessed: 0, errorCount: 0 });
+        let runResult: RemoteRoomRunResult | undefined;
+        if (parsed.options.runAfterJoin) {
+          await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+          runResult = await runner.run({
+            maxCycles: parsed.options.maxCycles ?? 10,
+            maxMessagesPerPoll: parsed.options.limit ?? 10,
+            maxIdlePolls: parsed.options.maxIdlePolls ?? 1,
+            idleIntervalMs: parsed.options.idleIntervalMs ?? 1000,
+            intervalMs: parsed.options.loopIntervalMs ?? 1000,
+            stopWhenIdle: parsed.options.stopWhenIdle ?? true,
+            maxIdleCycles: parsed.options.maxIdleCycles ?? 1,
+            baseBackoffMs: parsed.options.baseBackoffMs ?? 1000,
+            maxBackoffMs: parsed.options.maxBackoffMs ?? 30000,
+            maxErrors: parsed.options.maxErrors ?? 3,
+            heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? 60,
+            lifecycle: stopFileLifecycle?.lifecycle,
+            onMessage: parsed.options.replyTemplate
+              ? async (message) => {
+                  await runner.say({
+                    kind: "chat",
+                    body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
+                      roomId: parsed.options.roomId!,
+                      agentId: localAgent.id,
+                    }),
+                  });
+                }
+              : undefined,
+            onPoll: async (poll) => {
+              await statusReporter?.recordPoll(poll);
+              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            },
+            onError: async (error, cycle) => {
+              await statusReporter?.recordError(error, cycle);
+              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            },
+          });
+          await statusReporter?.recordStop(runResult);
+        }
+        const pullEvidence = {
+          acceptedFromRoomInvitation: accept.member.actor.id === localAgent.id && accept.member.status === "active",
+          ranFromRoomInvitation: Boolean(runResult),
+        };
+        const result = {
+          agent: localAgent,
+          member: accept.member,
+          heartbeat,
+          run: runResult,
+          pullEvidence,
+        };
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`member\t${accept.member.actor.type}:${accept.member.actor.id}\t${accept.member.role}\t${accept.member.status}\t${(accept.member.aliases ?? []).join(",")}`);
+          console.log(`heartbeat\t${heartbeat.agent.id}\t${heartbeat.agent.heartbeatStatus ?? "-"}\texpires=${heartbeat.agent.heartbeatExpiresAt ?? "-"}`);
+          console.log(`pull\taccepted=${pullEvidence.acceptedFromRoomInvitation}\tran=${pullEvidence.ranFromRoomInvitation}`);
+          if (runResult) {
+            console.log(`run\t${runResult.agentId}\t${runResult.stopReason}\tcycles=${runResult.cycles}\tprocessed=${runResult.messagesProcessed}\terrors=${runResult.errors.length}`);
+          }
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      } finally {
+        platform?.locks.close();
+        platform?.store.close();
+      }
+      return;
+    }
     if (subcommand === "inbox") {
       const parsed = parseRemoteArgs(args);
       if (!parsed.options.controlUrl || !parsed.options.roomId) {
@@ -912,6 +1391,45 @@ async function main() {
           for (const message of inbox.messages) {
             console.log(`${message.id}\t${message.kind}\t${message.signatureStatus ?? "-"}\t${message.activationContext?.reason ?? "-"}\t${message.createdAt}\t${message.body.replace(/\s+/g, " ").slice(0, 160)}`);
           }
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      } finally {
+        locks.close();
+        store.close();
+      }
+      return;
+    }
+    if (subcommand === "say") {
+      const parsed = parseRemoteArgs(args);
+      const body = parsed.positionals.join(" ").trim();
+      if (!parsed.options.controlUrl || !parsed.options.roomId || !body) {
+        console.error("Usage: agent remote say --control-url url [--control-token token] --room room-id [--kind chat|task|decision|tool_request|approval|artifact|system] <message>");
+        process.exitCode = 1;
+        return;
+      }
+      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+      if (!controlToken) {
+        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
+        process.exitCode = 1;
+        return;
+      }
+      const platform = await createLocalPlatform(process.cwd());
+      const { identity, localAgent, store, locks } = platform;
+      try {
+        const runner = new RemoteRoomRunner({
+          controlUrl: parsed.options.controlUrl,
+          token: controlToken,
+          roomId: parsed.options.roomId,
+          identity,
+          localAgent,
+        });
+        const result = await runner.say({ kind: parsed.options.kind ?? "chat", body });
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`${result.message.id}\t${result.message.roomId}\t${result.message.sender.type}:${result.message.sender.id}\t${result.message.kind}\t${result.message.body}`);
         }
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
@@ -1054,10 +1572,35 @@ async function main() {
       }
       return;
     }
+    if (subcommand === "service" || subcommand === "daemon") {
+      const parsed = parseRemoteArgs(args);
+      if (!parsed.options.controlUrl || !parsed.options.roomId) {
+        console.error("Usage: agent remote service --control-url url --room room-id [--control-token token] [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--heartbeat-ttl seconds] [--status-file path] [--stop-file path] [--json]");
+        process.exitCode = 1;
+        return;
+      }
+      try {
+        const plan = buildRemoteRoomServicePlan({
+          workspace: process.cwd(),
+          controlUrl: parsed.options.controlUrl,
+          roomId: parsed.options.roomId,
+          options: parsed.options,
+        });
+        if (parsed.options.json) {
+          console.log(JSON.stringify(plan, null, 2));
+        } else {
+          printRemoteRoomServicePlan(plan);
+        }
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        process.exitCode = 1;
+      }
+      return;
+    }
     if (subcommand === "run") {
       const parsed = parseRemoteArgs(args);
       if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote run --control-url url [--control-token token] --room room-id [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--backoff-ms n] [--max-backoff-ms n] [--max-errors n] [--heartbeat-ttl seconds] [--json]");
+        console.error("Usage: agent remote run --control-url url [--control-token token] --room room-id [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--backoff-ms n] [--max-backoff-ms n] [--max-errors n] [--heartbeat-ttl seconds] [--reply-template text] [--status-file path] [--stop-file path] [--json]");
         process.exitCode = 1;
         return;
       }
@@ -1077,6 +1620,20 @@ async function main() {
           identity,
           localAgent,
         });
+        const statusReporter = parsed.options.statusFilePath
+          ? createRemoteRunnerStatusReporter({
+              cwd: process.cwd(),
+              statusFilePath: parsed.options.statusFilePath,
+              roomId: parsed.options.roomId,
+              agentId: localAgent.id,
+              machineId: localAgent.machineId,
+            })
+          : undefined;
+        await statusReporter?.write({ status: "starting", messagesProcessed: 0, errorCount: 0 });
+        const stopFileLifecycle = parsed.options.stopFilePath
+          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
+          : undefined;
+        await stopFileLifecycle?.requestShutdownIfStopFilePresent();
         const result = await runner.run({
           maxCycles: parsed.options.maxCycles ?? 10,
           maxMessagesPerPoll: parsed.options.limit ?? 10,
@@ -1089,20 +1646,40 @@ async function main() {
           maxBackoffMs: parsed.options.maxBackoffMs ?? 30000,
           maxErrors: parsed.options.maxErrors ?? 3,
           heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? 60,
-          onPoll: parsed.options.json
-            ? undefined
-            : (poll) => {
+          lifecycle: stopFileLifecycle?.lifecycle,
+          onMessage: parsed.options.replyTemplate
+            ? async (message) => {
+                const reply = await runner.say({
+                  kind: "chat",
+                  body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
+                    roomId: parsed.options.roomId!,
+                    agentId: localAgent.id,
+                  }),
+                });
+                if (!parsed.options.json) {
+                  console.log(`reply\t${reply.message.id}\t${reply.message.kind}\t${reply.message.body}`);
+                }
+              }
+            : undefined,
+          onPoll: async (poll) => {
+            await statusReporter?.recordPoll(poll);
+            await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            if (!parsed.options.json) {
                 console.log(`cycle\t${poll.agentId}\t${poll.stopReason}\tprocessed=${poll.messagesProcessed}\tidle=${poll.idlePolls}`);
                 for (const ack of poll.acknowledgements) {
                   console.log(`ack\t${poll.agentId}\t${ack.messageId}\t${ack.ackSignature ? "signed" : "unsigned"}`);
                 }
-              },
-          onError: parsed.options.json
-            ? undefined
-            : (error, cycle) => {
+            }
+          },
+          onError: async (error, cycle) => {
+            await statusReporter?.recordError(error, cycle);
+            await stopFileLifecycle?.requestShutdownIfStopFilePresent();
+            if (!parsed.options.json) {
                 console.error(`cycle-error\t${cycle}\t${error.message}`);
-              },
+            }
+          },
         });
+        await statusReporter?.recordStop(result);
         if (parsed.options.json) {
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -2256,14 +2833,15 @@ async function main() {
         const parsed = parseRoomArgs(args);
         const name = parsed.positionals.join(" ").trim();
         if (!name) {
-          console.error("Usage: agent rooms create [--alias alias] [--agent-response broadcast|mentions_only] [--wide-mention-policy disabled|moderators|members] [--max-routed-agent-targets n] [--require-signed-invites] <name>");
+          console.error("Usage: agent rooms create [--local-agent] [--alias alias] [--agent-response broadcast|mentions_only] [--wide-mention-policy disabled|moderators|members] [--max-routed-agent-targets n] [--require-signed-invites] <name>");
           process.exitCode = 1;
           return;
         }
+        const createdBy = parsed.options.localAgent ? agentActor(localAgent) : localUserActor();
         const room = await rooms.createRoom({
           name,
           projectId: parsed.options.projectId,
-          createdBy: localUserActor(),
+          createdBy,
           memberAliases: parsed.options.aliases,
           policy: {
             joinPolicy: parsed.options.joinPolicy ?? "manual",
@@ -2468,6 +3046,45 @@ async function main() {
         return;
       }
 
+      if (subcommand === "invite-bundle") {
+        const parsed = parseRoomArgs(args);
+        const roomId = parsed.positionals[0];
+        const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
+        if (!roomId || !parsed.options.controlUrl || !controlToken) {
+          console.error("Usage: agent rooms invite-bundle <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--role role] [--ttl-hours n] [--max-uses n] [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const actor = parsed.options.localAgent === false ? await resolveActor(store, parseActorRef(parsed.options.actor)) : agentActor(localAgent);
+        const created = await rooms.createInvite({
+          roomId,
+          createdBy: actor,
+          role: parsed.options.role ?? "participant",
+          ttlHours: parsed.options.ttlHours,
+          maxUses: parsed.options.maxUses,
+        });
+        const signatureStatus = await rooms.verifyInvite(created.invite);
+        const bundle = buildRemoteInviteBundle({
+          controlUrl: parsed.options.controlUrl,
+          controlToken,
+          roomId,
+          inviteToken: created.token,
+          inviteId: created.invite.id,
+          inviteSignatureStatus: signatureStatus,
+          role: created.invite.role,
+          aliases: parsed.options.aliases ?? [],
+          displayName: parsed.options.displayName,
+          expiresAt: created.invite.expiresAt,
+          maxUses: created.invite.maxUses,
+        });
+        if (parsed.options.json) {
+          console.log(JSON.stringify(bundle, null, 2));
+        } else {
+          console.log(formatRemoteInviteBundle(bundle));
+        }
+        return;
+      }
+
       if (subcommand === "invites") {
         const roomId = args[0];
         if (!roomId) {
@@ -2496,6 +3113,31 @@ async function main() {
         const invite = await rooms.revokeInvite(roomId, inviteId, revokedBy);
         const signatureStatus = await rooms.verifyInvite(invite);
         console.log(`${invite.id}\t${invite.status}\t${invite.role}\tsignature=${signatureStatus}\tuses=${invite.uses}/${invite.maxUses}\texpires=${invite.expiresAt}`);
+        return;
+      }
+
+      if (subcommand === "pull-agent" || subcommand === "invite-agent-member") {
+        const parsed = parseRoomArgs(args);
+        const roomId = parsed.positionals[0];
+        const agentId = parsed.positionals[1] ?? parsed.options.agentId;
+        if (!roomId || !agentId) {
+          console.error("Usage: agent rooms pull-agent <room-id> <agent-id> [--alias alias] [--role participant|executor|reviewer|approver|observer] [--local-agent|--actor user:id|agent:id] [--json]");
+          process.exitCode = 1;
+          return;
+        }
+        const invitedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
+        const result = await new ControlPlaneService(platform).inviteRoomAgent({
+          roomId,
+          agentId,
+          invitedBy,
+          role: parsed.options.role ?? "participant",
+          aliases: parsed.options.aliases ?? [],
+        });
+        if (parsed.options.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(`${result.member.roomId}\t${result.member.actor.type}:${result.member.actor.id}\t${result.member.role}\t${result.member.status}\taliases=${result.member.aliases?.join(",") ?? ""}`);
+        }
         return;
       }
 
@@ -3893,11 +4535,13 @@ async function main() {
     const subcommand = rest[0];
     const sessionId = rest[1];
     const args = rest.slice(2);
-    const { lifecycle, store } = await createLocalPlatform(process.cwd());
+    const workspace = await resolveInitialWorkspace(process.cwd(), args);
+    const sessionArgs = stripWorkspaceOption(args);
+    const { lifecycle, store } = await createLocalPlatform(workspace);
     const actor = localUserActor();
     try {
       if (subcommand === "diff") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session diff <session-id> [--json]");
           process.exitCode = 1;
@@ -3912,7 +4556,7 @@ async function main() {
         return;
       }
       if (subcommand === "report") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session report <session-id> [--json]");
           process.exitCode = 1;
@@ -3927,7 +4571,7 @@ async function main() {
         return;
       }
       if (subcommand === "status") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session status <session-id> [--json]");
           process.exitCode = 1;
@@ -3942,7 +4586,7 @@ async function main() {
         return;
       }
       if (subcommand === "inspect") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session inspect <session-id> [--json]");
           process.exitCode = 1;
@@ -3957,7 +4601,7 @@ async function main() {
         return;
       }
       if (subcommand === "timeline" || subcommand === "logs") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session timeline <session-id> [--json] [--limit n]");
           process.exitCode = 1;
@@ -3972,7 +4616,7 @@ async function main() {
         return;
       }
       if (subcommand === "review") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session review <session-id> [--json] [--limit n]");
           process.exitCode = 1;
@@ -3987,14 +4631,14 @@ async function main() {
         return;
       }
       if (subcommand === "bundle") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]");
           process.exitCode = 1;
           return;
         }
         const bundle = await buildSessionEvidenceBundle(store, sessionId, {
-          workspace: process.cwd(),
+          workspace,
           limit: parsed.options.limit,
           preset: parsed.options.preset,
           requireChange: parsed.options.requireChange,
@@ -4009,7 +4653,7 @@ async function main() {
           requiredApprovalActions: parsed.options.requiredApprovalActions,
           requireCommand: parsed.options.allowNoCommand !== true,
         });
-        const output = parsed.options.output ? await writeJsonOutputInsideWorkspace(process.cwd(), parsed.options.output, bundle) : undefined;
+        const output = parsed.options.output ? await writeJsonOutputInsideWorkspace(workspace, parsed.options.output, bundle) : undefined;
         const printable = output ? { ...bundle, output } : bundle;
         if (parsed.options.json) {
           console.log(JSON.stringify(printable, null, 2));
@@ -4019,7 +4663,7 @@ async function main() {
         return;
       }
       if (subcommand === "result") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session result <session-id> [--json]");
           process.exitCode = 1;
@@ -4034,7 +4678,7 @@ async function main() {
         return;
       }
       if (subcommand === "next") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session next <session-id> [--json]");
           process.exitCode = 1;
@@ -4049,7 +4693,7 @@ async function main() {
         return;
       }
       if (subcommand === "verify") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
           process.exitCode = 1;
@@ -4080,7 +4724,7 @@ async function main() {
         return;
       }
       if (subcommand === "compact") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session compact <session-id> [--summary text] [--force]");
           process.exitCode = 1;
@@ -4096,7 +4740,7 @@ async function main() {
         return;
       }
       if (subcommand === "delete") {
-        const parsed = parseLifecycleArgs(args);
+        const parsed = parseLifecycleArgs(sessionArgs);
         if (!sessionId) {
           console.error("Usage: agent session delete <session-id> [--force]");
           process.exitCode = 1;
@@ -4221,6 +4865,16 @@ async function main() {
 
   if (command === "phase3") {
     await handlePhaseThreeCommand(rest, process.cwd());
+    return;
+  }
+
+  if (command === "phase4") {
+    await handlePhaseFourCommand(rest, process.cwd());
+    return;
+  }
+
+  if (command === "phase5") {
+    await handlePhaseFiveCommand(rest, process.cwd());
     return;
   }
 
@@ -4475,6 +5129,8 @@ async function main() {
           "       soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]\n" +
           "       soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed\n" +
           "       soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]\n" +
+          "       soloclaw phase3 long-task-gate [--workspace path] [--json]\n" +
+          "       soloclaw phase3 long-task-real-provider [--workspace path] [--json]\n" +
           "       soloclaw smoke --rich-tui-real-provider\n" +
           "       agent phase2 checklist",
       );
@@ -4536,6 +5192,9 @@ async function main() {
   if (targetModeCommand) {
     parsed.options.targetMode = targetModeCommand;
   }
+  if (!parsed.options.modelProfile && !parsed.options.provider) {
+    parsed.options.modelProfile = await defaultSoloclawModelProfileForWorkspace(workspace);
+  }
   const task = parsed.task;
   if (!task) {
     console.error("Missing task.");
@@ -4565,7 +5224,8 @@ async function main() {
     }
   }
 
-  const { agent, store } = await createLocalPlatform(workspace, parsed.options);
+  const platform = await createLocalPlatform(workspace, parsed.options);
+  const { agent, store } = platform;
 
   const runResult = await agent.runWithSession(task);
   const completedSession = runResult.session ? (await store.getSession(runResult.session.id)) ?? runResult.session : undefined;
@@ -4626,6 +5286,7 @@ async function main() {
   if (verification?.status === "fail") {
     process.exitCode = 1;
   }
+  await closeWorkspaceRuntimeMaybe(platform.workspace);
   store.close();
 }
 
@@ -4651,12 +5312,22 @@ type RunPlatformOptions = NonNullable<Parameters<typeof createLocalPlatform>[1]>
 
 function parseRunArgs(args: string[]) {
   const options: RunPlatformOptions = {};
+  if (process.env.SOLOCLAW_WORKSPACE_RUNTIME) {
+    options.workspaceRuntime = parseWorkspaceRuntimeMode(process.env.SOLOCLAW_WORKSPACE_RUNTIME);
+  }
+  if (process.env.SOLOCLAW_AGENT_RUNNER) {
+    options.workspaceRuntimeRunner = process.env.SOLOCLAW_AGENT_RUNNER;
+  }
+  const compactionArgs = parseContextCompactionCliOptions(args);
+  if (compactionArgs.contextCompaction) {
+    options.contextCompaction = compactionArgs.contextCompaction;
+  }
   const cli: RunCliOptions = {};
   const taskParts: string[] = [];
 
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
+  for (let index = 0; index < compactionArgs.rest.length; index += 1) {
+    const arg = compactionArgs.rest[index];
+    const next = compactionArgs.rest[index + 1];
     if ((arg === "--require-execution-profile" || arg === "--require-execution-profiles") && next) {
       cli.requiredExecutionProfiles = [...(cli.requiredExecutionProfiles ?? []), ...parseCommandExecutionProfileList(next)];
       cli.verifySession = true;
@@ -4678,6 +5349,11 @@ function parseRunArgs(args: string[]) {
     }
     if (arg === "--provider" && next) {
       options.provider = next as NonNullable<typeof options.provider>;
+      index += 1;
+      continue;
+    }
+    if ((arg === "--model-profile" || arg === "--profile") && next) {
+      options.modelProfile = next;
       index += 1;
       continue;
     }
@@ -4750,6 +5426,24 @@ function parseRunArgs(args: string[]) {
     if ((arg === "--target-mode" || arg === "--mode") && next) {
       options.targetMode = parseTargetMode(next);
       index += 1;
+      continue;
+    }
+    if (arg === "--workspace-runtime" && next) {
+      options.workspaceRuntime = parseWorkspaceRuntimeMode(next);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--workspace-runtime=")) {
+      options.workspaceRuntime = parseWorkspaceRuntimeMode(arg.slice("--workspace-runtime=".length));
+      continue;
+    }
+    if (arg === "--agent-runner" && next) {
+      options.workspaceRuntimeRunner = next;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--agent-runner=")) {
+      options.workspaceRuntimeRunner = arg.slice("--agent-runner=".length);
       continue;
     }
     if (arg === "--parent-session" && next) {
@@ -4858,7 +5552,7 @@ function parseRunArgs(args: string[]) {
 }
 
 async function buildRunModelReadinessView(workspace: string, options: RunPlatformOptions): Promise<ModelCheckView> {
-  const result = await buildModelCheckView(workspace, buildRunModelCheckArgs(options), options.provider, {
+  const result = await buildModelCheckView(workspace, buildRunModelCheckArgs(options), options.modelProfile ?? options.provider, {
     apiKeySecretRef: options.apiKeySecretRef,
   });
   return result.view;
@@ -4866,6 +5560,9 @@ async function buildRunModelReadinessView(workspace: string, options: RunPlatfor
 
 function buildRunModelCheckArgs(options: RunPlatformOptions): string[] {
   const args: string[] = [];
+  if (options.modelProfile) {
+    args.push("--model-profile", options.modelProfile);
+  }
   if (options.provider) {
     args.push("--provider", options.provider);
   }
@@ -4883,16 +5580,25 @@ function buildRunModelCheckArgs(options: RunPlatformOptions): string[] {
 
 function parseResumeArgs(args: string[]): { options: RunPlatformOptions; cli: RunCliOptions } {
   const options: RunPlatformOptions = {};
+  const compactionArgs = parseContextCompactionCliOptions(args);
+  if (compactionArgs.contextCompaction) {
+    options.contextCompaction = compactionArgs.contextCompaction;
+  }
   const cli: RunCliOptions = {};
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
+  for (let index = 0; index < compactionArgs.rest.length; index += 1) {
+    const arg = compactionArgs.rest[index];
+    const next = compactionArgs.rest[index + 1];
     if (arg === "--require-model-ready" || arg === "--model-ready") {
       cli.requireModelReady = true;
       continue;
     }
     if (arg === "--provider" && next) {
       options.provider = next as NonNullable<typeof options.provider>;
+      index += 1;
+      continue;
+    }
+    if ((arg === "--model-profile" || arg === "--profile") && next) {
+      options.modelProfile = next;
       index += 1;
       continue;
     }
@@ -5169,6 +5875,10 @@ type PhaseOneReadinessResult = {
   root: string;
   status: "pass" | "fail";
   checks: PhaseOneReadinessCheck[];
+  platform: SoloclawPlatformCapabilities["platform"];
+  paths: SoloclawPlatformCapabilities["paths"];
+  capabilities: SoloclawPlatformCapabilities;
+  legacyConfig: boolean;
   commands: {
     tui: string;
     init: string;
@@ -5191,6 +5901,7 @@ type PhaseOneReadinessResult = {
 
 async function verifyPhaseOneReadiness(cwd: string): Promise<PhaseOneReadinessResult> {
   const checks: PhaseOneReadinessCheck[] = [];
+  const capabilities = await detectPlatformCapabilities();
   const snapshot = await collectWorkspaceSnapshot(cwd);
   const rendered = renderWorkspaceSnapshot(snapshot);
   checks.push({
@@ -5275,11 +5986,16 @@ async function verifyPhaseOneReadiness(cwd: string): Promise<PhaseOneReadinessRe
   });
 
   const status: "pass" | "fail" = checks.some((check) => check.status === "fail") ? "fail" : "pass";
+  const globalProfiles = new GlobalModelProfileStore();
   return {
     generatedAt: new Date().toISOString(),
     root: cwd,
     status,
     checks,
+    platform: capabilities.platform,
+    paths: capabilities.paths,
+    capabilities,
+    legacyConfig: await globalProfiles.usesLegacyConfig(),
     commands: {
       tui: "soloclaw",
       init: "soloclaw init",
@@ -5304,6 +6020,10 @@ async function verifyPhaseOneReadiness(cwd: string): Promise<PhaseOneReadinessRe
 function printPhaseOneReadiness(result: PhaseOneReadinessResult): void {
   console.log(`Phase 1 local CLI readiness: ${result.status}`);
   console.log(`root: ${result.root}`);
+  console.log(`platform: ${result.platform.id}`);
+  console.log(`config: ${result.paths.modelConfigPath}${result.legacyConfig ? " (legacy read fallback active)" : ""}`);
+  console.log(`cache: ${result.paths.cacheDir}`);
+  console.log(`logs: ${result.paths.logDir}`);
   for (const check of result.checks) {
     console.log(`[${check.status}] ${check.label}: ${check.summary}`);
   }
@@ -7474,6 +8194,10695 @@ type PhaseTwoFinalGateResult = {
   steps: PhaseTwoFinalGateStepResult[];
 };
 
+type PhaseFourCheck = {
+  id: "platform-paths" | "platform-capabilities" | "cli-surface" | "typescript-runtime-smoke" | "rust-runtime-smoke" | "secret-shape-scan";
+  label: string;
+  status: "pass" | "warn" | "fail";
+  summary: string;
+  metadata?: Record<string, unknown>;
+};
+
+type PhaseFourVerifyResult = {
+  phase: "phase4";
+  status: "pass" | "fail";
+  workspace: string;
+  generatedAt: string;
+  platform: SoloclawPlatformCapabilities["platform"];
+  paths: SoloclawPlatformCapabilities["paths"];
+  capabilities: SoloclawPlatformCapabilities;
+  workspaceRuntime: {
+    requestedMode: WorkspaceRuntimeMode;
+  };
+  checks: PhaseFourCheck[];
+  matrixCommand: string;
+};
+
+type PhaseFourArgs = {
+  workspace: string;
+  json: boolean;
+  workspaceRuntime: WorkspaceRuntimeMode;
+};
+
+async function handlePhaseFourCommand(args: string[], cwd: string): Promise<void> {
+  const subcommand = args[0] ?? "checklist";
+  if (subcommand === "checklist") {
+    console.log(formatPhaseFourChecklist());
+    return;
+  }
+  if (subcommand === "matrix-template") {
+    const json = args.slice(1).includes("--json");
+    const matrix = buildPhaseFourMatrixTemplate();
+    if (json) {
+      console.log(JSON.stringify(matrix, null, 2));
+    } else {
+      console.log(formatPhaseFourMatrixTemplate(matrix));
+    }
+    return;
+  }
+  if (subcommand === "verify" || subcommand === "smoke") {
+    try {
+      const options = await parsePhaseFourArgs(args.slice(1), cwd);
+      const result = await runPhaseFourVerify(options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFourVerify(result));
+      }
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  console.error("Usage: soloclaw phase4 checklist|verify|matrix-template [--workspace path] [--workspace-runtime typescript|rust|auto] [--json]");
+  process.exitCode = 1;
+}
+
+async function parsePhaseFourArgs(args: string[], cwd: string): Promise<PhaseFourArgs> {
+  return {
+    workspace: await resolveInitialWorkspace(cwd, args),
+    json: args.includes("--json"),
+    workspaceRuntime: parseWorkspaceRuntimeFromArgs(args, "auto"),
+  };
+}
+
+async function runPhaseFourVerify(options: PhaseFourArgs): Promise<PhaseFourVerifyResult> {
+  const capabilities = await detectPlatformCapabilities();
+  const checks: PhaseFourCheck[] = [];
+  const paths = capabilities.paths;
+  checks.push({
+    id: "platform-paths",
+    label: "platform paths",
+    status: paths.configDir && paths.cacheDir && paths.logDir && paths.modelConfigPath && paths.workspaceHistoryPath ? "pass" : "fail",
+    summary: `config=${paths.configDir}, cache=${paths.cacheDir}, logs=${paths.logDir}`,
+  });
+  checks.push({
+    id: "platform-capabilities",
+    label: "platform capabilities",
+    status: capabilities.commands.node.available && capabilities.commands.npm.available ? "pass" : "fail",
+    summary:
+      `node=${capabilities.commands.node.available}, npm=${capabilities.commands.npm.available}, ` +
+      `git=${capabilities.commands.git.available}, rg=${capabilities.commands.rg.available}, cargo=${capabilities.commands.cargo.available}`,
+  });
+  checks.push({
+    id: "cli-surface",
+    label: "phase4 CLI surface",
+    status: "pass",
+    summary: "platform doctor, phase4 checklist, phase4 verify, and phase4 matrix-template are registered",
+  });
+
+  checks.push(await runPhaseFourTypescriptRuntimeSmoke(options.workspace));
+  checks.push(await runPhaseFourRustRuntimeSmoke(options));
+
+  const secretMatches = countSecretShapes({
+    phase: "phase4",
+    platform: capabilities.platform,
+    paths: capabilities.paths,
+    commands: Object.fromEntries(Object.entries(capabilities.commands).map(([key, value]) => [key, value.available])),
+    rustRunnerSource: capabilities.rustRunner.source,
+    checks,
+  });
+  checks.push({
+    id: "secret-shape-scan",
+    label: "secret shape scan",
+    status: secretMatches === 0 ? "pass" : "fail",
+    summary: `secretMatches=${secretMatches}`,
+  });
+
+  return {
+    phase: "phase4",
+    status: checks.some((check) => check.status === "fail") ? "fail" : "pass",
+    workspace: options.workspace,
+    generatedAt: new Date().toISOString(),
+    platform: capabilities.platform,
+    paths,
+    capabilities,
+    workspaceRuntime: {
+      requestedMode: options.workspaceRuntime,
+    },
+    checks,
+    matrixCommand: "soloclaw phase4 matrix-template",
+  };
+}
+
+async function runPhaseFourTypescriptRuntimeSmoke(workspace: string): Promise<PhaseFourCheck> {
+  const platform = await createLocalPlatform(workspace, {
+    provider: "mock",
+    workspaceRuntime: "typescript",
+    workspaceSnapshot: false,
+  });
+  try {
+    const files = await platform.workspace.listFiles(".");
+    return {
+      id: "typescript-runtime-smoke",
+      label: "TypeScript WorkspaceRuntime smoke",
+      status: files.length >= 0 ? "pass" : "fail",
+      summary: `listed ${files.length} workspace entr${files.length === 1 ? "y" : "ies"}`,
+      metadata: { selectedMode: platform.workspaceRuntime.selectedMode },
+    };
+  } catch (error) {
+    return {
+      id: "typescript-runtime-smoke",
+      label: "TypeScript WorkspaceRuntime smoke",
+      status: "fail",
+      summary: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await closeWorkspaceRuntimeMaybe(platform.workspace);
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runPhaseFourRustRuntimeSmoke(options: PhaseFourArgs): Promise<PhaseFourCheck> {
+  if (options.workspaceRuntime === "typescript") {
+    return {
+      id: "rust-runtime-smoke",
+      label: "Rust WorkspaceRuntime smoke",
+      status: "warn",
+      summary: "not requested because workspaceRuntime=typescript",
+    };
+  }
+  const smoke = await runWorkspaceRuntimeJsonRpcRustSmoke({ cleanup: true });
+  const failed = !smoke.ok && !smoke.skipped;
+  const skippedRust = smoke.skipped === true;
+  const explicitRustFailure = options.workspaceRuntime === "rust" && (failed || skippedRust);
+  return {
+    id: "rust-runtime-smoke",
+    label: "Rust WorkspaceRuntime smoke",
+    status: smoke.ok ? "pass" : explicitRustFailure ? "fail" : "warn",
+    summary: smoke.ok
+      ? `runner=${smoke.runner}, methods=${smoke.methods.length}, commandExit=${smoke.commandExitCode}`
+      : smoke.reason ?? "Rust runtime smoke skipped",
+    metadata: {
+      runner: smoke.runner,
+      skipped: smoke.skipped,
+      requestedMode: options.workspaceRuntime,
+    },
+  };
+}
+
+function formatPhaseFourChecklist(): string {
+  return [
+    "Phase 4 multi-platform local agent checklist",
+    "",
+    "- Platform paths resolve through SOLOCLAW_HOME or OS-native config/cache/log locations.",
+    "- `soloclaw platform doctor --json` reports platform, paths, shell hints, and local tool capabilities.",
+    "- `soloclaw phase4 verify --json` passes locally with TypeScript runtime and reports Rust runner smoke or a skip reason.",
+    "- `soloclaw phase4 matrix-template` is used for Windows PowerShell/CMD, Linux, macOS, and Android Termux manual smoke.",
+    "- `soloclaw doctor --json`, `soloclaw status --json`, and `soloclaw config path --json` include platform metadata without raw secrets.",
+  ].join("\n");
+}
+
+function formatPhaseFourVerify(result: PhaseFourVerifyResult): string {
+  return [
+    `Phase 4 multi-platform local agent verify: ${result.status}`,
+    `workspace=${result.workspace}`,
+    `platform=${result.platform.id}`,
+    `config=${result.paths.configDir}`,
+    `cache=${result.paths.cacheDir}`,
+    `logs=${result.paths.logDir}`,
+    `runtime=${result.workspaceRuntime.requestedMode}`,
+    ...result.checks.map((check) => `[${check.status}] ${check.id}: ${check.summary}`),
+    `matrix=${result.matrixCommand}`,
+  ].join("\n");
+}
+
+function buildPhaseFourMatrixTemplate() {
+  return {
+    generatedAt: new Date().toISOString(),
+    phase: "phase4",
+    targets: [
+      {
+        id: "windows-powershell",
+        label: "Windows PowerShell",
+        install: ["npm install", "npm run build"],
+        smoke: ["node dist\\cli\\index.js setup --mock", "node dist\\cli\\index.js doctor --json", "node dist\\cli\\index.js config path --json", "node dist\\cli\\index.js phase4 verify --json"],
+      },
+      {
+        id: "windows-cmd",
+        label: "Windows CMD",
+        install: ["npm install", "npm run build"],
+        smoke: ["node dist\\cli\\index.js setup --mock", "node dist\\cli\\index.js doctor --json", "node dist\\cli\\index.js config path --json", "node dist\\cli\\index.js phase4 verify --json"],
+      },
+      {
+        id: "linux-shell",
+        label: "Linux shell",
+        install: ["npm install", "npm run build"],
+        smoke: ["node dist/cli/index.js setup --mock", "node dist/cli/index.js doctor --json", "node dist/cli/index.js config path --json", "node dist/cli/index.js phase4 verify --json"],
+      },
+      {
+        id: "macos-shell",
+        label: "macOS shell",
+        install: ["npm install", "npm run build"],
+        smoke: ["node dist/cli/index.js setup --mock", "node dist/cli/index.js doctor --json", "node dist/cli/index.js config path --json", "node dist/cli/index.js phase4 verify --json"],
+      },
+      {
+        id: "android-termux",
+        label: "Android Termux",
+        install: ["pkg install nodejs git ripgrep", "npm install", "npm run build"],
+        smoke: ["node dist/cli/index.js setup --mock", "node dist/cli/index.js doctor --json", "node dist/cli/index.js config path --json", "node dist/cli/index.js phase4 verify --json"],
+      },
+    ],
+  };
+}
+
+function formatPhaseFourMatrixTemplate(matrix: ReturnType<typeof buildPhaseFourMatrixTemplate>): string {
+  const lines = ["Phase 4 manual smoke matrix"];
+  for (const target of matrix.targets) {
+    lines.push("", `[${target.id}] ${target.label}`, "Install:");
+    lines.push(...target.install.map((command) => `- ${command}`));
+    lines.push("Smoke:");
+    lines.push(...target.smoke.map((command) => `- ${command}`));
+  }
+  return lines.join("\n");
+}
+
+type PhaseFiveCheckId =
+  | "control-plane-health"
+  | "signed-invite-enrollment"
+  | "one-file-room-bootstrap"
+  | "registered-agent-pull-communication"
+  | "web-invite-bundle"
+  | "revoked-invite-join-blocked"
+  | "revoked-agent-signed-ops-blocked"
+  | "room-key-rotation"
+  | "suspended-agent-blocked"
+  | "routed-message-delivery"
+  | "multi-agent-route-isolation"
+  | "no-broadcast-fallback-execution"
+  | "signed-ack-heartbeat"
+  | "room-delivery-status"
+  | "control-plane-event-stream"
+  | "stale-agent-health-detected"
+  | "stale-agent-recovery"
+  | "signed-template-reply"
+  | "room-assignment-result"
+  | "agent-to-agent-exchange"
+  | "room-handoff"
+  | "room-conflict-resolution"
+  | "room-result-sync"
+  | "runner-stop-file-shutdown"
+  | "operator-room-visibility"
+  | "secret-shape-scan";
+
+type PhaseFiveCheck = {
+  id: PhaseFiveCheckId;
+  label: string;
+  status: "pass" | "fail";
+  summary: string;
+  metadata?: Record<string, unknown>;
+};
+
+type PhaseFiveVerifyResult = {
+  phase: "phase5";
+  status: "pass" | "fail";
+  workspace: string;
+  generatedAt: string;
+  room: {
+    id?: string;
+    ownerAgentId?: string;
+    remoteAgentId?: string;
+    remoteAgentIds?: string[];
+    bootstrapAgentId?: string;
+    bootstrapRunnerStatusFileObserved?: boolean;
+    bootstrapRunnerStopReason?: string;
+    bootstrapRunnerLastHeartbeatStatus?: string;
+    pulledAgentId?: string;
+    pulledAgentInvitationListed?: boolean;
+    pulledAgentAccepted?: boolean;
+    pulledAgentTaskMessageId?: string;
+    pulledAgentReplyMessageId?: string;
+    pulledAgentAckSigned?: boolean;
+    pulledAgentHeartbeatStatus?: string;
+    pulledAgentRunStopReason?: string;
+    webInviteBundleObserved?: boolean;
+    webInviteBundleSignatureStatus?: string;
+    webInviteBundleStateLeakFree?: boolean;
+    webInviteBundleAuditLeakFree?: boolean;
+    taskMessageId?: string;
+    taskMessageIds?: string[];
+    broadcastFallbackMessageId?: string;
+    broadcastFallbackHandledCount?: number;
+    broadcastFallbackInboxCounts?: Record<string, number>;
+    broadcastFallbackPendingCounts?: Record<string, number>;
+    replyMessageId?: string;
+    replyMessageIds?: string[];
+    roomAssignmentTargetAgentId?: string;
+    roomAssignmentSubtaskId?: string;
+    roomAssignmentChildSessionId?: string;
+    roomAssignmentMessageId?: string;
+    roomAssignmentResultMessageId?: string;
+    agentExchangeMessageId?: string;
+    agentExchangeReplyMessageId?: string;
+    agentExchangeSenderId?: string;
+    agentExchangeReceiverId?: string;
+    roomHandoffId?: string;
+    roomHandoffSourceAgentId?: string;
+    roomHandoffTargetAgentId?: string;
+    roomHandoffMessageId?: string;
+    roomHandoffAcceptanceMessageId?: string;
+    roomHandoffResultMessageId?: string;
+    roomConflictResultKey?: string;
+    roomConflictPrimaryAgentId?: string;
+    roomConflictSecondaryAgentId?: string;
+    roomConflictPrimaryMessageId?: string;
+    roomConflictSecondaryMessageId?: string;
+    roomConflictResolutionMessageId?: string;
+    roomConflictWinningAgentId?: string;
+    roomResultSyncAgentId?: string;
+    roomResultSyncArtifactId?: string;
+    roomResultSyncArtifactMessageId?: string;
+    roomResultSyncArtifactSha256?: string;
+    roomResultSyncArtifactSizeBytes?: number;
+    stopFileShutdownAgentId?: string;
+    stopFileShutdownReason?: string;
+    stopFileShutdownStatusFileObserved?: boolean;
+    revokedInviteJoinBlocked?: boolean;
+    revokedAgentId?: string;
+    revokedAgentSignedSayBlocked?: boolean;
+    revokedAgentSignedAckBlocked?: boolean;
+    revokedAgentSignedHeartbeatBlocked?: boolean;
+    keyRotationAgentId?: string;
+    keyRotationPreviousFingerprint?: string;
+    keyRotationRotatedFingerprint?: string;
+    keyRotationOldSignedSayBlocked?: boolean;
+    keyRotationNewSignedSayAccepted?: boolean;
+    keyRotationAuditEventVisible?: boolean;
+    keyRotationMessageId?: string;
+    suspendedAgentId?: string;
+    suspendedAgentBlocked?: boolean;
+    staleAgentId?: string;
+    staleAgentDetected?: boolean;
+    staleAgentRecovered?: boolean;
+    controlPlaneEventStreamObserved?: boolean;
+    controlPlaneEventStreamAgentIds?: string[];
+    controlPlaneRoomMessageEventObserved?: boolean;
+    controlPlaneEventStreamRoomMessageIds?: string[];
+    controlPlaneDeliveryAckEventObserved?: boolean;
+    controlPlaneEventStreamAckMessageIds?: string[];
+    controlPlaneDeliveryStatusObserved?: boolean;
+    controlPlaneDeliveryStatusAgentIds?: string[];
+    controlPlaneDeliveryStatusPendingCounts?: Record<string, number>;
+    controlPlaneDeliveryStatusAckMessageIds?: string[];
+  };
+  checks: PhaseFiveCheck[];
+  evidence: {
+    controlPlane: "local-http";
+    remoteWorkspace: "separate-local-workspace" | "separate-local-workspaces";
+    cleanup: boolean;
+  };
+};
+
+type PhaseFiveRemotePeer = {
+  workspace?: string;
+  platform: Awaited<ReturnType<typeof createLocalPlatform>>;
+  agent: Awaited<ReturnType<typeof createLocalPlatform>>["localAgent"];
+};
+
+type PhaseFiveAgentExchangeResult = {
+  pass: boolean;
+  senderId?: string;
+  receiverId?: string;
+  messageId?: string;
+  replyMessageId?: string;
+  receiverHandledMessages: string[];
+  senderHandledReplyMessages: string[];
+  messageSignatureStatus?: unknown;
+  replySignatureStatus?: unknown;
+  receiverAckSigned: boolean;
+  senderAckSigned: boolean;
+};
+
+type PhaseFiveRoomHandoffResult = {
+  pass: boolean;
+  handoffId?: string;
+  sourceAgentId?: string;
+  targetAgentId?: string;
+  handoffMessageId?: string;
+  acceptanceMessageId?: string;
+  resultMessageId?: string;
+  resultStatus?: string;
+  handoffMessageVisible: boolean;
+  acceptanceMessageVisible: boolean;
+  resultMessageVisible: boolean;
+  handoffAccepted: boolean;
+  handoffCompleted: boolean;
+  targetHandledMessages: string[];
+  sourceHandledMessages: string[];
+  requestSignatureStatus?: unknown;
+  acceptanceSignatureStatus?: unknown;
+  resultSignatureStatus?: unknown;
+  targetAckSigned: boolean;
+  sourceAckSigned: boolean;
+};
+
+type PhaseFiveRoomConflictResolutionResult = {
+  pass: boolean;
+  resultKey?: string;
+  primaryAgentId?: string;
+  conflictingAgentId?: string;
+  primaryMessageId?: string;
+  conflictingMessageId?: string;
+  resolutionMessageId?: string;
+  winningAgentId?: string;
+  conflictDetected: boolean;
+  resolutionRecorded: boolean;
+  resolutionStatus?: string;
+  primarySignatureStatus?: unknown;
+  conflictingSignatureStatus?: unknown;
+};
+
+type PhaseFiveRoomResultSyncResult = {
+  pass: boolean;
+  agentId?: string;
+  artifactId?: string;
+  artifactKind?: string;
+  artifactName?: string;
+  artifactRoomId?: string;
+  artifactStatus?: string;
+  artifactSha256?: string;
+  artifactSizeBytes?: number;
+  artifactRegistered: boolean;
+  artifactMessageId?: string;
+  artifactMessageVisible: boolean;
+  artifactTranscriptKind?: string;
+};
+
+type PhaseFiveStopFileShutdownResult = {
+  pass: boolean;
+  agentId?: string;
+  stopFile?: string;
+  runnerStatusFile?: string;
+  runnerStatusKind?: string;
+  runnerStatus?: string;
+  runnerStopReason?: string;
+  runnerStatusFileObserved: boolean;
+};
+
+type PhaseFiveRoomAssignmentResult = {
+  pass: boolean;
+  targetAgentId?: string;
+  subtaskId?: string;
+  childSessionId?: string;
+  assignmentMessageId?: string;
+  resultMessageId?: string;
+  resultStatus?: string;
+  assignedAgentIdMatches: boolean;
+  assignmentMessageVisible: boolean;
+  resultMessageVisible: boolean;
+  assignmentTranscriptKind?: string;
+  resultTranscriptKind?: string;
+};
+
+type PhaseFiveKeyRotationResult = {
+  pass: boolean;
+  agentId?: string;
+  previousFingerprint?: string;
+  rotatedFingerprint?: string;
+  trustStatusAfter?: string;
+  oldSignedSayBlocked: boolean;
+  oldSignedSayRejection?: string;
+  newSignedSayAccepted: boolean;
+  newMessageId?: string;
+  newMessageVisible: boolean;
+  auditEventVisible: boolean;
+};
+
+type PhaseFiveOneFileBootstrapResult = {
+  pass: boolean;
+  agentId?: string;
+  bundleKind?: string;
+  joined: boolean;
+  runnerStatusFileObserved: boolean;
+  runnerStopReason?: string;
+  runnerLastHeartbeatStatus?: string;
+  runStopReason?: string;
+};
+
+type PhaseFiveWebInviteBundleResult = {
+  pass: boolean;
+  bundleKind?: string;
+  inviteSignatureStatus?: string;
+  inviteTokenShapeValid: boolean;
+  controlTokenMatches: boolean;
+  controlUrlMatches: boolean;
+  enrollCommandPresent: boolean;
+  runCommandPresent: boolean;
+  stateLeakedInviteToken: boolean;
+  stateLeakedControlToken: boolean;
+  stateLeakedControlUrl: boolean;
+  stateLeakFree: boolean;
+  auditEventVisible: boolean;
+  auditInviteIdVisible: boolean;
+  auditLeakedInviteToken: boolean;
+  auditLeakedControlToken: boolean;
+  auditLeakedControlUrl: boolean;
+  auditLeakFree: boolean;
+};
+
+type PhaseFiveRegisteredAgentPullResult = {
+  pass: boolean;
+  agentId?: string;
+  registered: boolean;
+  invitationListed: boolean;
+  accepted: boolean;
+  role?: string;
+  aliases?: string[];
+  taskMessageId?: string;
+  replyMessageId?: string;
+  handledMessages: string[];
+  messagesProcessed?: number;
+  ackSigned: boolean;
+  replySignatureStatus?: unknown;
+  heartbeatStatus?: string;
+  runStopReason?: string;
+};
+
+type PhaseFiveOperatorVisibilityResult = {
+  pass: boolean;
+  transcriptMessageIds: string[];
+  expectedMessageIds: string[];
+  missingTranscriptMessageIds: string[];
+  stateRoomVisible: boolean;
+  stateRoomMessageIds: string[];
+  missingStateMessageIds: string[];
+  healthAgentIds: string[];
+  missingHealthAgentIds: string[];
+  responsiveHealthAgentIds: string[];
+  roomHealthAgentIds: string[];
+  deliveryStatusAgentIds: string[];
+  missingDeliveryStatusAgentIds: string[];
+  deliveryStatusPendingCounts: Record<string, number>;
+  deliveryStatusAckMessageIds: string[];
+};
+
+type PhaseFiveEventStreamProbe = {
+  close(): Promise<void>;
+  reader: ReadableStreamDefaultReader<Uint8Array>;
+};
+
+type PhaseFiveEventStreamResult = {
+  connected: boolean;
+  eventCount: number;
+  controlActionTypes: string[];
+  controlActionSummaries: string[];
+  roomMessageEventTypes: string[];
+  roomMessageIds: string[];
+  missingRoomMessageIds: string[];
+  deliveryAckEventTypes: string[];
+  ackMessageIds: string[];
+  missingAckMessageIds: string[];
+  agentIds: string[];
+  missingAgentIds: string[];
+};
+
+const PHASE_FIVE_REQUIRED_TARGET_IDS = [
+  "control-plane-host",
+  "windows-powershell-agent",
+  "windows-cmd-agent",
+  "linux-shell-agent",
+  "macos-shell-agent",
+  "android-termux-agent",
+] as const;
+
+const PHASE_FIVE_REMOTE_TARGET_IDS = PHASE_FIVE_REQUIRED_TARGET_IDS.filter((id) => id !== "control-plane-host");
+
+type PhaseFiveEvidenceCheckId =
+  | "evidence-shape"
+  | "required-targets"
+  | "target-smoke-results"
+  | "revoked-invite-join-blocked"
+  | "revoked-agent-signed-ops-blocked"
+  | "room-key-rotation-evidence"
+  | "suspended-agent-blocked"
+  | "control-plane-event-stream"
+  | "signed-room-exchange"
+  | "registered-agent-pull-communication-evidence"
+  | "no-broadcast-fallback-execution-evidence"
+  | "stale-agent-health-detected"
+  | "stale-agent-recovery"
+  | "one-file-room-bootstrap-evidence"
+  | "remote-service-plan-evidence"
+  | "runner-status-file-evidence"
+  | "runner-stop-file-shutdown"
+  | "agent-to-agent-exchange"
+  | "room-assignment-result-evidence"
+  | "room-conflict-resolution-evidence"
+  | "room-result-sync-evidence"
+  | "room-handoff-evidence"
+  | "operator-room-visibility"
+  | "secret-shape-scan";
+
+type PhaseFiveEvidenceCheck = {
+  id: PhaseFiveEvidenceCheckId;
+  label: string;
+  status: "pass" | "fail";
+  summary: string;
+  metadata?: Record<string, unknown>;
+};
+
+type PhaseFiveMissingEvidence = {
+  scope: "matrix" | "target" | "room" | "control-plane";
+  targetId?: string;
+  checkId: PhaseFiveEvidenceCheckId;
+  label: string;
+  missing: string[];
+  summary: string;
+};
+
+type PhaseFiveMissingEvidenceScopeSummary = {
+  matrix: number;
+  target: number;
+  room: number;
+  controlPlane: number;
+};
+
+type PhaseFiveEvidenceCheckResult = {
+  phase: "phase5";
+  gate: "matrix-evidence" | "target-evidence";
+  status: "pass" | "fail";
+  generatedAt: string;
+  filePath: string;
+  targetId?: string;
+  summary: {
+    requiredTargets: number;
+    targetsPresent: number;
+    remoteTargetsPassed: number;
+    missingEvidenceByScope: PhaseFiveMissingEvidenceScopeSummary;
+  };
+  missingEvidence: PhaseFiveMissingEvidence[];
+  checks: PhaseFiveEvidenceCheck[];
+};
+
+type PhaseFiveArgs = {
+  workspace: string;
+  json: boolean;
+};
+
+async function handlePhaseFiveCommand(args: string[], cwd: string): Promise<void> {
+  const subcommand = args[0] ?? "checklist";
+  if (subcommand === "checklist") {
+    console.log(formatPhaseFiveChecklist());
+    return;
+  }
+  if (subcommand === "matrix-template") {
+    const matrixArgs = args.slice(1);
+    const json = matrixArgs.includes("--json");
+    const targetId = parsePhaseFiveMatrixTargetOption(matrixArgs);
+    const matrix = filterPhaseFiveMatrixTemplate(buildPhaseFiveMatrixTemplate(), targetId);
+    if (json) {
+      console.log(JSON.stringify(matrix, null, 2));
+    } else {
+      console.log(formatPhaseFiveMatrixTemplate(matrix));
+    }
+    return;
+  }
+  if (subcommand === "evidence-plan" || subcommand === "collection-plan") {
+    try {
+      const planArgs = args.slice(1);
+      const json = planArgs.includes("--json");
+      const registeredPullTargetId = parsePhaseFiveRegisteredPullTargetOption(planArgs);
+      const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+      if (json) {
+        console.log(JSON.stringify(plan, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidencePlan(plan));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "collection-runbook" || subcommand === "runbook") {
+    try {
+      const runbookArgs = stripWorkspaceOption(args.slice(1));
+      const json = runbookArgs.includes("--json");
+      const outputPath = parsePhaseFiveRunbookOutputPathOption(runbookArgs);
+      const force = runbookArgs.includes("--force");
+      const registeredPullTargetId = parsePhaseFiveRegisteredPullTargetOption(runbookArgs);
+      const runbook = buildPhaseFiveCollectionRunbook({ registeredPullTargetId });
+      const outputFile = outputPath
+        ? await writeTextFileInsideWorkspace(cwd, outputPath, formatPhaseFiveCollectionRunbookMarkdown(runbook), {
+          force,
+          optionName: "--output",
+          description: "Phase 5 collection runbook output",
+        })
+        : undefined;
+      if (json) {
+        console.log(JSON.stringify({
+          ...runbook,
+          ...(outputFile ? { outputFile } : {}),
+        }, null, 2));
+      } else {
+        const formatted = formatPhaseFiveCollectionRunbook(runbook);
+        console.log(outputFile ? `${formatted}\noutput=${outputFile.path}` : formatted);
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "collection-prepare" || subcommand === "prepare") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveCollectionPrepareArgs(cleanArgs);
+      const result = await buildPhaseFiveCollectionPrepare(cwd, options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveCollectionPrepare(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "registered-pull-operator-next" || subcommand === "operator-next") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveRegisteredPullOperatorNextArgs(cleanArgs);
+      const result = await buildPhaseFiveRegisteredPullOperatorNext(cwd, options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveRegisteredPullOperatorNext(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "registered-pull-evidence-patch" || subcommand === "pull-evidence-patch") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveRegisteredPullEvidencePatchArgs(cleanArgs);
+      const result = await buildPhaseFiveRegisteredPullEvidencePatch(cwd, options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveRegisteredPullEvidencePatch(result));
+      }
+    } catch (error) {
+      console.error(sanitizePhaseFiveEvidenceStatusError(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "collector-guide" || subcommand === "collection-guide") {
+    try {
+      const guideArgs = args.slice(1);
+      const json = guideArgs.includes("--json");
+      const targetId = parsePhaseFiveMatrixTargetOption(guideArgs);
+      const includeSmokeCommands = guideArgs.includes("--include-smoke-commands") || guideArgs.includes("--include-matrix-commands");
+      const registeredPullTargetId = parsePhaseFiveRegisteredPullTargetOption(guideArgs);
+      if (!targetId) {
+        throw new Error("Missing --target for Phase 5 collector-guide.");
+      }
+      const guide = buildPhaseFiveCollectorGuide(targetId, { includeSmokeCommands, registeredPullTargetId });
+      if (json) {
+        console.log(JSON.stringify(guide, null, 2));
+      } else {
+        console.log(formatPhaseFiveCollectorGuide(guide));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "collector-pack" || subcommand === "collection-pack") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveCollectorPackArgs(cleanArgs);
+      const result = await buildPhaseFiveCollectorPack(cwd, options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveCollectorPack(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-init" || subcommand === "collection-init") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveEvidenceInitArgs(cleanArgs);
+      const result = await buildPhaseFiveEvidenceInit(cwd, options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidenceInit(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-status" || subcommand === "collection-status") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveEvidenceMergeArgs(cleanArgs);
+      if (!options.filePath) {
+        throw new Error("Missing --file path for Phase 5 evidence-status.");
+      }
+      const targetFilePaths = await expandPhaseFiveEvidenceStatusTargetFiles(options.targetFilePaths, options.targetDirPaths);
+      const result = await buildPhaseFiveEvidenceStatus(options.filePath, targetFilePaths, {
+        registeredPullTargetId: options.registeredPullTargetId,
+        includeMissingEvidence: options.includeMissingEvidence,
+        targetId: options.targetId,
+      });
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidenceStatus(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-template") {
+    try {
+      const templateArgs = args.slice(1);
+      const json = templateArgs.includes("--json");
+      const targetId = parsePhaseFiveMatrixTargetOption(templateArgs);
+      const registeredPullTargetId = parsePhaseFiveRegisteredPullTargetOption(templateArgs);
+      const template = filterPhaseFiveEvidenceTemplate(buildPhaseFiveEvidenceTemplate({ registeredPullTargetId }), targetId);
+      if (json) {
+        console.log(JSON.stringify(template, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidenceTemplate(template));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-merge" || subcommand === "merge-evidence") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const options = parsePhaseFiveEvidenceMergeArgs(cleanArgs);
+      if (!options.filePath) {
+        throw new Error("Missing --file path for Phase 5 evidence-merge.");
+      }
+      const targetFilePaths = await expandPhaseFiveEvidenceMergeTargetFiles(options.targetFilePaths, options.targetDirPaths);
+      if (targetFilePaths.length === 0) {
+        throw new Error("Missing --target-file or --target-dir path for Phase 5 evidence-merge.");
+      }
+      const result = await buildPhaseFiveEvidenceMerge(options.filePath, targetFilePaths);
+      if (options.outputPath) {
+        const output = await writeJsonOutputInsideWorkspace(cwd, options.outputPath, result.evidence, "--output");
+        const finalEvidenceCheck = await buildPhaseFiveEvidenceCheck(output.path);
+        if (options.json) {
+          console.log(JSON.stringify({
+            phase: "phase5",
+            action: "evidence-merge",
+            status: "pass",
+            baseFilePath: result.baseFilePath,
+            targetFilePaths: result.targetFilePaths,
+            requiredTargetIds: result.requiredTargetIds,
+            mergedTargetIds: result.mergedTargetIds,
+            remainingTargetIds: result.remainingTargetIds,
+            readyForFinalEvidenceCheck: result.readyForFinalEvidenceCheck,
+            collectionStatus: result.collectionStatus,
+            roomStatus: result.roomStatus,
+            targetStatus: result.targetStatus,
+            finalEvidenceCheck: summarizePhaseFiveEvidenceMergeFinalCheck(finalEvidenceCheck),
+            output,
+          }, null, 2));
+        } else {
+          console.log(formatPhaseFiveEvidenceMerge(result, output));
+        }
+      } else if (options.json) {
+        console.log(JSON.stringify(result.evidence, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidenceMerge(result));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-check" || subcommand === "check-evidence") {
+    try {
+      const cleanArgs = stripWorkspaceOption(args.slice(1));
+      const filePath = parsePhaseTwoEvidenceFileOption(cleanArgs);
+      if (!filePath) {
+        throw new Error("Missing --file path for Phase 5 evidence-check.");
+      }
+      const targetId = parsePhaseFiveMatrixTargetOption(cleanArgs);
+      const result = targetId
+        ? await buildPhaseFiveTargetEvidenceCheck(filePath, targetId)
+        : await buildPhaseFiveEvidenceCheck(filePath);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveEvidenceCheck(result));
+      }
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "verify" || subcommand === "smoke") {
+    try {
+      const options = await parsePhaseFiveArgs(args.slice(1), cwd);
+      const result = await runPhaseFiveVerify(options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseFiveVerify(result));
+      }
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  console.error("Usage: soloclaw phase5 checklist|verify|matrix-template|evidence-plan|collection-runbook|collection-prepare|registered-pull-operator-next|registered-pull-evidence-patch|collector-guide|collector-pack|evidence-init|evidence-status|evidence-template|evidence-merge|evidence-check [--workspace path] [--file path] [--target target-id] [--registered-pull-target target-id] [--status-file path] [--pull-agent-file path] [--invitations-file path] [--accept-room-file path] [--room-show-file path] [--delivery-status-file path] [--control-fragment-file path] [--patched-control-fragment-output path] [--target-file path] [--target-dir path] [--output path] [--output-dir path] [--include-smoke-commands] [--include-missing-evidence] [--force] [--json]");
+  process.exitCode = 1;
+}
+
+async function parsePhaseFiveArgs(args: string[], cwd: string): Promise<PhaseFiveArgs> {
+  return {
+    workspace: await resolveInitialWorkspace(cwd, args),
+    json: args.includes("--json"),
+  };
+}
+
+async function runPhaseFiveVerify(options: PhaseFiveArgs): Promise<PhaseFiveVerifyResult> {
+  const checks: PhaseFiveCheck[] = [];
+  const controlWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-control-"));
+  const remoteWorkspaces: string[] = [];
+  let setupPlatform: Awaited<ReturnType<typeof createLocalPlatform>> | undefined;
+  const remotePlatforms: Array<Awaited<ReturnType<typeof createLocalPlatform>>> = [];
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  let eventStream: PhaseFiveEventStreamProbe | undefined;
+  const roomEvidence: PhaseFiveVerifyResult["room"] = {};
+
+  try {
+    remoteWorkspaces.push(
+      await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-remote-a-")),
+      await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-remote-b-")),
+    );
+    setupPlatform = await createLocalPlatform(controlWorkspace, { provider: "mock", workspaceSnapshot: false });
+    const owner = {
+      type: "agent" as const,
+      id: setupPlatform.localAgent.id,
+      displayName: setupPlatform.localAgent.displayName,
+    };
+    const room = await setupPlatform.rooms.createRoom({
+      name: "Phase 5 local remote-room smoke",
+      createdBy: owner,
+      policy: {
+        joinPolicy: "invite_token",
+        defaultCapabilities: [],
+        agentResponseMode: "mentions_only",
+        wideMentionPolicy: "members",
+        maxRoutedAgentTargets: 4,
+        requireSignedInvites: true,
+      },
+    });
+    const invite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: remoteWorkspaces.length,
+    });
+    const inviteSignatureStatus = await setupPlatform.rooms.verifyInvite(invite.invite);
+    const bootstrapInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    const bootstrapInviteSignatureStatus = await setupPlatform.rooms.verifyInvite(bootstrapInvite.invite);
+    const revokedInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    const revokedInviteRecord = await setupPlatform.rooms.revokeInvite(room.id, revokedInvite.invite.id, owner);
+    const revokedAgentInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    const suspendedInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    const staleInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    const keyRotationInvite = await setupPlatform.rooms.createInvite({
+      roomId: room.id,
+      createdBy: owner,
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    });
+    roomEvidence.id = room.id;
+    roomEvidence.ownerAgentId = owner.id;
+    await closePhaseFivePlatform(setupPlatform);
+    setupPlatform = undefined;
+
+    const eventBus = new LocalEventBus();
+    server = await startLocalRoomWebServer(controlWorkspace, { host: "127.0.0.1", port: 0, eventBus });
+    const health = await controlPlaneGetJson<{ ok?: boolean; localAgentId?: string }>(server.baseUrl, "/api/health", server.token);
+    eventStream = await openPhaseFiveEventStream(server, room.id);
+    checks.push({
+      id: "control-plane-health",
+      label: "local HTTP control plane",
+      status: health.ok === true && health.localAgentId === owner.id ? "pass" : "fail",
+      summary: `ok=${health.ok === true}, localAgent=${health.localAgentId ?? "-"}`,
+    });
+
+    const remotes: Array<{
+      workspace: string;
+      alias: string;
+      platform: Awaited<ReturnType<typeof createLocalPlatform>>;
+      agent: Awaited<ReturnType<typeof createLocalPlatform>>["localAgent"];
+      join?: { member: { actor: { id: string }; role: string; status: string; aliases?: string[] } };
+      task?: { message: { id: string; body: string; signature?: string } };
+      handledMessages: string[];
+      run?: RemoteRoomRunResult;
+      ackSigned?: boolean;
+      heartbeatStatus?: string;
+      lastHeartbeatAt?: string;
+      reply?: { id: string; kind: string; body: string; metadata?: Record<string, unknown> };
+    }> = [];
+
+    for (let index = 0; index < remoteWorkspaces.length; index += 1) {
+      const platform = await createLocalPlatform(remoteWorkspaces[index], { provider: "mock", workspaceSnapshot: false });
+      remotePlatforms.push(platform);
+      const remoteAgent = platform.localAgent;
+      const alias = `remote-phase5-${index + 1}`;
+      await controlPlaneJson<{ agent: { id: string } }>(server.baseUrl, "/api/agents/register", server.token, {
+        actor: `agent:${remoteAgent.id}`,
+        agentId: remoteAgent.id,
+        machineId: remoteAgent.machineId,
+        displayName: remoteAgent.displayName,
+        publicKeyPem: remoteAgent.publicKeyPem,
+        fingerprint: remoteAgent.fingerprint,
+        capabilities: remoteAgent.capabilities,
+        allowedProjects: remoteAgent.allowedProjects,
+      });
+      const join = await controlPlaneJson<{ member: { actor: { id: string }; role: string; status: string; aliases?: string[] } }>(
+        server.baseUrl,
+        `/api/rooms/${encodeURIComponent(room.id)}/join-invite`,
+        server.token,
+        {
+          actor: `agent:${remoteAgent.id}`,
+          token: invite.token,
+          aliases: [alias],
+        },
+      );
+      remotes.push({ workspace: remoteWorkspaces[index], alias, platform, agent: remoteAgent, join, handledMessages: [] });
+    }
+
+    roomEvidence.remoteAgentId = remotes[0]?.agent.id;
+    roomEvidence.remoteAgentIds = remotes.map((remote) => remote.agent.id);
+    const joinedActiveAgents = remotes.filter((remote) => remote.join?.member.actor.id === remote.agent.id && remote.join.member.status === "active");
+    checks.push({
+      id: "signed-invite-enrollment",
+      label: "signed invite enrollment",
+      status: inviteSignatureStatus === "valid" && joinedActiveAgents.length === remotes.length ? "pass" : "fail",
+      summary: `inviteSignature=${inviteSignatureStatus}, joined=${joinedActiveAgents.length}/${remotes.length}`,
+      metadata: {
+        aliases: remotes.map((remote) => remote.alias),
+        roles: remotes.map((remote) => remote.join?.member.role ?? "unknown"),
+      },
+    });
+
+    const bootstrap = await runPhaseFiveOneFileBootstrap({
+      server,
+      roomId: room.id,
+      invite: bootstrapInvite,
+      inviteSignatureStatus: bootstrapInviteSignatureStatus,
+      remoteWorkspaces,
+      remotePlatforms,
+    });
+    roomEvidence.bootstrapAgentId = bootstrap.agentId;
+    roomEvidence.bootstrapRunnerStatusFileObserved = bootstrap.runnerStatusFileObserved;
+    roomEvidence.bootstrapRunnerStopReason = bootstrap.runnerStopReason;
+    roomEvidence.bootstrapRunnerLastHeartbeatStatus = bootstrap.runnerLastHeartbeatStatus;
+    checks.push({
+      id: "one-file-room-bootstrap",
+      label: "one-file room invite bootstrap",
+      status: bootstrap.pass ? "pass" : "fail",
+      summary:
+        `agent=${bootstrap.agentId ?? "-"}, joined=${bootstrap.joined}, ` +
+        `statusFile=${bootstrap.runnerStatusFileObserved}, stop=${bootstrap.runnerStopReason ?? "-"}`,
+      metadata: {
+        agentId: bootstrap.agentId,
+        bundleKind: bootstrap.bundleKind,
+        joined: bootstrap.joined,
+        runnerStatusFileObserved: bootstrap.runnerStatusFileObserved,
+        runnerStopReason: bootstrap.runnerStopReason,
+        runnerLastHeartbeatStatus: bootstrap.runnerLastHeartbeatStatus,
+        runStopReason: bootstrap.runStopReason,
+      },
+    });
+
+    const pulledAgent = await runPhaseFiveRegisteredAgentPullCommunication({
+      server,
+      roomId: room.id,
+      owner,
+      remoteWorkspaces,
+      remotePlatforms,
+    });
+    roomEvidence.pulledAgentId = pulledAgent.agentId;
+    roomEvidence.pulledAgentInvitationListed = pulledAgent.invitationListed;
+    roomEvidence.pulledAgentAccepted = pulledAgent.accepted;
+    roomEvidence.pulledAgentTaskMessageId = pulledAgent.taskMessageId;
+    roomEvidence.pulledAgentReplyMessageId = pulledAgent.replyMessageId;
+    roomEvidence.pulledAgentAckSigned = pulledAgent.ackSigned;
+    roomEvidence.pulledAgentHeartbeatStatus = pulledAgent.heartbeatStatus;
+    roomEvidence.pulledAgentRunStopReason = pulledAgent.runStopReason;
+    checks.push({
+      id: "registered-agent-pull-communication",
+      label: "registered agent pull communication",
+      status: pulledAgent.pass ? "pass" : "fail",
+      summary:
+        `agent=${pulledAgent.agentId ?? "-"}, ` +
+        `invited=${pulledAgent.invitationListed}, accepted=${pulledAgent.accepted}, ` +
+        `handled=${pulledAgent.handledMessages.length}, ack=${pulledAgent.ackSigned}`,
+      metadata: {
+        agentId: pulledAgent.agentId,
+        registered: pulledAgent.registered,
+        invitationListed: pulledAgent.invitationListed,
+        accepted: pulledAgent.accepted,
+        role: pulledAgent.role,
+        aliases: pulledAgent.aliases,
+        taskMessageId: pulledAgent.taskMessageId,
+        replyMessageId: pulledAgent.replyMessageId,
+        handledMessages: pulledAgent.handledMessages,
+        messagesProcessed: pulledAgent.messagesProcessed,
+        ackSigned: pulledAgent.ackSigned,
+        replySignatureStatus: pulledAgent.replySignatureStatus,
+        heartbeatStatus: pulledAgent.heartbeatStatus,
+        runStopReason: pulledAgent.runStopReason,
+      },
+    });
+
+    const webInviteBundle = await runPhaseFiveWebInviteBundleProbe({
+      server,
+      roomId: room.id,
+      actor: owner,
+    });
+    roomEvidence.webInviteBundleObserved = webInviteBundle.pass;
+    roomEvidence.webInviteBundleSignatureStatus = webInviteBundle.inviteSignatureStatus;
+    roomEvidence.webInviteBundleStateLeakFree = webInviteBundle.stateLeakFree;
+    roomEvidence.webInviteBundleAuditLeakFree = webInviteBundle.auditLeakFree;
+    checks.push({
+      id: "web-invite-bundle",
+      label: "Web remote invite bundle",
+      status: webInviteBundle.pass ? "pass" : "fail",
+      summary:
+        `bundle=${webInviteBundle.bundleKind ?? "-"}, ` +
+        `signature=${webInviteBundle.inviteSignatureStatus ?? "-"}, ` +
+        `stateLeakFree=${webInviteBundle.stateLeakFree}, auditLeakFree=${webInviteBundle.auditLeakFree}`,
+      metadata: {
+        bundleKind: webInviteBundle.bundleKind,
+        inviteSignatureStatus: webInviteBundle.inviteSignatureStatus,
+        inviteTokenShapeValid: webInviteBundle.inviteTokenShapeValid,
+        controlTokenMatches: webInviteBundle.controlTokenMatches,
+        controlUrlMatches: webInviteBundle.controlUrlMatches,
+        enrollCommandPresent: webInviteBundle.enrollCommandPresent,
+        runCommandPresent: webInviteBundle.runCommandPresent,
+        stateLeakedInviteToken: webInviteBundle.stateLeakedInviteToken,
+        stateLeakedControlToken: webInviteBundle.stateLeakedControlToken,
+        stateLeakedControlUrl: webInviteBundle.stateLeakedControlUrl,
+        auditEventVisible: webInviteBundle.auditEventVisible,
+        auditInviteIdVisible: webInviteBundle.auditInviteIdVisible,
+        auditLeakedInviteToken: webInviteBundle.auditLeakedInviteToken,
+        auditLeakedControlToken: webInviteBundle.auditLeakedControlToken,
+        auditLeakedControlUrl: webInviteBundle.auditLeakedControlUrl,
+      },
+    });
+
+    const revokedWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-revoked-"));
+    remoteWorkspaces.push(revokedWorkspace);
+    const revokedPlatform = await createLocalPlatform(revokedWorkspace, { provider: "mock", workspaceSnapshot: false });
+    remotePlatforms.push(revokedPlatform);
+    await controlPlaneJson<{ agent: { id: string } }>(server.baseUrl, "/api/agents/register", server.token, {
+      actor: `agent:${revokedPlatform.localAgent.id}`,
+      agentId: revokedPlatform.localAgent.id,
+      machineId: revokedPlatform.localAgent.machineId,
+      displayName: revokedPlatform.localAgent.displayName,
+      publicKeyPem: revokedPlatform.localAgent.publicKeyPem,
+      fingerprint: revokedPlatform.localAgent.fingerprint,
+      capabilities: revokedPlatform.localAgent.capabilities,
+      allowedProjects: revokedPlatform.localAgent.allowedProjects,
+    });
+    let revokedInviteBlocked = false;
+    let revokedInviteError = "";
+    try {
+      await controlPlaneJson<{ member: { actor: { id: string } } }>(
+        server.baseUrl,
+        `/api/rooms/${encodeURIComponent(room.id)}/join-invite`,
+        server.token,
+        {
+          actor: `agent:${revokedPlatform.localAgent.id}`,
+          token: revokedInvite.token,
+          aliases: ["revoked-phase5"],
+        },
+      );
+    } catch (error) {
+      revokedInviteError = error instanceof Error ? error.message : String(error);
+      revokedInviteBlocked = /revoked/i.test(revokedInviteError);
+    }
+    roomEvidence.revokedInviteJoinBlocked = revokedInviteBlocked;
+    checks.push({
+      id: "revoked-invite-join-blocked",
+      label: "revoked invite join blocked",
+      status: revokedInviteRecord.status === "revoked" && revokedInviteBlocked ? "pass" : "fail",
+      summary: `revoked=${revokedInviteRecord.status === "revoked"}, blocked=${revokedInviteBlocked}`,
+      metadata: {
+        attemptedAgentId: revokedPlatform.localAgent.id,
+        rejection: revokedInviteError ? "Room invite is revoked" : undefined,
+      },
+    });
+
+    const revokedAgentWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-revoked-agent-"));
+    remoteWorkspaces.push(revokedAgentWorkspace);
+    const revokedAgentPlatform = await createLocalPlatform(revokedAgentWorkspace, { provider: "mock", workspaceSnapshot: false });
+    remotePlatforms.push(revokedAgentPlatform);
+    await controlPlaneJson<{ agent: { id: string } }>(server.baseUrl, "/api/agents/register", server.token, {
+      actor: `agent:${revokedAgentPlatform.localAgent.id}`,
+      agentId: revokedAgentPlatform.localAgent.id,
+      machineId: revokedAgentPlatform.localAgent.machineId,
+      displayName: revokedAgentPlatform.localAgent.displayName,
+      publicKeyPem: revokedAgentPlatform.localAgent.publicKeyPem,
+      fingerprint: revokedAgentPlatform.localAgent.fingerprint,
+      capabilities: revokedAgentPlatform.localAgent.capabilities,
+      allowedProjects: revokedAgentPlatform.localAgent.allowedProjects,
+    });
+    await controlPlaneJson<{ member: { actor: { id: string }; role: string; status: string; aliases?: string[] } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/join-invite`,
+      server.token,
+      {
+        actor: `agent:${revokedAgentPlatform.localAgent.id}`,
+        token: revokedAgentInvite.token,
+        aliases: ["revoked-agent-phase5"],
+      },
+    );
+    const revokedAgentTrust = await controlPlaneJson<{
+      agent: { id: string; trustStatus?: string };
+      previousTrustStatus?: string;
+    }>(
+      server.baseUrl,
+      `/api/agents/${encodeURIComponent(revokedAgentPlatform.localAgent.id)}/trust`,
+      server.token,
+      {
+        actor: `agent:${owner.id}`,
+        trustStatus: "revoked",
+        reason: "phase5 verify revoked-agent signed operation probe",
+      },
+    );
+    const revokedAgentRunner = new RemoteRoomRunner({
+      controlUrl: server.baseUrl,
+      token: server.token,
+      roomId: room.id,
+      identity: revokedAgentPlatform.identity,
+      localAgent: revokedAgentPlatform.localAgent,
+    });
+    const revokedAgentTask = await controlPlaneJson<{ message: { id: string; body: string; signature?: string } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/messages`,
+      server.token,
+      {
+        actor: `agent:${owner.id}`,
+        kind: "task",
+        body: `@agent:${revokedAgentPlatform.localAgent.id} phase5 revoked-agent ack probe`,
+      },
+    );
+    let revokedAgentSayBlocked = false;
+    let revokedAgentSayError = "";
+    try {
+      await revokedAgentRunner.say({
+        kind: "chat",
+        body: `@agent:${owner.id} phase5 revoked-agent signed say should be rejected`,
+      });
+    } catch (error) {
+      revokedAgentSayError = error instanceof Error ? error.message : String(error);
+      revokedAgentSayBlocked = /403|Agent trust status revoked|revoked|does not allow signed/i.test(revokedAgentSayError);
+    }
+    let revokedAgentAckBlocked = false;
+    let revokedAgentAckError = "";
+    try {
+      await revokedAgentRunner.ack(revokedAgentTask.message.id);
+    } catch (error) {
+      revokedAgentAckError = error instanceof Error ? error.message : String(error);
+      revokedAgentAckBlocked = /403|Agent trust status revoked|revoked|does not allow signed/i.test(revokedAgentAckError);
+    }
+    let revokedAgentHeartbeatBlocked = false;
+    let revokedAgentHeartbeatError = "";
+    try {
+      await revokedAgentRunner.heartbeat({ status: "online", ttlSeconds: 30 });
+    } catch (error) {
+      revokedAgentHeartbeatError = error instanceof Error ? error.message : String(error);
+      revokedAgentHeartbeatBlocked = /403|Agent trust status revoked|revoked|does not allow signed/i.test(revokedAgentHeartbeatError);
+    }
+    const revokedAgentSignedOpsBlocked =
+      revokedAgentTrust.agent.trustStatus === "revoked" &&
+      revokedAgentSayBlocked &&
+      revokedAgentAckBlocked &&
+      revokedAgentHeartbeatBlocked;
+    roomEvidence.revokedAgentId = revokedAgentPlatform.localAgent.id;
+    roomEvidence.revokedAgentSignedSayBlocked = revokedAgentSayBlocked;
+    roomEvidence.revokedAgentSignedAckBlocked = revokedAgentAckBlocked;
+    roomEvidence.revokedAgentSignedHeartbeatBlocked = revokedAgentHeartbeatBlocked;
+    checks.push({
+      id: "revoked-agent-signed-ops-blocked",
+      label: "revoked agent signed operations blocked",
+      status: revokedAgentSignedOpsBlocked ? "pass" : "fail",
+      summary:
+        `trust=${revokedAgentTrust.agent.trustStatus ?? "-"}, ` +
+        `say=${revokedAgentSayBlocked}, ack=${revokedAgentAckBlocked}, heartbeat=${revokedAgentHeartbeatBlocked}`,
+      metadata: {
+        agentId: revokedAgentPlatform.localAgent.id,
+        previousTrustStatus: revokedAgentTrust.previousTrustStatus,
+        trustStatus: revokedAgentTrust.agent.trustStatus,
+        ackProbeMessageId: revokedAgentTask.message.id,
+        signedSayBlocked: revokedAgentSayBlocked,
+        signedAckBlocked: revokedAgentAckBlocked,
+        signedHeartbeatBlocked: revokedAgentHeartbeatBlocked,
+        rejections: {
+          say: revokedAgentSayError ? "Agent trust status revoked does not allow signed room message intent." : undefined,
+          ack: revokedAgentAckError ? "Agent trust status revoked does not allow signed room delivery ack." : undefined,
+          heartbeat: revokedAgentHeartbeatError ? "Agent trust status revoked does not allow signed agent heartbeat." : undefined,
+        },
+      },
+    });
+
+    const keyRotation = await runPhaseFiveKeyRotation({
+      server,
+      roomId: room.id,
+      invite: keyRotationInvite,
+      owner,
+      remoteWorkspaces,
+      remotePlatforms,
+    });
+    roomEvidence.keyRotationAgentId = keyRotation.agentId;
+    roomEvidence.keyRotationPreviousFingerprint = keyRotation.previousFingerprint;
+    roomEvidence.keyRotationRotatedFingerprint = keyRotation.rotatedFingerprint;
+    roomEvidence.keyRotationOldSignedSayBlocked = keyRotation.oldSignedSayBlocked;
+    roomEvidence.keyRotationNewSignedSayAccepted = keyRotation.newSignedSayAccepted;
+    roomEvidence.keyRotationAuditEventVisible = keyRotation.auditEventVisible;
+    roomEvidence.keyRotationMessageId = keyRotation.newMessageId;
+    checks.push({
+      id: "room-key-rotation",
+      label: "room key rotation",
+      status: keyRotation.pass ? "pass" : "fail",
+      summary:
+        `agent=${keyRotation.agentId ?? "-"}, ` +
+        `fingerprintChanged=${Boolean(keyRotation.previousFingerprint && keyRotation.rotatedFingerprint && keyRotation.previousFingerprint !== keyRotation.rotatedFingerprint)}, ` +
+        `oldBlocked=${keyRotation.oldSignedSayBlocked}, newAccepted=${keyRotation.newSignedSayAccepted}`,
+      metadata: {
+        agentId: keyRotation.agentId,
+        previousFingerprint: keyRotation.previousFingerprint,
+        rotatedFingerprint: keyRotation.rotatedFingerprint,
+        trustStatusAfter: keyRotation.trustStatusAfter,
+        oldSignedSayBlocked: keyRotation.oldSignedSayBlocked,
+        newSignedSayAccepted: keyRotation.newSignedSayAccepted,
+        newMessageId: keyRotation.newMessageId,
+        newMessageVisible: keyRotation.newMessageVisible,
+        auditEventVisible: keyRotation.auditEventVisible,
+        rejection: keyRotation.oldSignedSayRejection ? "Invalid room message intent envelope signature: invalid" : undefined,
+      },
+    });
+
+    const suspendedWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-suspended-"));
+    remoteWorkspaces.push(suspendedWorkspace);
+    const suspendedPlatform = await createLocalPlatform(suspendedWorkspace, { provider: "mock", workspaceSnapshot: false });
+    remotePlatforms.push(suspendedPlatform);
+    await controlPlaneJson<{ agent: { id: string } }>(server.baseUrl, "/api/agents/register", server.token, {
+      actor: `agent:${suspendedPlatform.localAgent.id}`,
+      agentId: suspendedPlatform.localAgent.id,
+      machineId: suspendedPlatform.localAgent.machineId,
+      displayName: suspendedPlatform.localAgent.displayName,
+      publicKeyPem: suspendedPlatform.localAgent.publicKeyPem,
+      fingerprint: suspendedPlatform.localAgent.fingerprint,
+      capabilities: suspendedPlatform.localAgent.capabilities,
+      allowedProjects: suspendedPlatform.localAgent.allowedProjects,
+    });
+    await controlPlaneJson<{ member: { actor: { id: string }; role: string; status: string; aliases?: string[] } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/join-invite`,
+      server.token,
+      {
+        actor: `agent:${suspendedPlatform.localAgent.id}`,
+        token: suspendedInvite.token,
+        aliases: ["suspended-phase5"],
+      },
+    );
+    const suspendedStatus = await controlPlaneJson<{ member: { actor: { id: string }; status: string } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/members/${encodeURIComponent(suspendedPlatform.localAgent.id)}/status`,
+      server.token,
+      {
+        actor: `agent:${owner.id}`,
+        status: "suspended",
+      },
+    );
+    const suspendedProbe = await controlPlaneJson<{ message: { id: string; body: string; signature?: string } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/messages`,
+      server.token,
+      {
+        actor: `agent:${owner.id}`,
+        kind: "task",
+        body: `@agent:${suspendedPlatform.localAgent.id} phase5 suspended probe: should not wake`,
+      },
+    );
+    const suspendedRunner = new RemoteRoomRunner({
+      controlUrl: server.baseUrl,
+      token: server.token,
+      roomId: room.id,
+      identity: suspendedPlatform.identity,
+      localAgent: suspendedPlatform.localAgent,
+    });
+    const suspendedInbox = await suspendedRunner.inbox({ limit: 5, includeDelivered: true });
+    let suspendedSayBlocked = false;
+    let suspendedSayError = "";
+    try {
+      await suspendedRunner.say({
+        kind: "chat",
+        body: `@agent:${owner.id} phase5 suspended self-check should be rejected`,
+      });
+    } catch (error) {
+      suspendedSayError = error instanceof Error ? error.message : String(error);
+      suspendedSayBlocked = /room\.message\.send|capability|suspended|status/i.test(suspendedSayError);
+    }
+    const suspendedInboxMessageCount = suspendedInbox.messages.length;
+    const suspendedAgentBlocked =
+      suspendedStatus.member.status === "suspended" &&
+      suspendedInboxMessageCount === 0 &&
+      suspendedSayBlocked;
+    roomEvidence.suspendedAgentId = suspendedPlatform.localAgent.id;
+    roomEvidence.suspendedAgentBlocked = suspendedAgentBlocked;
+    checks.push({
+      id: "suspended-agent-blocked",
+      label: "suspended agent routing and send blocked",
+      status: suspendedAgentBlocked ? "pass" : "fail",
+      summary:
+        `status=${suspendedStatus.member.status}, inbox=${suspendedInboxMessageCount}, ` +
+        `sayBlocked=${suspendedSayBlocked}`,
+      metadata: {
+        agentId: suspendedPlatform.localAgent.id,
+        routedMessageId: suspendedProbe.message.id,
+        inboxMessageCount: suspendedInboxMessageCount,
+        remoteSayBlocked: suspendedSayBlocked,
+        rejection: suspendedSayError ? "Room capability denied: room.message.send" : undefined,
+      },
+    });
+
+    for (const [index, remote] of remotes.entries()) {
+      remote.task = await controlPlaneJson<{ message: { id: string; body: string; signature?: string } }>(
+        server.baseUrl,
+        `/api/rooms/${encodeURIComponent(room.id)}/messages`,
+        server.token,
+        {
+          actor: `agent:${owner.id}`,
+          kind: "task",
+          body: `@agent:${remote.agent.id} phase5 verify ${index + 1}: acknowledge and reply`,
+        },
+      );
+    }
+    roomEvidence.taskMessageId = remotes[0]?.task?.message.id;
+    roomEvidence.taskMessageIds = remotes.map((remote) => remote.task?.message.id).filter((id): id is string => Boolean(id));
+
+    for (const remote of remotes) {
+      const runner = new RemoteRoomRunner({
+        controlUrl: server.baseUrl,
+        token: server.token,
+        roomId: room.id,
+        identity: remote.platform.identity,
+        localAgent: remote.agent,
+      });
+      remote.run = await runner.run({
+        maxCycles: 2,
+        maxMessagesPerPoll: 2,
+        maxIdlePolls: 1,
+        idleIntervalMs: 0,
+        intervalMs: 0,
+        stopWhenIdle: true,
+        maxIdleCycles: 1,
+        baseBackoffMs: 0,
+        maxBackoffMs: 0,
+        maxErrors: 1,
+        heartbeatTtlSeconds: 30,
+        onMessage: async (message) => {
+          remote.handledMessages.push(message.id);
+          await runner.say({
+            kind: "chat",
+            body: formatRemoteReplyTemplate(`@agent:${owner.id} phase5 handled {messageId} by {agentId}`, message, {
+              roomId: room.id,
+              agentId: remote.agent.id,
+            }),
+          });
+        },
+      });
+    }
+
+    const routedDeliveryPass = remotes.every((remote) =>
+      remote.run?.messagesProcessed === 1 &&
+      remote.handledMessages.length === 1 &&
+      remote.handledMessages[0] === remote.task?.message.id
+    );
+    checks.push({
+      id: "routed-message-delivery",
+      label: "routed message delivery",
+      status: routedDeliveryPass ? "pass" : "fail",
+      summary: `processed=${remotes.map((remote) => remote.run?.messagesProcessed ?? 0).join("+")}, agents=${remotes.length}`,
+      metadata: {
+        agents: remotes.map((remote) => ({
+          agentId: remote.agent.id,
+          taskMessageId: remote.task?.message.id,
+          handledMessages: remote.handledMessages,
+          stopReason: remote.run?.stopReason,
+          cycles: remote.run?.cycles,
+        })),
+      },
+    });
+
+    const taskIds = remotes.map((remote) => remote.task?.message.id).filter((id): id is string => Boolean(id));
+    const multiAgentIsolationPass =
+      remotes.length >= 2 &&
+      new Set(remotes.map((remote) => remote.agent.id)).size === remotes.length &&
+      new Set(taskIds).size === remotes.length &&
+      remotes.every((remote) =>
+        remote.handledMessages.length === 1 &&
+        remote.handledMessages[0] === remote.task?.message.id &&
+        remotes.every((other) => other === remote || !remote.handledMessages.includes(other.task?.message.id ?? ""))
+      );
+    checks.push({
+      id: "multi-agent-route-isolation",
+      label: "multi-agent route isolation",
+      status: multiAgentIsolationPass ? "pass" : "fail",
+      summary: `agents=${remotes.length}, isolated=${multiAgentIsolationPass}`,
+      metadata: {
+        remoteAgentIds: remotes.map((remote) => remote.agent.id),
+        taskMessageIds: taskIds,
+        handledByAgent: Object.fromEntries(remotes.map((remote) => [remote.agent.id, remote.handledMessages])),
+      },
+    });
+
+    const broadcastFallbackProbe = await controlPlaneJson<{ message: { id: string; body: string; signature?: string } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/messages`,
+      server.token,
+      {
+        actor: `agent:${owner.id}`,
+        kind: "chat",
+        body: "phase5 verifier ordinary transcript-only message without agent mention",
+      },
+    );
+    const broadcastFallbackRoomDetail = await controlPlaneGetJson<{ messages?: Array<{ id?: string }> }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}`,
+      server.token,
+    );
+    const broadcastFallbackTranscriptVisible =
+      broadcastFallbackRoomDetail.messages?.some((message) => message.id === broadcastFallbackProbe.message.id) === true;
+    const broadcastFallbackHandledByAgent: Record<string, string[]> = Object.fromEntries(
+      remotes.map((remote) => [remote.agent.id, []]),
+    );
+    const broadcastFallbackInboxCounts: Record<string, number> = {};
+    const broadcastFallbackRunMessagesProcessed: Record<string, number> = {};
+    const broadcastFallbackRunStopReasons: Record<string, string> = {};
+
+    for (const remote of remotes) {
+      const runner = new RemoteRoomRunner({
+        controlUrl: server.baseUrl,
+        token: server.token,
+        roomId: room.id,
+        identity: remote.platform.identity,
+        localAgent: remote.agent,
+      });
+      const pendingInbox = await runner.inbox({ limit: 5 });
+      broadcastFallbackInboxCounts[remote.agent.id] = pendingInbox.messages.length;
+      const run = await runner.run({
+        maxCycles: 1,
+        maxMessagesPerPoll: 2,
+        maxIdlePolls: 1,
+        idleIntervalMs: 0,
+        intervalMs: 0,
+        stopWhenIdle: true,
+        maxIdleCycles: 1,
+        baseBackoffMs: 0,
+        maxBackoffMs: 0,
+        maxErrors: 1,
+        heartbeatTtlSeconds: 30,
+        onMessage: async (message) => {
+          broadcastFallbackHandledByAgent[remote.agent.id]?.push(message.id);
+        },
+      });
+      broadcastFallbackRunMessagesProcessed[remote.agent.id] = run.messagesProcessed;
+      broadcastFallbackRunStopReasons[remote.agent.id] = run.stopReason;
+    }
+
+    const broadcastFallbackDeliveryStatus = await controlPlaneGetJson<{
+      agents?: Array<{
+        agentId?: string;
+        routedMessageCount?: number;
+        pendingRoutedCount?: number;
+      }>;
+    }>(server.baseUrl, `/api/rooms/${encodeURIComponent(room.id)}/delivery-status`, server.token);
+    const broadcastFallbackDeliveryStatusByAgent = new Map(
+      (broadcastFallbackDeliveryStatus.agents ?? []).map((agent) => [agent.agentId, agent]),
+    );
+    const broadcastFallbackPendingCounts = Object.fromEntries(
+      remotes.map((remote) => [
+        remote.agent.id,
+        Number(broadcastFallbackDeliveryStatusByAgent.get(remote.agent.id)?.pendingRoutedCount ?? -1),
+      ]),
+    );
+    const broadcastFallbackRoutedCounts = Object.fromEntries(
+      remotes.map((remote) => [
+        remote.agent.id,
+        Number(broadcastFallbackDeliveryStatusByAgent.get(remote.agent.id)?.routedMessageCount ?? -1),
+      ]),
+    );
+    const broadcastFallbackHandledCount = Object.values(broadcastFallbackHandledByAgent)
+      .reduce((total, messages) => total + messages.length, 0);
+    const noBroadcastFallbackPass =
+      broadcastFallbackTranscriptVisible &&
+      broadcastFallbackHandledCount === 0 &&
+      remotes.every((remote) =>
+        broadcastFallbackInboxCounts[remote.agent.id] === 0 &&
+        broadcastFallbackPendingCounts[remote.agent.id] === 0 &&
+        broadcastFallbackRoutedCounts[remote.agent.id] === 1 &&
+        broadcastFallbackRunMessagesProcessed[remote.agent.id] === 0
+      );
+    roomEvidence.broadcastFallbackMessageId = broadcastFallbackProbe.message.id;
+    roomEvidence.broadcastFallbackHandledCount = broadcastFallbackHandledCount;
+    roomEvidence.broadcastFallbackInboxCounts = broadcastFallbackInboxCounts;
+    roomEvidence.broadcastFallbackPendingCounts = broadcastFallbackPendingCounts;
+    checks.push({
+      id: "no-broadcast-fallback-execution",
+      label: "mentions_only no broadcast fallback execution",
+      status: noBroadcastFallbackPass ? "pass" : "fail",
+      summary:
+        `message=${broadcastFallbackProbe.message.id}, ` +
+        `transcriptVisible=${broadcastFallbackTranscriptVisible}, handled=${broadcastFallbackHandledCount}`,
+      metadata: {
+        messageId: broadcastFallbackProbe.message.id,
+        transcriptVisible: broadcastFallbackTranscriptVisible,
+        handledCount: broadcastFallbackHandledCount,
+        handledByAgent: broadcastFallbackHandledByAgent,
+        inboxCounts: broadcastFallbackInboxCounts,
+        pendingRoutedCounts: broadcastFallbackPendingCounts,
+        routedMessageCounts: broadcastFallbackRoutedCounts,
+        runMessagesProcessed: broadcastFallbackRunMessagesProcessed,
+        runStopReasons: broadcastFallbackRunStopReasons,
+      },
+    });
+
+    for (const remote of remotes) {
+      const firstAck = remote.run?.acknowledgements[0];
+      remote.ackSigned = firstAck?.ackSignature?.startsWith("ed25519:") === true;
+      const agentDetail = await controlPlaneGetJson<{
+        agent?: { id?: string; heartbeatStatus?: string; lastHeartbeatAt?: string; heartbeatMetadata?: Record<string, unknown> };
+      }>(server.baseUrl, `/api/agents/${encodeURIComponent(remote.agent.id)}`, server.token);
+      remote.heartbeatStatus = agentDetail.agent?.heartbeatStatus;
+      remote.lastHeartbeatAt = agentDetail.agent?.lastHeartbeatAt;
+    }
+    checks.push({
+      id: "signed-ack-heartbeat",
+      label: "signed ack and heartbeat",
+      status: remotes.every((remote) => remote.ackSigned && Boolean(remote.lastHeartbeatAt)) ? "pass" : "fail",
+      summary: `signedAcks=${remotes.filter((remote) => remote.ackSigned).length}/${remotes.length}, heartbeats=${remotes.filter((remote) => remote.lastHeartbeatAt).length}/${remotes.length}`,
+      metadata: {
+        agents: remotes.map((remote) => ({
+          agentId: remote.agent.id,
+          lastDeliveredMessageId: remote.run?.acknowledgements[0]?.messageId,
+          heartbeatStatus: remote.heartbeatStatus,
+          messagesProcessed: remote.run?.messagesProcessed,
+        })),
+      },
+    });
+
+    const deliveryStatus = await controlPlaneGetJson<{
+      roomId?: string;
+      transcriptMessageCount?: number;
+      agents?: Array<{
+        agentId?: string;
+        memberStatus?: string;
+        role?: string;
+        routedMessageCount?: number;
+        pendingRoutedCount?: number;
+        lastRoutedMessageId?: string;
+        lastAckMessageId?: string;
+        lastAckSigned?: boolean;
+      }>;
+    }>(server.baseUrl, `/api/rooms/${encodeURIComponent(room.id)}/delivery-status`, server.token);
+    const deliveryStatusByAgent = new Map((deliveryStatus.agents ?? []).map((agent) => [agent.agentId, agent]));
+    const deliveryStatusAgentIds = remotes
+      .map((remote) => remote.agent.id)
+      .filter((agentId) => deliveryStatusByAgent.has(agentId))
+      .sort();
+    const deliveryStatusPendingCounts = Object.fromEntries(
+      remotes.map((remote) => [
+        remote.agent.id,
+        Number(deliveryStatusByAgent.get(remote.agent.id)?.pendingRoutedCount ?? -1),
+      ]),
+    );
+    const deliveryStatusAckMessageIds = remotes
+      .map((remote) => deliveryStatusByAgent.get(remote.agent.id)?.lastAckMessageId)
+      .filter((id): id is string => Boolean(id))
+      .sort();
+    const deliveryStatusPass =
+      deliveryStatus.roomId === room.id &&
+      remotes.every((remote) => {
+        const status = deliveryStatusByAgent.get(remote.agent.id);
+        return (
+          status?.memberStatus === "active" &&
+          status.routedMessageCount === 1 &&
+          status.pendingRoutedCount === 0 &&
+          status.lastRoutedMessageId === remote.task?.message.id &&
+          status.lastAckMessageId === remote.task?.message.id &&
+          status.lastAckSigned === true
+        );
+      });
+    roomEvidence.controlPlaneDeliveryStatusObserved = deliveryStatusPass;
+    roomEvidence.controlPlaneDeliveryStatusAgentIds = deliveryStatusAgentIds;
+    roomEvidence.controlPlaneDeliveryStatusPendingCounts = deliveryStatusPendingCounts;
+    roomEvidence.controlPlaneDeliveryStatusAckMessageIds = deliveryStatusAckMessageIds;
+    checks.push({
+      id: "room-delivery-status",
+      label: "room delivery status",
+      status: deliveryStatusPass ? "pass" : "fail",
+      summary:
+        `agents=${deliveryStatusAgentIds.length}/${remotes.length}, ` +
+        `pending=${Object.values(deliveryStatusPendingCounts).join("+")}, ` +
+        `acks=${deliveryStatusAckMessageIds.length}/${remotes.length}`,
+      metadata: {
+        agentCount: deliveryStatusAgentIds.length,
+        agentIds: deliveryStatusAgentIds,
+        pendingRoutedCounts: deliveryStatusPendingCounts,
+        ackMessageIds: deliveryStatusAckMessageIds,
+        transcriptMessageCount: deliveryStatus.transcriptMessageCount,
+      },
+    });
+
+    const eventStreamEvidence = await readPhaseFiveEventStream(eventStream, remotes.map((remote) => remote.agent.id), taskIds);
+    roomEvidence.controlPlaneEventStreamObserved =
+      eventStreamEvidence.connected &&
+      eventStreamEvidence.controlActionTypes.includes("control_plane.action") &&
+      eventStreamEvidence.missingAgentIds.length === 0 &&
+      eventStreamEvidence.roomMessageEventTypes.includes("room.message.sent") &&
+      eventStreamEvidence.missingRoomMessageIds.length === 0 &&
+      eventStreamEvidence.deliveryAckEventTypes.includes("room.delivery.acknowledged") &&
+      eventStreamEvidence.missingAckMessageIds.length === 0;
+    roomEvidence.controlPlaneEventStreamAgentIds = eventStreamEvidence.agentIds;
+    roomEvidence.controlPlaneRoomMessageEventObserved =
+      eventStreamEvidence.roomMessageEventTypes.includes("room.message.sent") &&
+      eventStreamEvidence.missingRoomMessageIds.length === 0;
+    roomEvidence.controlPlaneEventStreamRoomMessageIds = eventStreamEvidence.roomMessageIds;
+    roomEvidence.controlPlaneDeliveryAckEventObserved =
+      eventStreamEvidence.deliveryAckEventTypes.includes("room.delivery.acknowledged") &&
+      eventStreamEvidence.missingAckMessageIds.length === 0;
+    roomEvidence.controlPlaneEventStreamAckMessageIds = eventStreamEvidence.ackMessageIds;
+    checks.push({
+      id: "control-plane-event-stream",
+      label: "control-plane event stream",
+      status: roomEvidence.controlPlaneEventStreamObserved ? "pass" : "fail",
+      summary:
+        `connected=${eventStreamEvidence.connected}, controlActions=${eventStreamEvidence.eventCount}, ` +
+        `agents=${remotes.length - eventStreamEvidence.missingAgentIds.length}/${remotes.length} ` +
+        `(observed=${eventStreamEvidence.agentIds.length}), ` +
+        `roomMessages=${taskIds.length - eventStreamEvidence.missingRoomMessageIds.length}/${taskIds.length} ` +
+        `(observed=${eventStreamEvidence.roomMessageIds.length}), ` +
+        `acks=${taskIds.length - eventStreamEvidence.missingAckMessageIds.length}/${taskIds.length} ` +
+        `(observed=${eventStreamEvidence.ackMessageIds.length})`,
+      metadata: {
+        controlActionTypes: eventStreamEvidence.controlActionTypes,
+        controlActionSummaries: eventStreamEvidence.controlActionSummaries,
+        roomMessageEventTypes: eventStreamEvidence.roomMessageEventTypes,
+        roomMessageIds: eventStreamEvidence.roomMessageIds,
+        missingRoomMessageIds: eventStreamEvidence.missingRoomMessageIds,
+        deliveryAckEventTypes: eventStreamEvidence.deliveryAckEventTypes,
+        ackMessageIds: eventStreamEvidence.ackMessageIds,
+        missingAckMessageIds: eventStreamEvidence.missingAckMessageIds,
+        agentIds: eventStreamEvidence.agentIds,
+        missingAgentIds: eventStreamEvidence.missingAgentIds,
+      },
+    });
+
+    const staleWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-stale-"));
+    remoteWorkspaces.push(staleWorkspace);
+    const stalePlatform = await createLocalPlatform(staleWorkspace, { provider: "mock", workspaceSnapshot: false });
+    remotePlatforms.push(stalePlatform);
+    await controlPlaneJson<{ agent: { id: string } }>(server.baseUrl, "/api/agents/register", server.token, {
+      actor: `agent:${stalePlatform.localAgent.id}`,
+      agentId: stalePlatform.localAgent.id,
+      machineId: stalePlatform.localAgent.machineId,
+      displayName: stalePlatform.localAgent.displayName,
+      publicKeyPem: stalePlatform.localAgent.publicKeyPem,
+      fingerprint: stalePlatform.localAgent.fingerprint,
+      capabilities: stalePlatform.localAgent.capabilities,
+      allowedProjects: stalePlatform.localAgent.allowedProjects,
+    });
+    await controlPlaneJson<{ member: { actor: { id: string }; role: string; status: string; aliases?: string[] } }>(
+      server.baseUrl,
+      `/api/rooms/${encodeURIComponent(room.id)}/join-invite`,
+      server.token,
+      {
+        actor: `agent:${stalePlatform.localAgent.id}`,
+        token: staleInvite.token,
+        aliases: ["stale-phase5"],
+      },
+    );
+    const staleHeartbeatAt = new Date(Date.now() - 120_000).toISOString();
+    const staleHeartbeatExpiresAt = new Date(Date.now() - 60_000).toISOString();
+    const staleActor = {
+      type: "agent" as const,
+      id: stalePlatform.localAgent.id,
+      displayName: stalePlatform.localAgent.displayName,
+    };
+    const staleHeartbeatUnsigned: Omit<AgentHeartbeatEnvelope, "signature"> = {
+      version: 1,
+      agentId: stalePlatform.localAgent.id as AgentHeartbeatEnvelope["agentId"],
+      machineId: stalePlatform.localAgent.machineId as AgentHeartbeatEnvelope["machineId"],
+      status: "online",
+      roomId: room.id as AgentHeartbeatEnvelope["roomId"],
+      heartbeatAt: staleHeartbeatAt,
+      expiresAt: staleHeartbeatExpiresAt,
+      heartbeatBy: staleActor,
+      nonce: randomUUID(),
+    };
+    const staleHeartbeatSignature = await stalePlatform.identity.signAgentHeartbeatEnvelope(staleHeartbeatUnsigned);
+    if (!staleHeartbeatSignature) {
+      throw new Error("Failed to sign Phase 5 stale agent heartbeat envelope.");
+    }
+    await controlPlaneJson<{ agent: { id: string; heartbeatStatus?: string; heartbeatExpiresAt?: string } }>(
+      server.baseUrl,
+      `/api/agents/${encodeURIComponent(stalePlatform.localAgent.id)}/heartbeat`,
+      server.token,
+      {
+        actor: `agent:${stalePlatform.localAgent.id}`,
+        status: "online",
+        roomId: room.id,
+        heartbeatEnvelope: { ...staleHeartbeatUnsigned, signature: staleHeartbeatSignature },
+      },
+    );
+    const staleHealthNow = new Date().toISOString();
+    const staleHealth = await controlPlaneGetJson<{
+      health?: {
+        perAgent?: Array<{
+          agentId: string;
+          heartbeatStatus?: string;
+          healthState?: string;
+          heartbeatExpired?: boolean;
+          responsive?: boolean;
+          lastRoomId?: string;
+          heartbeatExpiresAt?: string;
+        }>;
+      };
+    }>(
+      server.baseUrl,
+      `/api/agents/health?now=${encodeURIComponent(staleHealthNow)}&limit=1000`,
+      server.token,
+    );
+    const staleAgentHealth = staleHealth.health?.perAgent?.find((agent) => agent.agentId === stalePlatform.localAgent.id);
+    const staleAgentDetected =
+      staleAgentHealth?.heartbeatStatus === "online" &&
+      staleAgentHealth.healthState === "stale" &&
+      staleAgentHealth.heartbeatExpired === true &&
+      staleAgentHealth.responsive === false &&
+      staleAgentHealth.lastRoomId === room.id;
+    roomEvidence.staleAgentId = stalePlatform.localAgent.id;
+    roomEvidence.staleAgentDetected = staleAgentDetected;
+    checks.push({
+      id: "stale-agent-health-detected",
+      label: "stale agent health detected",
+      status: staleAgentDetected ? "pass" : "fail",
+      summary:
+        `healthState=${staleAgentHealth?.healthState ?? "-"}, ` +
+        `expired=${staleAgentHealth?.heartbeatExpired === true}, responsive=${staleAgentHealth?.responsive === true}`,
+      metadata: {
+        agentId: stalePlatform.localAgent.id,
+        heartbeatStatus: staleAgentHealth?.heartbeatStatus,
+        healthState: staleAgentHealth?.healthState,
+        heartbeatExpired: staleAgentHealth?.heartbeatExpired,
+        responsive: staleAgentHealth?.responsive,
+        lastRoomId: staleAgentHealth?.lastRoomId,
+        heartbeatExpiresAt: staleAgentHealth?.heartbeatExpiresAt,
+      },
+    });
+
+    const staleRecovery = await controlPlaneJson<{
+      recovery?: {
+        kind?: string;
+        summary?: { recovered?: number; stale?: number; skipped?: number };
+        recovered?: Array<{
+          agentId?: string;
+          roomId?: string;
+          memberStatusAfter?: string;
+          heartbeatStatusAfter?: string;
+          heartbeatExpired?: boolean;
+        }>;
+      };
+    }>(server.baseUrl, "/api/agents/recover-stale", server.token, {
+      actor: `agent:${owner.id}`,
+      now: staleHealthNow,
+      limit: 1000,
+    });
+    const recoveredStaleAgent = staleRecovery.recovery?.recovered?.find((agent) => agent.agentId === stalePlatform.localAgent.id);
+    const staleRecoveryHealth = await controlPlaneGetJson<{
+      health?: {
+        perAgent?: Array<{
+          agentId: string;
+          heartbeatStatus?: string;
+          healthState?: string;
+          responsive?: boolean;
+        }>;
+      };
+    }>(
+      server.baseUrl,
+      `/api/agents/health?now=${encodeURIComponent(staleHealthNow)}&limit=1000`,
+      server.token,
+    );
+    const staleAgentHealthAfter = staleRecoveryHealth.health?.perAgent?.find((agent) => agent.agentId === stalePlatform.localAgent.id);
+    const staleRecoveryRoomDetail = await controlPlaneGetJson<{
+      members?: Array<{ actor: { type: string; id: string }; status: string }>;
+    }>(server.baseUrl, `/api/rooms/${encodeURIComponent(room.id)}`, server.token);
+    const staleRecoveredMember = staleRecoveryRoomDetail.members?.find((member) => member.actor.type === "agent" && member.actor.id === stalePlatform.localAgent.id);
+    const staleAgentRecovered =
+      staleRecovery.recovery?.kind === "soloclaw.agent_stale_recovery" &&
+      recoveredStaleAgent?.memberStatusAfter === "suspended" &&
+      recoveredStaleAgent.heartbeatStatusAfter === "offline" &&
+      staleRecoveredMember?.status === "suspended" &&
+      staleAgentHealthAfter?.heartbeatStatus === "offline" &&
+      staleAgentHealthAfter.healthState === "offline" &&
+      staleAgentHealthAfter.responsive === false;
+    roomEvidence.staleAgentRecovered = staleAgentRecovered;
+    checks.push({
+      id: "stale-agent-recovery",
+      label: "stale agent recovery",
+      status: staleAgentRecovered ? "pass" : "fail",
+      summary:
+        `recovered=${staleRecovery.recovery?.summary?.recovered ?? 0}, ` +
+        `member=${staleRecoveredMember?.status ?? "-"}, health=${staleAgentHealthAfter?.healthState ?? "-"}`,
+      metadata: {
+        agentId: stalePlatform.localAgent.id,
+        recoveryKind: staleRecovery.recovery?.kind,
+        recoveredCount: staleRecovery.recovery?.summary?.recovered,
+        skippedCount: staleRecovery.recovery?.summary?.skipped,
+        memberStatusAfter: staleRecoveredMember?.status,
+        heartbeatStatusAfter: staleAgentHealthAfter?.heartbeatStatus,
+        healthStateAfter: staleAgentHealthAfter?.healthState,
+        responsiveAfter: staleAgentHealthAfter?.responsive,
+      },
+    });
+
+    const roomDetail = await controlPlaneGetJson<{
+      messages?: Array<{ id: string; sender: { type: string; id: string }; kind: string; body: string; metadata?: Record<string, unknown>; signature?: string }>;
+    }>(server.baseUrl, `/api/rooms/${encodeURIComponent(room.id)}`, server.token);
+    for (const remote of remotes) {
+      remote.reply = roomDetail.messages?.find((message) =>
+        message.sender.type === "agent" &&
+        message.sender.id === remote.agent.id &&
+        message.body.includes(`phase5 handled ${remote.task?.message.id}`)
+      );
+    }
+    roomEvidence.replyMessageId = remotes[0]?.reply?.id;
+    roomEvidence.replyMessageIds = remotes.map((remote) => remote.reply?.id).filter((id): id is string => Boolean(id));
+    checks.push({
+      id: "signed-template-reply",
+      label: "signed template reply",
+      status: remotes.every((remote) => remote.reply?.metadata?.remoteIntentSignatureStatus === "valid") ? "pass" : "fail",
+      summary: `validReplies=${remotes.filter((remote) => remote.reply?.metadata?.remoteIntentSignatureStatus === "valid").length}/${remotes.length}`,
+      metadata: {
+        transcriptMessages: roomDetail.messages?.length ?? 0,
+        replies: remotes.map((remote) => ({
+          agentId: remote.agent.id,
+          replyId: remote.reply?.id,
+          replyKind: remote.reply?.kind,
+          remoteIntentSignatureStatus: remote.reply?.metadata?.remoteIntentSignatureStatus,
+        })),
+      },
+    });
+
+    const assignment = await runPhaseFiveRoomAssignmentResult({
+      workspace: controlWorkspace,
+      server,
+      roomId: room.id,
+      actor: owner,
+      targetAgentId: remotes[0]?.agent.id,
+    });
+    roomEvidence.roomAssignmentTargetAgentId = assignment.targetAgentId;
+    roomEvidence.roomAssignmentSubtaskId = assignment.subtaskId;
+    roomEvidence.roomAssignmentChildSessionId = assignment.childSessionId;
+    roomEvidence.roomAssignmentMessageId = assignment.assignmentMessageId;
+    roomEvidence.roomAssignmentResultMessageId = assignment.resultMessageId;
+    checks.push({
+      id: "room-assignment-result",
+      label: "room assignment/result evidence",
+      status: assignment.pass ? "pass" : "fail",
+      summary:
+        `target=${assignment.targetAgentId ?? "-"}, ` +
+        `subtask=${assignment.subtaskId ?? "-"}, result=${assignment.resultStatus ?? "-"}`,
+      metadata: {
+        targetAgentId: assignment.targetAgentId,
+        subtaskId: assignment.subtaskId,
+        childSessionId: assignment.childSessionId,
+        assignmentMessageId: assignment.assignmentMessageId,
+        resultMessageId: assignment.resultMessageId,
+        resultStatus: assignment.resultStatus,
+        assignedAgentIdMatches: assignment.assignedAgentIdMatches,
+        assignmentMessageVisible: assignment.assignmentMessageVisible,
+        resultMessageVisible: assignment.resultMessageVisible,
+        assignmentTranscriptKind: assignment.assignmentTranscriptKind,
+        resultTranscriptKind: assignment.resultTranscriptKind,
+      },
+    });
+
+    const exchange = await runPhaseFiveAgentExchange({
+      server,
+      roomId: room.id,
+      sender: remotes[0],
+      receiver: remotes[1],
+    });
+    roomEvidence.agentExchangeMessageId = exchange.messageId;
+    roomEvidence.agentExchangeReplyMessageId = exchange.replyMessageId;
+    roomEvidence.agentExchangeSenderId = exchange.senderId;
+    roomEvidence.agentExchangeReceiverId = exchange.receiverId;
+    checks.push({
+      id: "agent-to-agent-exchange",
+      label: "agent-to-agent room exchange",
+      status: exchange.pass ? "pass" : "fail",
+      summary:
+        `sender=${exchange.senderId ?? "-"}, receiver=${exchange.receiverId ?? "-"}, ` +
+        `receiverHandled=${exchange.receiverHandledMessages.length}, senderHandledReplies=${exchange.senderHandledReplyMessages.length}`,
+      metadata: {
+        messageId: exchange.messageId,
+        replyMessageId: exchange.replyMessageId,
+        senderId: exchange.senderId,
+        receiverId: exchange.receiverId,
+        receiverHandledMessages: exchange.receiverHandledMessages,
+        senderHandledReplyMessages: exchange.senderHandledReplyMessages,
+        messageSignatureStatus: exchange.messageSignatureStatus,
+        replySignatureStatus: exchange.replySignatureStatus,
+        receiverAckSigned: exchange.receiverAckSigned,
+        senderAckSigned: exchange.senderAckSigned,
+      },
+    });
+
+    const handoff = await runPhaseFiveRoomHandoff({
+      server,
+      roomId: room.id,
+      source: remotes[0],
+      target: remotes[1],
+    });
+    roomEvidence.roomHandoffId = handoff.handoffId;
+    roomEvidence.roomHandoffSourceAgentId = handoff.sourceAgentId;
+    roomEvidence.roomHandoffTargetAgentId = handoff.targetAgentId;
+    roomEvidence.roomHandoffMessageId = handoff.handoffMessageId;
+    roomEvidence.roomHandoffAcceptanceMessageId = handoff.acceptanceMessageId;
+    roomEvidence.roomHandoffResultMessageId = handoff.resultMessageId;
+    checks.push({
+      id: "room-handoff",
+      label: "remote-to-remote room handoff",
+      status: handoff.pass ? "pass" : "fail",
+      summary:
+        `source=${handoff.sourceAgentId ?? "-"}, target=${handoff.targetAgentId ?? "-"}, ` +
+        `accepted=${handoff.handoffAccepted}, completed=${handoff.handoffCompleted}`,
+      metadata: {
+        handoffId: handoff.handoffId,
+        sourceAgentId: handoff.sourceAgentId,
+        targetAgentId: handoff.targetAgentId,
+        handoffMessageId: handoff.handoffMessageId,
+        acceptanceMessageId: handoff.acceptanceMessageId,
+        resultMessageId: handoff.resultMessageId,
+        resultStatus: handoff.resultStatus,
+        handoffMessageVisible: handoff.handoffMessageVisible,
+        acceptanceMessageVisible: handoff.acceptanceMessageVisible,
+        resultMessageVisible: handoff.resultMessageVisible,
+        handoffAccepted: handoff.handoffAccepted,
+        handoffCompleted: handoff.handoffCompleted,
+        targetHandledMessages: handoff.targetHandledMessages,
+        sourceHandledMessages: handoff.sourceHandledMessages,
+        requestSignatureStatus: handoff.requestSignatureStatus,
+        acceptanceSignatureStatus: handoff.acceptanceSignatureStatus,
+        resultSignatureStatus: handoff.resultSignatureStatus,
+        targetAckSigned: handoff.targetAckSigned,
+        sourceAckSigned: handoff.sourceAckSigned,
+      },
+    });
+
+    const conflictResolution = await runPhaseFiveRoomConflictResolution({
+      server,
+      roomId: room.id,
+      owner,
+      primary: remotes[0],
+      conflicting: remotes[1],
+    });
+    roomEvidence.roomConflictResultKey = conflictResolution.resultKey;
+    roomEvidence.roomConflictPrimaryAgentId = conflictResolution.primaryAgentId;
+    roomEvidence.roomConflictSecondaryAgentId = conflictResolution.conflictingAgentId;
+    roomEvidence.roomConflictPrimaryMessageId = conflictResolution.primaryMessageId;
+    roomEvidence.roomConflictSecondaryMessageId = conflictResolution.conflictingMessageId;
+    roomEvidence.roomConflictResolutionMessageId = conflictResolution.resolutionMessageId;
+    roomEvidence.roomConflictWinningAgentId = conflictResolution.winningAgentId;
+    checks.push({
+      id: "room-conflict-resolution",
+      label: "room conflict resolution evidence",
+      status: conflictResolution.pass ? "pass" : "fail",
+      summary:
+        `resultKey=${conflictResolution.resultKey ?? "-"}, winner=${conflictResolution.winningAgentId ?? "-"}, ` +
+        `status=${conflictResolution.resolutionStatus ?? "-"}`,
+      metadata: {
+        resultKey: conflictResolution.resultKey,
+        primaryAgentId: conflictResolution.primaryAgentId,
+        conflictingAgentId: conflictResolution.conflictingAgentId,
+        primaryMessageId: conflictResolution.primaryMessageId,
+        conflictingMessageId: conflictResolution.conflictingMessageId,
+        resolutionMessageId: conflictResolution.resolutionMessageId,
+        winningAgentId: conflictResolution.winningAgentId,
+        conflictDetected: conflictResolution.conflictDetected,
+        resolutionRecorded: conflictResolution.resolutionRecorded,
+        resolutionStatus: conflictResolution.resolutionStatus,
+        primarySignatureStatus: conflictResolution.primarySignatureStatus,
+        conflictingSignatureStatus: conflictResolution.conflictingSignatureStatus,
+      },
+    });
+
+    const resultSync = await runPhaseFiveRoomResultSync({
+      workspace: controlWorkspace,
+      server,
+      roomId: room.id,
+      actor: owner,
+      target: remotes[1],
+    });
+    roomEvidence.roomResultSyncAgentId = resultSync.agentId;
+    roomEvidence.roomResultSyncArtifactId = resultSync.artifactId;
+    roomEvidence.roomResultSyncArtifactMessageId = resultSync.artifactMessageId;
+    roomEvidence.roomResultSyncArtifactSha256 = resultSync.artifactSha256;
+    roomEvidence.roomResultSyncArtifactSizeBytes = resultSync.artifactSizeBytes;
+    checks.push({
+      id: "room-result-sync",
+      label: "room result sync evidence",
+      status: resultSync.pass ? "pass" : "fail",
+      summary:
+        `agent=${resultSync.agentId ?? "-"}, artifact=${resultSync.artifactId ?? "-"}, ` +
+        `message=${resultSync.artifactMessageId ?? "-"}`,
+      metadata: {
+        agentId: resultSync.agentId,
+        artifactId: resultSync.artifactId,
+        artifactKind: resultSync.artifactKind,
+        artifactName: resultSync.artifactName,
+        artifactRoomId: resultSync.artifactRoomId,
+        artifactStatus: resultSync.artifactStatus,
+        artifactSha256: resultSync.artifactSha256,
+        artifactSizeBytes: resultSync.artifactSizeBytes,
+        artifactRegistered: resultSync.artifactRegistered,
+        artifactMessageId: resultSync.artifactMessageId,
+        artifactMessageVisible: resultSync.artifactMessageVisible,
+        artifactTranscriptKind: resultSync.artifactTranscriptKind,
+      },
+    });
+
+    const operatorVisibility = await verifyPhaseFiveOperatorVisibility({
+      server,
+      roomId: room.id,
+      expectedMessageIds: [
+        ...taskIds,
+        broadcastFallbackProbe.message.id,
+        ...remotes.map((remote) => remote.reply?.id).filter((id): id is string => Boolean(id)),
+        keyRotation.newMessageId,
+        assignment.assignmentMessageId,
+        assignment.resultMessageId,
+        exchange.messageId,
+        exchange.replyMessageId,
+        handoff.handoffMessageId,
+        handoff.acceptanceMessageId,
+        handoff.resultMessageId,
+        conflictResolution.primaryMessageId,
+        conflictResolution.conflictingMessageId,
+        conflictResolution.resolutionMessageId,
+        resultSync.artifactMessageId,
+      ].filter((id): id is string => Boolean(id)),
+      remoteAgentIds: remotes.map((remote) => remote.agent.id),
+    });
+    checks.push({
+      id: "operator-room-visibility",
+      label: "operator room transcript and agent health visibility",
+      status: operatorVisibility.pass ? "pass" : "fail",
+      summary:
+        `transcript=${operatorVisibility.transcriptMessageIds.length}, ` +
+        `stateRoom=${operatorVisibility.stateRoomVisible}, ` +
+        `health=${operatorVisibility.responsiveHealthAgentIds.length}/${remotes.length}, ` +
+        `delivery=${remotes.length - operatorVisibility.missingDeliveryStatusAgentIds.length}/${remotes.length}`,
+      metadata: {
+        expectedMessageIds: operatorVisibility.expectedMessageIds,
+        missingTranscriptMessageIds: operatorVisibility.missingTranscriptMessageIds,
+        missingStateMessageIds: operatorVisibility.missingStateMessageIds,
+        remoteAgentIds: remotes.map((remote) => remote.agent.id),
+        healthAgentIds: operatorVisibility.healthAgentIds,
+        responsiveHealthAgentIds: operatorVisibility.responsiveHealthAgentIds,
+        roomHealthAgentIds: operatorVisibility.roomHealthAgentIds,
+        deliveryStatusAgentIds: operatorVisibility.deliveryStatusAgentIds,
+        missingDeliveryStatusAgentIds: operatorVisibility.missingDeliveryStatusAgentIds,
+        deliveryStatusPendingCounts: operatorVisibility.deliveryStatusPendingCounts,
+        deliveryStatusAckMessageIds: operatorVisibility.deliveryStatusAckMessageIds,
+      },
+    });
+
+    const stopFileShutdown = await runPhaseFiveStopFileShutdown({
+      roomId: room.id,
+      server,
+      target: remotes[0],
+    });
+    roomEvidence.stopFileShutdownAgentId = stopFileShutdown.agentId;
+    roomEvidence.stopFileShutdownReason = stopFileShutdown.runnerStopReason;
+    roomEvidence.stopFileShutdownStatusFileObserved = stopFileShutdown.runnerStatusFileObserved;
+    checks.push({
+      id: "runner-stop-file-shutdown",
+      label: "runner stop-file shutdown",
+      status: stopFileShutdown.pass ? "pass" : "fail",
+      summary:
+        `agent=${stopFileShutdown.agentId ?? "-"}, stop=${stopFileShutdown.runnerStopReason ?? "-"}, ` +
+        `statusFile=${stopFileShutdown.runnerStatusFileObserved}`,
+      metadata: {
+        agentId: stopFileShutdown.agentId,
+        stopFile: stopFileShutdown.stopFile,
+        runnerStatusFile: stopFileShutdown.runnerStatusFile,
+        runnerStatusKind: stopFileShutdown.runnerStatusKind,
+        runnerStatus: stopFileShutdown.runnerStatus,
+        runnerStopReason: stopFileShutdown.runnerStopReason,
+        runnerStatusFileObserved: stopFileShutdown.runnerStatusFileObserved,
+      },
+    });
+
+    const secretMatches = countSecretShapes({
+      phase: "phase5",
+      room: roomEvidence,
+      checks,
+      evidence: { controlPlane: "local-http", remoteWorkspace: "separate-local-workspaces", cleanup: true },
+    });
+    checks.push({
+      id: "secret-shape-scan",
+      label: "secret shape scan",
+      status: secretMatches === 0 ? "pass" : "fail",
+      summary: `secretMatches=${secretMatches}`,
+    });
+
+    return {
+      phase: "phase5",
+      status: checks.some((check) => check.status === "fail") ? "fail" : "pass",
+      workspace: options.workspace,
+      generatedAt: new Date().toISOString(),
+      room: roomEvidence,
+      checks,
+      evidence: {
+        controlPlane: "local-http",
+        remoteWorkspace: "separate-local-workspaces",
+        cleanup: true,
+      },
+    };
+  } finally {
+    await eventStream?.close();
+    await server?.close();
+    for (const remotePlatform of remotePlatforms) {
+      await closePhaseFivePlatform(remotePlatform);
+    }
+    if (setupPlatform) {
+      await closePhaseFivePlatform(setupPlatform);
+    }
+    await fs.rm(controlWorkspace, { recursive: true, force: true });
+    for (const remoteWorkspace of remoteWorkspaces) {
+      await fs.rm(remoteWorkspace, { recursive: true, force: true });
+    }
+  }
+}
+
+async function runPhaseFiveRegisteredAgentPullCommunication(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  owner: ActorRef;
+  remoteWorkspaces: string[];
+  remotePlatforms: Array<Awaited<ReturnType<typeof createLocalPlatform>>>;
+}): Promise<PhaseFiveRegisteredAgentPullResult> {
+  const pulledWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-pulled-"));
+  input.remoteWorkspaces.push(pulledWorkspace);
+  const platform = await createLocalPlatform(pulledWorkspace, { provider: "mock", workspaceSnapshot: false });
+  input.remotePlatforms.push(platform);
+  const agent = platform.localAgent;
+  const alias = "pulled-phase5";
+
+  const registration = await controlPlaneJson<{
+    agent?: { id?: string; trustStatus?: string; displayName?: string };
+  }>(input.server.baseUrl, "/api/agents/register", input.server.token, {
+    actor: `agent:${agent.id}`,
+    agentId: agent.id,
+    machineId: agent.machineId,
+    displayName: agent.displayName,
+    publicKeyPem: agent.publicKeyPem,
+    fingerprint: agent.fingerprint,
+    capabilities: agent.capabilities,
+    allowedProjects: agent.allowedProjects,
+  });
+  const registered =
+    registration.agent?.id === agent.id &&
+    registration.agent.trustStatus !== "revoked" &&
+    registration.agent.trustStatus !== "suspended" &&
+    registration.agent.trustStatus !== "expired";
+
+  const invitation = await controlPlaneJson<{
+    member?: { actor?: { id?: string }; role?: string; status?: string; aliases?: string[] };
+  }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/members/${encodeURIComponent(agent.id)}/invite`,
+    input.server.token,
+    {
+      actor: `agent:${input.owner.id}`,
+      role: "executor",
+      aliases: [alias],
+    },
+  );
+  const invitations = await controlPlaneGetJson<{
+    invitations?: Array<{
+      room?: { id?: string };
+      member?: { status?: string; role?: string; aliases?: string[] };
+    }>;
+  }>(
+    input.server.baseUrl,
+    `/api/agents/${encodeURIComponent(agent.id)}/room-invitations`,
+    input.server.token,
+  );
+  const listedInvitation = invitations.invitations?.find((candidate) => candidate.room?.id === input.roomId);
+  const invitationListed =
+    invitation.member?.status === "invited" &&
+    listedInvitation?.member?.status === "invited" &&
+    listedInvitation.member.role === "executor" &&
+    listedInvitation.member.aliases?.includes(alias) === true;
+
+  const acceptedInvitation = await controlPlaneJson<{
+    member?: { actor?: { id?: string }; role?: string; status?: string; aliases?: string[] };
+  }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/members/${encodeURIComponent(agent.id)}/accept-invitation`,
+    input.server.token,
+    {
+      actor: `agent:${agent.id}`,
+    },
+  );
+  const accepted =
+    acceptedInvitation.member?.actor?.id === agent.id &&
+    acceptedInvitation.member.status === "active" &&
+    acceptedInvitation.member.role === "executor";
+
+  const task = await controlPlaneJson<{ message: { id: string; body: string; signature?: string } }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/messages`,
+    input.server.token,
+    {
+      actor: `agent:${input.owner.id}`,
+      kind: "task",
+      body: `@agent:${agent.id} phase5 pulled-agent communication probe`,
+    },
+  );
+
+  const runner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: platform.identity,
+    localAgent: agent,
+  });
+  const handledMessages: string[] = [];
+  const run = await runner.run({
+    maxCycles: 2,
+    maxMessagesPerPoll: 2,
+    maxIdlePolls: 1,
+    idleIntervalMs: 0,
+    intervalMs: 0,
+    stopWhenIdle: true,
+    maxIdleCycles: 1,
+    baseBackoffMs: 0,
+    maxBackoffMs: 0,
+    maxErrors: 1,
+    heartbeatTtlSeconds: 30,
+    onMessage: async (message) => {
+      handledMessages.push(message.id);
+      await runner.say({
+        kind: "chat",
+        body: formatRemoteReplyTemplate(`@agent:${input.owner.id} phase5 pulled-agent handled {messageId} by {agentId}`, message, {
+          roomId: input.roomId,
+          agentId: agent.id,
+        }),
+      });
+    },
+  });
+  const taskAck = run.acknowledgements.find((ack) => ack.messageId === task.message.id);
+  const ackSigned = taskAck?.ackSignature?.startsWith("ed25519:") === true;
+
+  const roomDetail = await controlPlaneGetJson<{
+    messages?: Array<{ id?: string; sender?: { type?: string; id?: string }; body?: string; metadata?: Record<string, unknown> }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const reply = roomDetail.messages?.find((message) =>
+    message.sender?.type === "agent" &&
+    message.sender.id === agent.id &&
+    typeof message.body === "string" &&
+    message.body.includes(`phase5 pulled-agent handled ${task.message.id}`)
+  );
+  const agentDetail = await controlPlaneGetJson<{
+    agent?: { id?: string; heartbeatStatus?: string; lastRoomId?: string };
+  }>(input.server.baseUrl, `/api/agents/${encodeURIComponent(agent.id)}`, input.server.token);
+  const heartbeatStatus = agentDetail.agent?.heartbeatStatus;
+  const replySignatureStatus = reply?.metadata?.remoteIntentSignatureStatus;
+  const pass =
+    registered &&
+    invitationListed &&
+    accepted &&
+    handledMessages.length === 1 &&
+    handledMessages[0] === task.message.id &&
+    run.messagesProcessed === 1 &&
+    ackSigned &&
+    replySignatureStatus === "valid" &&
+    heartbeatStatus === "idle" &&
+    agentDetail.agent?.lastRoomId === input.roomId &&
+    run.stopReason === "idle";
+
+  return {
+    pass,
+    agentId: agent.id,
+    registered,
+    invitationListed,
+    accepted,
+    role: acceptedInvitation.member?.role,
+    aliases: acceptedInvitation.member?.aliases,
+    taskMessageId: task.message.id,
+    replyMessageId: reply?.id,
+    handledMessages,
+    messagesProcessed: run.messagesProcessed,
+    ackSigned,
+    replySignatureStatus,
+    heartbeatStatus,
+    runStopReason: run.stopReason,
+  };
+}
+
+async function runPhaseFiveOneFileBootstrap(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  invite: Awaited<ReturnType<Awaited<ReturnType<typeof createLocalPlatform>>["rooms"]["createInvite"]>>;
+  inviteSignatureStatus: string;
+  remoteWorkspaces: string[];
+  remotePlatforms: Array<Awaited<ReturnType<typeof createLocalPlatform>>>;
+}): Promise<PhaseFiveOneFileBootstrapResult> {
+  const bootstrapWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-bootstrap-"));
+  input.remoteWorkspaces.push(bootstrapWorkspace);
+  const bundle = buildRemoteInviteBundle({
+    controlUrl: input.server.baseUrl,
+    controlToken: input.server.token,
+    roomId: input.roomId,
+    inviteToken: input.invite.token,
+    inviteId: input.invite.invite.id,
+    inviteSignatureStatus: input.inviteSignatureStatus,
+    role: input.invite.invite.role,
+    aliases: ["bootstrap-phase5"],
+    displayName: "Phase 5 Bootstrap Agent",
+    expiresAt: input.invite.invite.expiresAt,
+    maxUses: input.invite.invite.maxUses,
+  });
+  const bundlePath = path.join(bootstrapWorkspace, "room-invite.json");
+  await fs.writeFile(bundlePath, `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
+  const parsedBundle = await readRemoteInviteBundle(bundlePath);
+
+  const platform = await createLocalPlatform(bootstrapWorkspace, { provider: "mock", workspaceSnapshot: false });
+  input.remotePlatforms.push(platform);
+  const { identity, localAgent } = platform;
+  const actor = `agent:${localAgent.id}`;
+  const registration = await controlPlaneJson<{ agent: { id: string } }>(input.server.baseUrl, "/api/agents/register", input.server.token, {
+    actor,
+    agentId: localAgent.id,
+    machineId: localAgent.machineId,
+    orgId: localAgent.orgId,
+    displayName: parsedBundle.displayName ?? localAgent.displayName,
+    publicKeyPem: localAgent.publicKeyPem,
+    fingerprint: localAgent.fingerprint,
+    capabilities: localAgent.capabilities,
+    allowedProjects: localAgent.allowedProjects,
+  });
+  const join = await controlPlaneJson<{ member: { actor: { id: string }; status: string; aliases?: string[] } }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/join-invite`,
+    input.server.token,
+    {
+      actor,
+      token: parsedBundle.inviteToken,
+      aliases: parsedBundle.aliases ?? [],
+    },
+  );
+  const runner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity,
+    localAgent,
+  });
+  await runner.heartbeat({
+    status: "online",
+    ttlSeconds: parsedBundle.defaultRun?.heartbeatTtlSeconds ?? 60,
+  });
+  const statusFilePath = ".agent/tmp/phase5-bootstrap-room-status.json";
+  const statusReporter = createRemoteRunnerStatusReporter({
+    cwd: bootstrapWorkspace,
+    statusFilePath,
+    roomId: input.roomId,
+    agentId: localAgent.id,
+    machineId: localAgent.machineId,
+  });
+  await statusReporter.write({ status: "starting", messagesProcessed: 0, errorCount: 0 });
+  const run = await runner.run({
+    maxCycles: 1,
+    maxMessagesPerPoll: 1,
+    maxIdlePolls: 1,
+    idleIntervalMs: 0,
+    intervalMs: 0,
+    stopWhenIdle: true,
+    maxIdleCycles: 1,
+    baseBackoffMs: 1,
+    maxBackoffMs: 1,
+    maxErrors: 1,
+    heartbeatTtlSeconds: parsedBundle.defaultRun?.heartbeatTtlSeconds ?? 60,
+    onPoll: async (poll) => {
+      await statusReporter.recordPoll(poll);
+    },
+    onError: async (error, cycle) => {
+      await statusReporter.recordError(error, cycle);
+    },
+  });
+  await statusReporter.recordStop(run);
+
+  const statusFile = JSON.parse(await fs.readFile(path.resolve(bootstrapWorkspace, statusFilePath), "utf8")) as unknown;
+  const statusRecord = isRecord(statusFile) ? statusFile : {};
+  const lastHeartbeat = isRecord(statusRecord.lastHeartbeat) ? statusRecord.lastHeartbeat : {};
+  const runnerStatusFileObserved =
+    statusRecord.kind === "soloclaw.remote_room_runner_status" &&
+    statusRecord.agentId === localAgent.id &&
+    statusRecord.roomId === input.roomId;
+  const runnerStopReason = optionalNonEmptyString(statusRecord.stopReason);
+  const runnerLastHeartbeatStatus = optionalNonEmptyString(lastHeartbeat.status);
+  const joined = registration.agent.id === localAgent.id &&
+    join.member.actor.id === localAgent.id &&
+    join.member.status === "active";
+  return {
+    pass:
+      parsedBundle.kind === "soloclaw.room_invite" &&
+      parsedBundle.inviteSignatureStatus === "valid" &&
+      joined &&
+      runnerStatusFileObserved &&
+      run.stopReason === "idle" &&
+      runnerStopReason === "idle" &&
+      runnerLastHeartbeatStatus === "idle",
+    agentId: localAgent.id,
+    bundleKind: parsedBundle.kind,
+    joined,
+    runnerStatusFileObserved,
+    runnerStopReason,
+    runnerLastHeartbeatStatus,
+    runStopReason: run.stopReason,
+  };
+}
+
+async function runPhaseFiveWebInviteBundleProbe(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  actor: ActorRef;
+}): Promise<PhaseFiveWebInviteBundleResult> {
+  const created = await controlPlaneJson<{
+    bundle?: RemoteInviteBundle;
+    invite?: { id?: string; signatureStatus?: string };
+  }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/invite-bundle`,
+    input.server.token,
+    {
+      actor: `${input.actor.type}:${input.actor.id}`,
+      controlUrl: input.server.baseUrl,
+      alias: "web-invite-phase5",
+      displayName: "Phase 5 Web Invite Agent",
+      role: "participant",
+      ttlHours: 1,
+      maxUses: 1,
+    },
+  );
+
+  const bundle = created.bundle;
+  const inviteToken = optionalNonEmptyString(bundle?.inviteToken);
+  const inviteId = optionalNonEmptyString(bundle?.inviteId ?? created.invite?.id);
+  const controlToken = optionalNonEmptyString(bundle?.controlToken) ?? input.server.token;
+  const controlUrl = optionalNonEmptyString(bundle?.controlUrl) ?? input.server.baseUrl;
+  const enrollCommandPresent = bundle?.commands?.enroll.includes("room join --invite-bundle room-invite.json --json") === true;
+  const runCommandPresent = bundle?.commands?.run.includes("room join --invite-bundle room-invite.json --run") === true;
+  const inviteTokenShapeValid = inviteToken ? /^rinv_[A-Za-z0-9_-]+$/.test(inviteToken) : false;
+  const controlTokenMatches = bundle?.controlToken === input.server.token;
+  const controlUrlMatches = bundle?.controlUrl === input.server.baseUrl;
+
+  const state = await controlPlaneGetJson<unknown>(input.server.baseUrl, "/api/state", input.server.token);
+  const stateText = JSON.stringify(state) ?? "";
+  const stateLeakedInviteToken = Boolean(inviteToken && stateText.includes(inviteToken));
+  const stateLeakedControlToken = Boolean(controlToken && stateText.includes(controlToken));
+  const stateLeakedControlUrl = Boolean(controlUrl && stateText.includes(controlUrl));
+  const stateLeakFree = !stateLeakedInviteToken && !stateLeakedControlToken && !stateLeakedControlUrl;
+
+  const audit = await controlPlaneGetJson<{
+    events?: Array<{ summary?: string; metadata?: Record<string, unknown> }>;
+  }>(
+    input.server.baseUrl,
+    `/api/audit?type=control_plane.action&room=${encodeURIComponent(input.roomId)}&limit=100`,
+    input.server.token,
+  );
+  const auditEvents = audit.events ?? [];
+  const auditEvent = auditEvents.find((event) =>
+    event.summary === "Created remote room invite bundle from control plane" &&
+    event.metadata?.roomId === input.roomId &&
+    (inviteId ? event.metadata?.inviteId === inviteId : true)
+  );
+  const auditText = JSON.stringify(audit) ?? "";
+  const auditLeakedInviteToken = Boolean(inviteToken && auditText.includes(inviteToken));
+  const auditLeakedControlToken = Boolean(controlToken && auditText.includes(controlToken));
+  const auditLeakedControlUrl = Boolean(controlUrl && auditText.includes(controlUrl));
+  const auditLeakFree = !auditLeakedInviteToken && !auditLeakedControlToken && !auditLeakedControlUrl;
+  const auditEventVisible = auditEvent !== undefined;
+  const auditInviteIdVisible = Boolean(inviteId && auditEvent?.metadata?.inviteId === inviteId);
+  const inviteSignatureStatus = bundle?.inviteSignatureStatus ?? created.invite?.signatureStatus;
+
+  return {
+    pass:
+      bundle?.kind === "soloclaw.room_invite" &&
+      inviteSignatureStatus === "valid" &&
+      inviteTokenShapeValid &&
+      controlTokenMatches &&
+      controlUrlMatches &&
+      enrollCommandPresent &&
+      runCommandPresent &&
+      stateLeakFree &&
+      auditEventVisible &&
+      auditInviteIdVisible &&
+      auditLeakFree,
+    bundleKind: bundle?.kind,
+    inviteSignatureStatus,
+    inviteTokenShapeValid,
+    controlTokenMatches,
+    controlUrlMatches,
+    enrollCommandPresent,
+    runCommandPresent,
+    stateLeakedInviteToken,
+    stateLeakedControlToken,
+    stateLeakedControlUrl,
+    stateLeakFree,
+    auditEventVisible,
+    auditInviteIdVisible,
+    auditLeakedInviteToken,
+    auditLeakedControlToken,
+    auditLeakedControlUrl,
+    auditLeakFree,
+  };
+}
+
+async function runPhaseFiveRoomAssignmentResult(input: {
+  workspace: string;
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  actor: ActorRef;
+  targetAgentId?: string;
+}): Promise<PhaseFiveRoomAssignmentResult> {
+  if (!input.targetAgentId) {
+    return {
+      pass: false,
+      assignedAgentIdMatches: false,
+      assignmentMessageVisible: false,
+      resultMessageVisible: false,
+    };
+  }
+
+  const platform = await createLocalPlatform(input.workspace, {
+    provider: "mock",
+    workspaceSnapshot: false,
+    roomId: input.roomId,
+  });
+  try {
+    const delegated = await platform.subagents.delegate({
+      objective: "phase5 room assignment/result evidence smoke",
+      roomId: input.roomId,
+      assignedAgentId: input.targetAgentId,
+      createdBy: input.actor,
+      executionMode: "trusted",
+    });
+    const roomDetail = await controlPlaneGetJson<{
+      messages?: Array<{ id: string; sender: { type: string; id: string }; kind: string; body: string }>;
+    }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+    const assignmentMessage = roomDetail.messages?.find((message) =>
+      message.kind === "task" &&
+      message.body.includes(`Subtask ${delegated.subtask.id} assigned to ${input.targetAgentId}`)
+    );
+    const resultMessage = roomDetail.messages?.find((message) =>
+      message.kind === "decision" &&
+      message.sender.type === "agent" &&
+      message.sender.id === input.targetAgentId &&
+      message.body.includes(`Subtask ${delegated.subtask.id} completed`)
+    );
+    const assignedAgentIdMatches = delegated.subtask.assignedAgentId === input.targetAgentId;
+    const assignmentMessageVisible = Boolean(assignmentMessage);
+    const resultMessageVisible = Boolean(resultMessage);
+    return {
+      pass:
+        delegated.subtask.status === "completed" &&
+        Boolean(delegated.childSession?.id) &&
+        assignedAgentIdMatches &&
+        assignmentMessageVisible &&
+        resultMessageVisible,
+      targetAgentId: input.targetAgentId,
+      subtaskId: delegated.subtask.id,
+      childSessionId: delegated.childSession?.id,
+      assignmentMessageId: assignmentMessage?.id,
+      resultMessageId: resultMessage?.id,
+      resultStatus: delegated.subtask.status,
+      assignedAgentIdMatches,
+      assignmentMessageVisible,
+      resultMessageVisible,
+      assignmentTranscriptKind: assignmentMessage?.kind,
+      resultTranscriptKind: resultMessage?.kind,
+    };
+  } finally {
+    await closePhaseFivePlatform(platform);
+  }
+}
+
+async function verifyPhaseFiveOperatorVisibility(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  expectedMessageIds: string[];
+  remoteAgentIds: string[];
+}): Promise<PhaseFiveOperatorVisibilityResult> {
+  const roomDetail = await controlPlaneGetJson<{
+    messages?: Array<{ id: string }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const state = await controlPlaneGetJson<{
+    rooms?: Array<{ room?: { id?: string }; messages?: Array<{ id: string }> }>;
+    agentHealth?: {
+      perAgent?: Array<{
+        agentId: string;
+        responsive?: boolean;
+        healthState?: string;
+        lastRoomId?: string;
+      }>;
+    };
+  }>(input.server.baseUrl, "/api/state", input.server.token);
+  const health = await controlPlaneGetJson<{
+    health?: {
+      perAgent?: Array<{
+        agentId: string;
+        responsive?: boolean;
+        healthState?: string;
+        lastRoomId?: string;
+      }>;
+    };
+  }>(input.server.baseUrl, "/api/agents/health", input.server.token);
+  const deliveryStatus = await controlPlaneGetJson<{
+    agents?: Array<{
+      agentId?: string;
+      pendingRoutedCount?: number;
+      lastAckMessageId?: string;
+    }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}/delivery-status`, input.server.token);
+
+  const expectedMessageIds = [...new Set(input.expectedMessageIds)].sort();
+  const transcriptMessageIds = [...new Set((roomDetail.messages ?? []).map((message) => message.id))].sort();
+  const stateRoom = (state.rooms ?? []).find((entry) => entry.room?.id === input.roomId);
+  const stateRoomMessageIds = [...new Set((stateRoom?.messages ?? []).map((message) => message.id))].sort();
+  const healthAgents = health.health?.perAgent ?? [];
+  const stateHealthAgents = state.agentHealth?.perAgent ?? [];
+  const remoteAgentIds = [...new Set(input.remoteAgentIds)].sort();
+  const healthAgentIds = [...new Set(healthAgents.map((agent) => agent.agentId))].sort();
+  const stateHealthAgentIds = new Set(stateHealthAgents.map((agent) => agent.agentId));
+  const responsiveHealthAgentIds = remoteAgentIds.filter((agentId) => {
+    const agent = healthAgents.find((candidate) => candidate.agentId === agentId);
+    return agent?.responsive === true || agent?.healthState === "online" || agent?.healthState === "idle" || agent?.healthState === "running";
+  });
+  const roomHealthAgentIds = remoteAgentIds.filter((agentId) => {
+    const agent = healthAgents.find((candidate) => candidate.agentId === agentId);
+    return agent?.lastRoomId === input.roomId;
+  });
+  const deliveryAgents = deliveryStatus.agents ?? [];
+  const deliveryStatusAgentIds = [...new Set(deliveryAgents
+    .map((agent) => agent.agentId)
+    .filter((agentId): agentId is string => Boolean(agentId)))]
+    .sort();
+  const deliveryStatusPendingCounts = Object.fromEntries(
+    remoteAgentIds.map((agentId) => [
+      agentId,
+      Number(deliveryAgents.find((agent) => agent.agentId === agentId)?.pendingRoutedCount ?? -1),
+    ]),
+  );
+  const deliveryStatusAckMessageIds = [...new Set(deliveryAgents
+    .map((agent) => agent.lastAckMessageId)
+    .filter((messageId): messageId is string => Boolean(messageId)))]
+    .sort();
+  const missingTranscriptMessageIds = expectedMessageIds.filter((id) => !transcriptMessageIds.includes(id));
+  const missingStateMessageIds = expectedMessageIds.filter((id) => !stateRoomMessageIds.includes(id));
+  const missingHealthAgentIds = remoteAgentIds.filter((agentId) => !healthAgentIds.includes(agentId) || !stateHealthAgentIds.has(agentId));
+  const missingDeliveryStatusAgentIds = remoteAgentIds.filter((agentId) => !deliveryStatusAgentIds.includes(agentId));
+  const pendingDeliveryStatusAgentIds = remoteAgentIds.filter((agentId) => deliveryStatusPendingCounts[agentId] !== 0);
+
+  return {
+    pass:
+      missingTranscriptMessageIds.length === 0 &&
+      stateRoom !== undefined &&
+      missingStateMessageIds.length === 0 &&
+      missingHealthAgentIds.length === 0 &&
+      responsiveHealthAgentIds.length === remoteAgentIds.length &&
+      roomHealthAgentIds.length === remoteAgentIds.length &&
+      missingDeliveryStatusAgentIds.length === 0 &&
+      pendingDeliveryStatusAgentIds.length === 0 &&
+      deliveryStatusAckMessageIds.length >= remoteAgentIds.length,
+    transcriptMessageIds,
+    expectedMessageIds,
+    missingTranscriptMessageIds,
+    stateRoomVisible: stateRoom !== undefined,
+    stateRoomMessageIds,
+    missingStateMessageIds,
+    healthAgentIds,
+    missingHealthAgentIds,
+    responsiveHealthAgentIds,
+    roomHealthAgentIds,
+    deliveryStatusAgentIds,
+    missingDeliveryStatusAgentIds,
+    deliveryStatusPendingCounts,
+    deliveryStatusAckMessageIds,
+  };
+}
+
+async function runPhaseFiveKeyRotation(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  invite: Awaited<ReturnType<Awaited<ReturnType<typeof createLocalPlatform>>["rooms"]["createInvite"]>>;
+  owner: ActorRef;
+  remoteWorkspaces: string[];
+  remotePlatforms: Array<Awaited<ReturnType<typeof createLocalPlatform>>>;
+}): Promise<PhaseFiveKeyRotationResult> {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "soloclaw-phase5-key-rotation-"));
+  input.remoteWorkspaces.push(workspace);
+  const platform = await createLocalPlatform(workspace, { provider: "mock", workspaceSnapshot: false });
+  input.remotePlatforms.push(platform);
+  const { identity, localAgent } = platform;
+  const actor = `agent:${localAgent.id}`;
+  await controlPlaneJson<{ agent: { id: string } }>(input.server.baseUrl, "/api/agents/register", input.server.token, {
+    actor,
+    agentId: localAgent.id,
+    machineId: localAgent.machineId,
+    displayName: localAgent.displayName,
+    publicKeyPem: localAgent.publicKeyPem,
+    fingerprint: localAgent.fingerprint,
+    capabilities: localAgent.capabilities,
+    allowedProjects: localAgent.allowedProjects,
+  });
+  await controlPlaneJson<{ member: { actor: { id: string }; status: string; aliases?: string[] } }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/join-invite`,
+    input.server.token,
+    {
+      actor,
+      token: input.invite.token,
+      aliases: ["key-rotation-phase5"],
+    },
+  );
+
+  const oldRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity,
+    localAgent,
+  });
+  await oldRunner.heartbeat({ status: "online", ttlSeconds: 60 });
+
+  const replacementKey = generateKeyPairSync("ed25519");
+  const replacementPublicKeyPem = replacementKey.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const rotation = await controlPlaneJson<{
+    agent?: { id?: string; fingerprint?: string; trustStatus?: string };
+    previousFingerprint?: string;
+  }>(
+    input.server.baseUrl,
+    `/api/agents/${encodeURIComponent(localAgent.id)}/rotate-key`,
+    input.server.token,
+    {
+      actor: `agent:${input.owner.id}`,
+      publicKeyPem: replacementPublicKeyPem,
+      reason: "phase5 verify key rotation smoke",
+    },
+  );
+
+  let oldSignedSayBlocked = false;
+  let oldSignedSayRejection = "";
+  try {
+    await oldRunner.say({
+      kind: "chat",
+      body: `@agent:${input.owner.id} phase5 key rotation old-key say should be rejected`,
+    });
+  } catch (error) {
+    oldSignedSayRejection = error instanceof Error ? error.message : String(error);
+    oldSignedSayBlocked = /Invalid room message intent envelope signature|invalid signature|Control plane 400|signature/i.test(oldSignedSayRejection);
+  }
+
+  const newBody = `@agent:${input.owner.id} phase5 key rotation new-key say accepted`;
+  const messageEnvelope = signPhaseFiveRoomMessageIntent({
+    roomId: input.roomId,
+    agentId: localAgent.id,
+    kind: "chat",
+    body: newBody,
+    privateKey: replacementKey.privateKey,
+  });
+  const newMessage = await controlPlaneJson<{
+    message?: { id?: string; metadata?: Record<string, unknown> };
+  }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/messages`,
+    input.server.token,
+    {
+      actor,
+      kind: "chat",
+      body: newBody,
+      messageEnvelope,
+    },
+  );
+  const newSignedSayAccepted = newMessage.message?.metadata?.remoteIntentSignatureStatus === "valid";
+  const roomDetail = await controlPlaneGetJson<{
+    messages?: Array<{ id?: string }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const newMessageVisible = Boolean(newMessage.message?.id && (roomDetail.messages ?? []).some((message) => message.id === newMessage.message?.id));
+  const audit = await controlPlaneGetJson<{
+    events?: Array<{ summary?: string; metadata?: Record<string, unknown> }>;
+  }>(
+    input.server.baseUrl,
+    `/api/audit?type=control_plane.action&room=${encodeURIComponent(input.roomId)}&limit=100`,
+    input.server.token,
+  );
+  const auditEventVisible = (audit.events ?? []).some((event) =>
+    event.summary === "Rotated agent identity key from control plane" &&
+    event.metadata?.agentId === localAgent.id &&
+    event.metadata?.previousFingerprint === rotation.previousFingerprint &&
+    event.metadata?.fingerprint === rotation.agent?.fingerprint
+  );
+  const fingerprintChanged = Boolean(
+    rotation.previousFingerprint &&
+    rotation.agent?.fingerprint &&
+    rotation.previousFingerprint !== rotation.agent.fingerprint,
+  );
+
+  return {
+    pass:
+      fingerprintChanged &&
+      rotation.agent?.trustStatus !== "revoked" &&
+      oldSignedSayBlocked &&
+      newSignedSayAccepted &&
+      newMessageVisible &&
+      auditEventVisible,
+    agentId: localAgent.id,
+    previousFingerprint: rotation.previousFingerprint,
+    rotatedFingerprint: rotation.agent?.fingerprint,
+    trustStatusAfter: rotation.agent?.trustStatus,
+    oldSignedSayBlocked,
+    oldSignedSayRejection,
+    newSignedSayAccepted,
+    newMessageId: newMessage.message?.id,
+    newMessageVisible,
+    auditEventVisible,
+  };
+}
+
+function signPhaseFiveRoomMessageIntent(input: {
+  roomId: string;
+  agentId: string;
+  kind: RoomMessageIntentEnvelope["kind"];
+  body: string;
+  privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"];
+}): RoomMessageIntentEnvelope {
+  const unsigned: Omit<RoomMessageIntentEnvelope, "signature"> = {
+    version: 1,
+    roomId: input.roomId as RoomMessageIntentEnvelope["roomId"],
+    agentId: input.agentId as RoomMessageIntentEnvelope["agentId"],
+    kind: input.kind,
+    body: input.body,
+    sentAt: new Date().toISOString(),
+    sentBy: { type: "agent", id: input.agentId },
+    nonce: randomUUID(),
+  };
+  const signature = sign(null, Buffer.from(roomMessageIntentEnvelopeSigningPayload(unsigned), "utf8"), input.privateKey);
+  return { ...unsigned, signature: `ed25519:${signature.toString("base64")}` };
+}
+
+async function runPhaseFiveAgentExchange(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  sender?: PhaseFiveRemotePeer;
+  receiver?: PhaseFiveRemotePeer;
+}): Promise<PhaseFiveAgentExchangeResult> {
+  if (!input.sender || !input.receiver) {
+    return {
+      pass: false,
+      receiverHandledMessages: [],
+      senderHandledReplyMessages: [],
+      receiverAckSigned: false,
+      senderAckSigned: false,
+    };
+  }
+  const sender = input.sender;
+  const receiver = input.receiver;
+
+  const senderRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: sender.platform.identity,
+    localAgent: sender.agent,
+  });
+  const receiverRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: receiver.platform.identity,
+    localAgent: receiver.agent,
+  });
+
+  const outbound = await senderRunner.say({
+    kind: "task",
+    body: `@agent:${receiver.agent.id} phase5 peer exchange from ${sender.agent.id}`,
+  });
+  const receiverHandledMessages: string[] = [];
+  const receiverRun = await receiverRunner.run({
+    maxCycles: 2,
+    maxMessagesPerPoll: 1,
+    maxIdlePolls: 1,
+    idleIntervalMs: 0,
+    intervalMs: 0,
+    stopWhenIdle: true,
+    maxIdleCycles: 1,
+    baseBackoffMs: 0,
+    maxBackoffMs: 0,
+    maxErrors: 1,
+    heartbeatTtlSeconds: 30,
+    onMessage: async (message) => {
+      receiverHandledMessages.push(message.id);
+      await receiverRunner.say({
+        kind: "chat",
+        body: `@agent:${sender.agent.id} phase5 peer reply to ${message.id} by ${receiver.agent.id}`,
+      });
+    },
+  });
+
+  const roomAfterReceiver = await controlPlaneGetJson<{
+    messages?: Array<{ id: string; sender: { type: string; id: string }; body: string; metadata?: Record<string, unknown> }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const reply = roomAfterReceiver.messages?.find((message) =>
+    message.sender.type === "agent" &&
+    message.sender.id === receiver.agent.id &&
+    message.body.includes(`phase5 peer reply to ${outbound.message.id}`)
+  );
+
+  const senderHandledReplyMessages: string[] = [];
+  let senderRun: RemoteRoomRunResult | undefined;
+  if (reply) {
+    senderRun = await senderRunner.run({
+      maxCycles: 2,
+      maxMessagesPerPoll: 1,
+      maxIdlePolls: 1,
+      idleIntervalMs: 0,
+      intervalMs: 0,
+      stopWhenIdle: true,
+      maxIdleCycles: 1,
+      baseBackoffMs: 0,
+      maxBackoffMs: 0,
+      maxErrors: 1,
+      heartbeatTtlSeconds: 30,
+      onMessage: async (message) => {
+        senderHandledReplyMessages.push(message.id);
+      },
+    });
+  }
+
+  const messageSignatureStatus = outbound.message.metadata?.remoteIntentSignatureStatus;
+  const replySignatureStatus = reply?.metadata?.remoteIntentSignatureStatus;
+  const receiverAckSigned = receiverRun.acknowledgements.some((ack) =>
+    ack.messageId === outbound.message.id && ack.ackSignature?.startsWith("ed25519:")
+  );
+  const senderAckSigned = senderRun?.acknowledgements.some((ack) =>
+    ack.messageId === reply?.id && ack.ackSignature?.startsWith("ed25519:")
+  ) === true;
+  const pass =
+    messageSignatureStatus === "valid" &&
+    receiverHandledMessages.includes(outbound.message.id) &&
+    replySignatureStatus === "valid" &&
+    Boolean(reply?.id) &&
+    senderHandledReplyMessages.includes(reply?.id ?? "") &&
+    receiverAckSigned &&
+    senderAckSigned;
+
+  return {
+    pass,
+    senderId: sender.agent.id,
+    receiverId: receiver.agent.id,
+    messageId: outbound.message.id,
+    replyMessageId: reply?.id,
+    receiverHandledMessages,
+    senderHandledReplyMessages,
+    messageSignatureStatus,
+    replySignatureStatus,
+    receiverAckSigned,
+    senderAckSigned,
+  };
+}
+
+async function runPhaseFiveRoomHandoff(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  source?: PhaseFiveRemotePeer;
+  target?: PhaseFiveRemotePeer;
+}): Promise<PhaseFiveRoomHandoffResult> {
+  if (!input.source || !input.target || input.source.agent.id === input.target.agent.id) {
+    return {
+      pass: false,
+      handoffMessageVisible: false,
+      acceptanceMessageVisible: false,
+      resultMessageVisible: false,
+      handoffAccepted: false,
+      handoffCompleted: false,
+      targetHandledMessages: [],
+      sourceHandledMessages: [],
+      targetAckSigned: false,
+      sourceAckSigned: false,
+    };
+  }
+  const source = input.source;
+  const target = input.target;
+  const handoffId = makeId<"PhaseFiveHandoffId">("handoff");
+  const sourceRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: source.platform.identity,
+    localAgent: source.agent,
+  });
+  const targetRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: target.platform.identity,
+    localAgent: target.agent,
+  });
+
+  const request = await sourceRunner.say({
+    kind: "task",
+    body: `@agent:${target.agent.id} phase5 handoff ${handoffId} from ${source.agent.id}: accept and complete this room handoff`,
+  });
+  const targetHandledMessages: string[] = [];
+  const targetRun = await targetRunner.run({
+    maxCycles: 2,
+    maxMessagesPerPoll: 1,
+    maxIdlePolls: 1,
+    idleIntervalMs: 0,
+    intervalMs: 0,
+    stopWhenIdle: true,
+    maxIdleCycles: 1,
+    baseBackoffMs: 0,
+    maxBackoffMs: 0,
+    maxErrors: 1,
+    heartbeatTtlSeconds: 30,
+    onMessage: async (message) => {
+      targetHandledMessages.push(message.id);
+      await targetRunner.say({
+        kind: "decision",
+        body: `@agent:${source.agent.id} phase5 handoff ${handoffId} accepted by ${target.agent.id}`,
+      });
+      await targetRunner.say({
+        kind: "decision",
+        body: `@agent:${source.agent.id} phase5 handoff ${handoffId} completed by ${target.agent.id}`,
+      });
+    },
+  });
+
+  const roomAfterTarget = await controlPlaneGetJson<{
+    messages?: Array<{ id: string; sender: { type: string; id: string }; kind: string; body: string; metadata?: Record<string, unknown> }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const handoffMessage = roomAfterTarget.messages?.find((message) => message.id === request.message.id);
+  const acceptance = roomAfterTarget.messages?.find((message) =>
+    message.sender.type === "agent" &&
+    message.sender.id === target.agent.id &&
+    message.kind === "decision" &&
+    message.body.includes(`phase5 handoff ${handoffId} accepted`)
+  );
+  const result = roomAfterTarget.messages?.find((message) =>
+    message.sender.type === "agent" &&
+    message.sender.id === target.agent.id &&
+    message.kind === "decision" &&
+    message.body.includes(`phase5 handoff ${handoffId} completed`)
+  );
+
+  const sourceHandledMessages: string[] = [];
+  let sourceRun: RemoteRoomRunResult | undefined;
+  if (acceptance || result) {
+    sourceRun = await sourceRunner.run({
+      maxCycles: 2,
+      maxMessagesPerPoll: 5,
+      maxIdlePolls: 1,
+      idleIntervalMs: 0,
+      intervalMs: 0,
+      stopWhenIdle: true,
+      maxIdleCycles: 1,
+      baseBackoffMs: 0,
+      maxBackoffMs: 0,
+      maxErrors: 1,
+      heartbeatTtlSeconds: 30,
+      onMessage: async (message) => {
+        sourceHandledMessages.push(message.id);
+      },
+    });
+  }
+
+  const targetAckSigned = targetRun.acknowledgements.some((ack) =>
+    ack.messageId === request.message.id && ack.ackSignature?.startsWith("ed25519:")
+  );
+  const sourceAckSigned = [acceptance?.id, result?.id]
+    .filter((id): id is string => Boolean(id))
+    .every((id) => sourceRun?.acknowledgements.some((ack) => ack.messageId === id && ack.ackSignature?.startsWith("ed25519:")) === true);
+  const handoffAccepted = Boolean(acceptance?.id && sourceHandledMessages.includes(acceptance.id));
+  const handoffCompleted = Boolean(result?.id && sourceHandledMessages.includes(result.id));
+  const handoffMessageVisible = handoffMessage?.id === request.message.id;
+  const acceptanceMessageVisible = Boolean(acceptance?.id);
+  const resultMessageVisible = Boolean(result?.id);
+
+  return {
+    pass:
+      request.message.metadata?.remoteIntentSignatureStatus === "valid" &&
+      handoffMessageVisible &&
+      targetHandledMessages.includes(request.message.id) &&
+      acceptance?.metadata?.remoteIntentSignatureStatus === "valid" &&
+      result?.metadata?.remoteIntentSignatureStatus === "valid" &&
+      handoffAccepted &&
+      handoffCompleted &&
+      targetAckSigned &&
+      sourceAckSigned,
+    handoffId,
+    sourceAgentId: source.agent.id,
+    targetAgentId: target.agent.id,
+    handoffMessageId: request.message.id,
+    acceptanceMessageId: acceptance?.id,
+    resultMessageId: result?.id,
+    resultStatus: handoffCompleted ? "completed" : "pending",
+    handoffMessageVisible,
+    acceptanceMessageVisible,
+    resultMessageVisible,
+    handoffAccepted,
+    handoffCompleted,
+    targetHandledMessages,
+    sourceHandledMessages,
+    requestSignatureStatus: request.message.metadata?.remoteIntentSignatureStatus,
+    acceptanceSignatureStatus: acceptance?.metadata?.remoteIntentSignatureStatus,
+    resultSignatureStatus: result?.metadata?.remoteIntentSignatureStatus,
+    targetAckSigned,
+    sourceAckSigned,
+  };
+}
+
+async function runPhaseFiveRoomConflictResolution(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  owner: ActorRef;
+  primary?: PhaseFiveRemotePeer;
+  conflicting?: PhaseFiveRemotePeer;
+}): Promise<PhaseFiveRoomConflictResolutionResult> {
+  if (!input.primary || !input.conflicting || input.primary.agent.id === input.conflicting.agent.id) {
+    return {
+      pass: false,
+      conflictDetected: false,
+      resolutionRecorded: false,
+    };
+  }
+  const resultKey = `phase5-conflict-${randomUUID().slice(0, 8)}`;
+  const primaryRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: input.primary.platform.identity,
+    localAgent: input.primary.agent,
+  });
+  const conflictingRunner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: input.conflicting.platform.identity,
+    localAgent: input.conflicting.agent,
+  });
+
+  const primary = await primaryRunner.say({
+    kind: "artifact",
+    body: `phase5 conflict result ${resultKey} from ${input.primary.agent.id}`,
+  });
+  const conflicting = await conflictingRunner.say({
+    kind: "artifact",
+    body: `phase5 conflict result ${resultKey} from ${input.conflicting.agent.id}`,
+  });
+  const resolution = await controlPlaneJson<{ message: { id: string; kind: string; body: string } }>(
+    input.server.baseUrl,
+    `/api/rooms/${encodeURIComponent(input.roomId)}/messages`,
+    input.server.token,
+    {
+      actor: `${input.owner.type}:${input.owner.id}`,
+      kind: "decision",
+      body:
+        `phase5 conflict resolution for ${resultKey}: choose ${input.primary.agent.id} ` +
+        `after reviewing ${primary.message.id} and ${conflicting.message.id}`,
+    },
+  );
+  const roomDetail = await controlPlaneGetJson<{
+    messages?: Array<{ id: string; sender: { type: string; id: string }; kind: string; body: string; metadata?: Record<string, unknown> }>;
+  }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+  const messages = roomDetail.messages ?? [];
+  const primaryMessage = messages.find((message) => message.id === primary.message.id);
+  const conflictingMessage = messages.find((message) => message.id === conflicting.message.id);
+  const resolutionMessage = messages.find((message) => message.id === resolution.message.id);
+  const conflictDetected =
+    primaryMessage?.kind === "artifact" &&
+    conflictingMessage?.kind === "artifact" &&
+    primaryMessage.body.includes(resultKey) &&
+    conflictingMessage.body.includes(resultKey) &&
+    primaryMessage.sender.id !== conflictingMessage.sender.id;
+  const resolutionRecorded =
+    resolutionMessage?.kind === "decision" &&
+    resolutionMessage.body.includes(resultKey) &&
+    resolutionMessage.body.includes(input.primary.agent.id);
+  const primarySignatureStatus = primaryMessage?.metadata?.remoteIntentSignatureStatus;
+  const conflictingSignatureStatus = conflictingMessage?.metadata?.remoteIntentSignatureStatus;
+
+  return {
+    pass:
+      conflictDetected &&
+      resolutionRecorded &&
+      primarySignatureStatus === "valid" &&
+      conflictingSignatureStatus === "valid",
+    resultKey,
+    primaryAgentId: input.primary.agent.id,
+    conflictingAgentId: input.conflicting.agent.id,
+    primaryMessageId: primary.message.id,
+    conflictingMessageId: conflicting.message.id,
+    resolutionMessageId: resolution.message.id,
+    winningAgentId: input.primary.agent.id,
+    conflictDetected,
+    resolutionRecorded,
+    resolutionStatus: resolutionRecorded ? "resolved" : "pending",
+    primarySignatureStatus,
+    conflictingSignatureStatus,
+  };
+}
+
+async function runPhaseFiveRoomResultSync(input: {
+  workspace: string;
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  actor: ActorRef;
+  target?: PhaseFiveRemotePeer;
+}): Promise<PhaseFiveRoomResultSyncResult> {
+  if (!input.target?.workspace) {
+    return {
+      pass: false,
+      artifactRegistered: false,
+      artifactMessageVisible: false,
+    };
+  }
+  const relativePath = ".agent/tmp/phase5-result-sync.json";
+  const remotePath = path.resolve(input.target.workspace, relativePath);
+  const controlPath = path.resolve(input.workspace, relativePath);
+  const payload = {
+    kind: "phase5.result_sync",
+    status: "completed",
+    agentId: input.target.agent.id,
+    roomId: input.roomId,
+    generatedAt: new Date().toISOString(),
+  };
+  await fs.mkdir(path.dirname(remotePath), { recursive: true });
+  await fs.writeFile(remotePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await fs.mkdir(path.dirname(controlPath), { recursive: true });
+  await fs.copyFile(remotePath, controlPath);
+
+  const platform = await createLocalPlatform(input.workspace, {
+    provider: "mock",
+    workspaceSnapshot: false,
+    roomId: input.roomId,
+  });
+  try {
+    const artifact = await platform.lifecycle.registerArtifact({
+      kind: "report",
+      name: "phase5-result-sync.json",
+      path: relativePath,
+      roomId: input.roomId,
+      metadata: {
+        sourceAgentId: input.target.agent.id,
+        sourceWorkspace: "remote-agent",
+      },
+      actor: input.actor,
+    });
+    const artifactMessage = await controlPlaneJson<{ message: { id: string; kind: string; body: string } }>(
+      input.server.baseUrl,
+      `/api/rooms/${encodeURIComponent(input.roomId)}/messages`,
+      input.server.token,
+      {
+        actor: `${input.actor.type}:${input.actor.id}`,
+        kind: "artifact",
+        body:
+          `phase5 result sync artifact ${artifact.id} from ${input.target.agent.id} ` +
+          `sha256 ${artifact.sha256 ?? "-"}`,
+      },
+    );
+    const roomDetail = await controlPlaneGetJson<{
+      messages?: Array<{ id: string; kind: string; body: string }>;
+    }>(input.server.baseUrl, `/api/rooms/${encodeURIComponent(input.roomId)}`, input.server.token);
+    const visibleMessage = roomDetail.messages?.find((message) => message.id === artifactMessage.message.id);
+    const artifactRegistered =
+      artifact.status === "active" &&
+      artifact.kind === "report" &&
+      artifact.roomId === input.roomId &&
+      Boolean(artifact.sha256) &&
+      Boolean(artifact.sizeBytes && artifact.sizeBytes > 0);
+    const artifactMessageVisible =
+      visibleMessage?.kind === "artifact" &&
+      visibleMessage.body.includes(artifact.id) &&
+      visibleMessage.body.includes(input.target.agent.id);
+
+    return {
+      pass: artifactRegistered && artifactMessageVisible,
+      agentId: input.target.agent.id,
+      artifactId: artifact.id,
+      artifactKind: artifact.kind,
+      artifactName: artifact.name,
+      artifactRoomId: artifact.roomId,
+      artifactStatus: artifact.status,
+      artifactSha256: artifact.sha256,
+      artifactSizeBytes: artifact.sizeBytes,
+      artifactRegistered,
+      artifactMessageId: artifactMessage.message.id,
+      artifactMessageVisible,
+      artifactTranscriptKind: visibleMessage?.kind,
+    };
+  } finally {
+    await closePhaseFivePlatform(platform);
+  }
+}
+
+async function runPhaseFiveStopFileShutdown(input: {
+  server: Awaited<ReturnType<typeof startLocalRoomWebServer>>;
+  roomId: string;
+  target?: PhaseFiveRemotePeer;
+}): Promise<PhaseFiveStopFileShutdownResult> {
+  if (!input.target?.workspace) {
+    return {
+      pass: false,
+      runnerStatusFileObserved: false,
+    };
+  }
+  const stopFile = ".agent/tmp/phase5-remote-room.stop";
+  const runnerStatusFile = ".agent/tmp/phase5-remote-room-stop-status.json";
+  await fs.mkdir(path.resolve(input.target.workspace, ".agent/tmp"), { recursive: true });
+  await fs.writeFile(path.resolve(input.target.workspace, stopFile), "", "utf8");
+  const stopFileLifecycle = createRemoteRunnerStopFileLifecycle(input.target.workspace, stopFile);
+  const statusReporter = createRemoteRunnerStatusReporter({
+    cwd: input.target.workspace,
+    statusFilePath: runnerStatusFile,
+    roomId: input.roomId,
+    agentId: input.target.agent.id,
+    machineId: input.target.agent.machineId,
+  });
+  await statusReporter.write({ status: "starting", messagesProcessed: 0, errorCount: 0 });
+  await stopFileLifecycle.requestShutdownIfStopFilePresent();
+
+  const runner = new RemoteRoomRunner({
+    controlUrl: input.server.baseUrl,
+    token: input.server.token,
+    roomId: input.roomId,
+    identity: input.target.platform.identity,
+    localAgent: input.target.agent,
+  });
+  const run = await runner.run({
+    maxCycles: 5,
+    maxMessagesPerPoll: 1,
+    maxIdlePolls: 1,
+    idleIntervalMs: 0,
+    intervalMs: 0,
+    stopWhenIdle: true,
+    maxIdleCycles: 1,
+    baseBackoffMs: 1,
+    maxBackoffMs: 1,
+    maxErrors: 1,
+    heartbeatTtlSeconds: 30,
+    lifecycle: stopFileLifecycle.lifecycle,
+  });
+  await statusReporter.recordStop(run);
+
+  const statusFile = JSON.parse(await fs.readFile(path.resolve(input.target.workspace, runnerStatusFile), "utf8")) as unknown;
+  const statusRecord = isRecord(statusFile) ? statusFile : {};
+  const runnerStatusFileObserved =
+    statusRecord.kind === "soloclaw.remote_room_runner_status" &&
+    statusRecord.agentId === input.target.agent.id &&
+    statusRecord.roomId === input.roomId;
+  const runnerStatusKind = optionalNonEmptyString(statusRecord.kind);
+  const runnerStatus = optionalNonEmptyString(statusRecord.status);
+  const runnerStopReason = optionalNonEmptyString(statusRecord.stopReason);
+  return {
+    pass:
+      run.stopReason === "shutdown_requested" &&
+      runnerStatusFileObserved &&
+      runnerStatusKind === "soloclaw.remote_room_runner_status" &&
+      runnerStatus === "stopped" &&
+      runnerStopReason === "shutdown_requested",
+    agentId: input.target.agent.id,
+    stopFile,
+    runnerStatusFile,
+    runnerStatusKind,
+    runnerStatus,
+    runnerStopReason,
+    runnerStatusFileObserved,
+  };
+}
+
+async function closePhaseFivePlatform(platform: Awaited<ReturnType<typeof createLocalPlatform>>): Promise<void> {
+  await closeWorkspaceRuntimeMaybe(platform.workspace);
+  platform.locks.close?.();
+  platform.store.close?.();
+}
+
+async function openPhaseFiveEventStream(server: Awaited<ReturnType<typeof startLocalRoomWebServer>>, roomId?: string): Promise<PhaseFiveEventStreamProbe> {
+  const controller = new AbortController();
+  const url = new URL("/api/events", server.baseUrl);
+  if (roomId) {
+    url.searchParams.set("room", roomId);
+  }
+  const response = await fetch(url, {
+    headers: { "x-agent-control-token": server.token },
+    signal: controller.signal,
+  });
+  if (!response.ok || !response.body) {
+    controller.abort();
+    throw new Error(`Control plane event stream failed: ${response.status} ${response.statusText}`);
+  }
+  const reader = response.body.getReader();
+  return {
+    reader,
+    close: async () => {
+      controller.abort();
+      await reader.cancel().catch(() => undefined);
+    },
+  };
+}
+
+async function readPhaseFiveEventStream(
+  stream: PhaseFiveEventStreamProbe,
+  expectedAgentIds: string[],
+  expectedRoomMessageIds: string[] = [],
+  timeoutMs = 5_000,
+): Promise<PhaseFiveEventStreamResult> {
+  const decoder = new TextDecoder();
+  const events: Record<string, unknown>[] = [];
+  let buffer = "";
+  const expectedAgents = [...new Set(expectedAgentIds)].filter((id) => id.trim().length > 0);
+  const expectedRoomMessages = [...new Set(expectedRoomMessageIds)].filter((id) => id.trim().length > 0);
+  const expectedAckMessages = expectedRoomMessages;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const result = await Promise.race([
+      stream.reader.read(),
+      new Promise<{ timedOut: true }>((resolve) => setTimeout(() => resolve({ timedOut: true }), remainingMs)),
+    ]);
+    if ("timedOut" in result) {
+      break;
+    }
+    const { value, done } = result;
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const parsed = parsePhaseFiveSseFrame(frame);
+      if (parsed) {
+        events.push(parsed);
+      }
+    }
+    const seenAgentIds = collectPhaseFiveEventAgentIds(events);
+    const seenRoomMessageIds = collectPhaseFiveRoomMessageIds(events);
+    const seenAckMessageIds = collectPhaseFiveDeliveryAckMessageIds(events);
+    if (
+      events.some((event) => event.type === "control_plane.action") &&
+      expectedAgents.every((agentId) => seenAgentIds.includes(agentId)) &&
+      events.some((event) => event.type === "room.message.sent") &&
+      expectedRoomMessages.every((messageId) => seenRoomMessageIds.includes(messageId)) &&
+      events.some((event) => event.type === "room.delivery.acknowledged") &&
+      expectedAckMessages.every((messageId) => seenAckMessageIds.includes(messageId))
+    ) {
+      break;
+    }
+  }
+
+  const agentIds = collectPhaseFiveEventAgentIds(events);
+  const roomMessageIds = collectPhaseFiveRoomMessageIds(events);
+  const ackMessageIds = collectPhaseFiveDeliveryAckMessageIds(events);
+  const controlActionEvents = events.filter((event) => event.type === "control_plane.action");
+  const roomMessageEvents = events.filter((event) => event.type === "room.message.sent");
+  const deliveryAckEvents = events.filter((event) => event.type === "room.delivery.acknowledged");
+  return {
+    connected: true,
+    eventCount: controlActionEvents.length,
+    controlActionTypes: [...new Set(controlActionEvents.map((event) => String(event.type)))].sort(),
+    controlActionSummaries: [...new Set(controlActionEvents.map(phaseFiveEventSummary).filter((summary): summary is string => Boolean(summary)))].sort(),
+    roomMessageEventTypes: [...new Set(roomMessageEvents.map((event) => String(event.type)))].sort(),
+    roomMessageIds,
+    missingRoomMessageIds: expectedRoomMessages.filter((messageId) => !roomMessageIds.includes(messageId)),
+    deliveryAckEventTypes: [...new Set(deliveryAckEvents.map((event) => String(event.type)))].sort(),
+    ackMessageIds,
+    missingAckMessageIds: expectedAckMessages.filter((messageId) => !ackMessageIds.includes(messageId)),
+    agentIds,
+    missingAgentIds: expectedAgents.filter((agentId) => !agentIds.includes(agentId)),
+  };
+}
+
+function parsePhaseFiveSseFrame(frame: string): Record<string, unknown> | undefined {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n")
+    .trim();
+  if (!data) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function collectPhaseFiveEventAgentIds(events: Record<string, unknown>[]): string[] {
+  return [...new Set(events
+    .flatMap((event) => [
+      isRecord(event.scope) ? optionalNonEmptyString(event.scope.agentId) : undefined,
+      isRecord(event.payload) && isRecord(event.payload.metadata) ? optionalNonEmptyString(event.payload.metadata.agentId) : undefined,
+      isRecord(event.auditEvent) && isRecord(event.auditEvent.metadata) ? optionalNonEmptyString(event.auditEvent.metadata.agentId) : undefined,
+    ])
+    .filter((id): id is string => Boolean(id)))]
+    .sort();
+}
+
+function collectPhaseFiveRoomMessageIds(events: Record<string, unknown>[]): string[] {
+  return [...new Set(events
+    .filter((event) => event.type === "room.message.sent")
+    .map((event) => isRecord(event.payload) ? optionalNonEmptyString(event.payload.messageId) : undefined)
+    .filter((id): id is string => Boolean(id)))]
+    .sort();
+}
+
+function collectPhaseFiveDeliveryAckMessageIds(events: Record<string, unknown>[]): string[] {
+  return [...new Set(events
+    .filter((event) => event.type === "room.delivery.acknowledged")
+    .map((event) => isRecord(event.payload) ? optionalNonEmptyString(event.payload.messageId) : undefined)
+    .filter((id): id is string => Boolean(id)))]
+    .sort();
+}
+
+function phaseFiveEventSummary(event: Record<string, unknown>): string | undefined {
+  if (isRecord(event.payload)) {
+    const summary = optionalNonEmptyString(event.payload.summary);
+    if (summary) {
+      return summary;
+    }
+  }
+  if (isRecord(event.auditEvent)) {
+    return optionalNonEmptyString(event.auditEvent.summary);
+  }
+  return undefined;
+}
+
+function formatPhaseFiveChecklist(): string {
+  return [
+    "Phase 5 multi-agent room checklist",
+    "",
+    "- Start a token-gated local HTTP control plane for a control workspace.",
+    "- Create a signed-invite room and enroll a separate local-agent identity from another workspace.",
+    "- Prove the one-file `room invite-agent` / `room join --invite-bundle --run` bootstrap shape writes token-safe runner status evidence.",
+    "- Prove the registered-agent pull path: `remote register`, control-host `rooms pull-agent`, remote `remote invitations`, `remote accept-room`, routed message delivery, `remote run`, signed ack, and signed reply.",
+    "- Revoke a probe invite and verify that a late remote agent cannot join with it.",
+    "- Route a room message to the remote agent, require a signed delivery ack and signed heartbeat.",
+    "- Run the remote foreground adapter with a reply template and verify the signed room reply.",
+    "- Prove at least one agent-to-agent exchange: one enrolled agent sends a signed routed message to another, receives a signed routed reply, and acknowledges it.",
+    "- Prove room-level conflict resolution, result-sync artifact registration, and stop-file shutdown status evidence in the local verifier.",
+    "- Use `soloclaw phase5 matrix-template` to record Windows PowerShell/CMD, Linux, macOS, and Termux remote-agent smoke evidence.",
+    "- Use `soloclaw phase5 evidence-plan --registered-pull-target <remote-target-id> --json` on the control host to assign fragment filenames, per-target commands, and final merge/check commands after choosing the registered-agent pull target.",
+    "- Use `soloclaw phase5 collection-runbook --json` on the control host to follow the token-safe collection sequence from init through final evidence-check.",
+    "- Use `soloclaw phase5 collection-prepare --json` on the control host to write the base evidence file, per-target fragment templates, per-target guide files, and runbook file in one no-overwrite step.",
+    "- Add `--registered-pull-target <remote-target-id>` to `collection-runbook`, `collection-prepare`, `collector-guide`, or `collector-pack` after choosing the one real remote target that will run the registered-agent pull sequence.",
+    "- Use `soloclaw phase5 registered-pull-operator-next --registered-pull-target <remote-target-id> --json` to write only the machine-readable selected-target/control-host pull handoff for an existing collection workspace.",
+    "- Use `soloclaw phase5 registered-pull-evidence-patch --registered-pull-target <remote-target-id> --status-file .agent/tmp/phase5-registered-pull-status.json --pull-agent-file pull-agent.json --invitations-file invitations.json --accept-room-file accept-room.json --room-show-file room-show.json --delivery-status-file delivery-status.json --json` to turn the selected target runner status, command JSON summaries, transcript summary, delivery summary, and control-host summaries into a paste-safe room.registeredAgentPull patch; add `--control-fragment-file phase5-fragments/control-plane-host.json --patched-control-fragment-output <path>` to write a patched control-plane fragment copy instead of pasting by hand.",
+    "- Use `soloclaw phase5 evidence-init --json` on the control host to write the base evidence file plus one token-safe fragment template per target; add `--force` only when intentionally replacing templates.",
+    "- Use `soloclaw phase5 evidence-status --file <base.json> --target-dir <fragments-dir> --json` on the control host to inspect collection progress without writing a merged file.",
+    "- Use `soloclaw phase5 collector-guide --target <target-id> --json` to print one target's token-safe collection steps, fragment path, preflight command, and return-to-control-host commands.",
+    "- Add `--include-smoke-commands` to `collector-guide` or `collector-pack` only when preparing an execution handoff that should include the target's matrix commands with placeholders.",
+    "- Use `soloclaw phase5 collector-pack --json` to write token-safe per-target Markdown guide files under `phase5-collector-guides` for distribution to machine operators.",
+    "- Use `soloclaw phase5 collector-pack --target <target-id> --json` when you only need to hand one machine operator a guide.",
+    "- Use `soloclaw phase5 matrix-template --target <target-id> --json` and `soloclaw phase5 evidence-template --target <target-id> --json` for per-machine collectors.",
+    "- Preflight each fragment with `soloclaw phase5 evidence-check --file <fragment.json> --target <target-id> --json`, merge it with `soloclaw phase5 evidence-merge --file <base.json> --target-file <fragment.json> --output <merged.json> --json` or `--target-dir <fragments-dir>`, read its `finalEvidenceCheck` summary, then run the full `soloclaw phase5 evidence-check --file <merged.json> --json` gate.",
+    "- Include revoked-invite, revoked-agent, suspended-agent, stale recovery, key rotation, no-broadcast fallback, assignment/result, conflict/result-sync, handoff, stop-file, event-stream, delivery-status, health, and secret-scan evidence.",
+    "- Treat this as a local source-install smoke plus real-machine evidence workflow; real multi-machine soak, production auth/key lifecycle, and production broker hardening remain future work.",
+  ].join("\n");
+}
+
+function formatPhaseFiveVerify(result: PhaseFiveVerifyResult): string {
+  return [
+    `Phase 5 remote room verify: ${result.status}`,
+    `workspace=${result.workspace}`,
+    `room=${result.room.id ?? "-"}`,
+    `remoteAgent=${result.room.remoteAgentId ?? "-"}`,
+    ...result.checks.map((check) => `[${check.status}] ${check.id}: ${check.summary}`),
+  ].join("\n");
+}
+
+type PhaseFiveEvidencePlan = {
+  phase: "phase5";
+  action: "evidence-plan";
+  generatedAt: string;
+  registeredPullTargetId?: string;
+  fragmentsDir: string;
+  baseEvidenceFile: string;
+  mergedEvidenceFile: string;
+  requiredTargetIds: string[];
+  targets: PhaseFiveEvidencePlanTarget[];
+  controlHostCommands: string[];
+  notes: string[];
+};
+
+type PhaseFiveEvidencePlanTarget = {
+  id: string;
+  label: string;
+  role: string;
+  fragmentFileName: string;
+  fragmentPath: string;
+  matrixCommand: string;
+  templateCommand: string;
+  preflightCommand: string;
+  statusCommand: string;
+  collectorGuideCommand: string;
+};
+
+type PhaseFiveCollectionRunbook = {
+  phase: "phase5";
+  action: "collection-runbook";
+  generatedAt: string;
+  registeredPullTargetId?: string;
+  fragmentsDir: string;
+  guidesDir: string;
+  baseEvidenceFile: string;
+  mergedEvidenceFile: string;
+  requiredTargetIds: string[];
+  commands: {
+    initializeEvidence: string;
+    writeCollectorGuides: string;
+    collectionStatus: string;
+    mergeFragments: string;
+    finalEvidenceCheck: string;
+  };
+  targetGuides: Array<{
+    targetId: string;
+    label: string;
+    role: string;
+    guidePath: string;
+    fragmentPath: string;
+    matrixCommand: string;
+    templateCommand: string;
+    preflightCommand: string;
+    statusCommand: string;
+    collectorGuideCommand: string;
+    isRegisteredPullTarget: boolean;
+    operatorNextCommands?: string[];
+    evidenceFileHandoff?: PhaseFiveRegisteredPullEvidenceFileHandoff;
+  }>;
+  registeredPullEvidenceFileHandoff?: PhaseFiveRegisteredPullEvidenceFileHandoff;
+  registeredPullControlHostRunbook?: PhaseFiveRegisteredPullControlHostRunbook;
+  steps: Array<{
+    id: string;
+    label: string;
+    command?: string;
+    summary: string;
+  }>;
+  notes: string[];
+};
+
+type PhaseFiveCollectionPrepareArgs = {
+  runbookFilePath?: string;
+  registeredPullTargetId?: string;
+  force: boolean;
+  json: boolean;
+};
+
+type PhaseFiveCollectionPrepareResult = {
+  phase: "phase5";
+  action: "collection-prepare";
+  status: "pass";
+  generatedAt: string;
+  force: boolean;
+  registeredPullTargetId?: string;
+  baseEvidenceFile: PhaseFiveEvidenceInitFile;
+  fragmentsDir: {
+    path: string;
+  };
+  fragments: Array<PhaseFiveEvidenceInitFile & {
+    targetId: string;
+    role: string;
+    templateCommand: string;
+    preflightCommand: string;
+    statusCommand: string;
+    collectorGuideCommand: string;
+  }>;
+  guidesDir: {
+    path: string;
+  };
+  guides: Array<{
+    targetId: string;
+    role: string;
+    fragmentPath: string;
+    preflightCommand: string;
+    statusCommand: string;
+    collectorGuideCommand: string;
+    operatorNextCommands?: string[];
+    evidenceFileHandoff?: PhaseFiveRegisteredPullEvidenceFileHandoff;
+    path: string;
+    bytes: number;
+    overwritten: boolean;
+  }>;
+  runbookFile: {
+    path: string;
+    bytes: number;
+    overwritten: boolean;
+  };
+  registeredPullOperatorNextFile?: PhaseFiveEvidenceInitFile;
+  registeredPullOperatorNext?: PhaseFiveEvidenceStatusRegisteredPullOperatorNext;
+  nextCommands: string[];
+  notes: string[];
+};
+
+type PhaseFiveRegisteredPullOperatorNextArgs = {
+  registeredPullTargetId?: string;
+  outputPath?: string;
+  force: boolean;
+  json: boolean;
+};
+
+type PhaseFiveRegisteredPullOperatorNextResult = {
+  phase: "phase5";
+  action: "registered-pull-operator-next";
+  status: "pass";
+  generatedAt: string;
+  force: boolean;
+  registeredPullTargetId: string;
+  outputFile: PhaseFiveEvidenceInitFile;
+  registeredPullOperatorNext: PhaseFiveEvidenceStatusRegisteredPullOperatorNext;
+  nextCommands: string[];
+  notes: string[];
+};
+
+type PhaseFiveRegisteredPullEvidencePatchArgs = {
+  registeredPullTargetId?: string;
+  statusFilePath: string;
+  pullAgentFilePath?: string;
+  invitationsFilePath?: string;
+  acceptRoomFilePath?: string;
+  roomShowFilePath?: string;
+  deliveryStatusFilePath?: string;
+  outputPath?: string;
+  controlFragmentFilePath?: string;
+  patchedControlFragmentOutputPath?: string;
+  force: boolean;
+  json: boolean;
+  agentId?: string;
+  registered: boolean;
+  invitationListed: boolean;
+  accepted: boolean;
+  role?: string;
+  aliases: string[];
+  taskMessageId?: string;
+  replyMessageId?: string;
+  replySignatureStatus?: string;
+  deliveryStatusPendingCount?: number;
+  transcriptEventKinds: string[];
+};
+
+type PhaseFiveRegisteredPullCommandSummary = {
+  agentId?: string;
+  registered?: boolean;
+  invitationListed?: boolean;
+  accepted?: boolean;
+  role?: string;
+  aliases: string[];
+};
+
+type PhaseFiveRegisteredPullControlSummary = {
+  replyMessageId?: string;
+  replySignatureStatus?: string;
+  deliveryStatusPendingCount?: number;
+  transcriptEventKinds: string[];
+};
+
+type PhaseFiveRegisteredPullEvidencePatchResult = {
+  phase: "phase5";
+  action: "registered-pull-evidence-patch";
+  status: "pass" | "incomplete";
+  generatedAt: string;
+  force: boolean;
+  registeredPullTargetId: string;
+  statusFile: {
+    path: string;
+    kind?: string;
+    runnerStatus?: string;
+    stopReason?: string;
+    messagesProcessed?: number;
+    lastAckMessageId?: string;
+    lastAckSigned?: boolean;
+    heartbeatStatus?: string;
+  };
+  pastePath: "room.registeredAgentPull";
+  patch: {
+    room: {
+      registeredAgentPull: Record<string, unknown>;
+    };
+  };
+  missingFields: string[];
+  outputFile?: PhaseFiveEvidenceInitFile;
+  patchedControlFragmentFile?: PhaseFiveEvidenceInitFile & {
+    sourcePath: string;
+    pastePath: "room.registeredAgentPull";
+  };
+  nextCommands: string[];
+  notes: string[];
+};
+
+type PhaseFiveCollectorGuide = {
+  phase: "phase5";
+  action: "collector-guide";
+  generatedAt: string;
+  targetId: string;
+  label: string;
+  role: string;
+  fragmentPath: string;
+  matrixCommand: string;
+  templateCommand: string;
+  preflightCommand: string;
+  registeredPullTargetId?: string;
+  isRegisteredPullTarget: boolean;
+  includeSmokeCommands: boolean;
+  smokeCommands?: string[];
+  smokeCommandOmissions?: PhaseFiveSmokeCommandOmission[];
+  registeredPullRunbook?: PhaseFiveRegisteredPullRunbook;
+  registeredPullControlHostRunbook?: PhaseFiveRegisteredPullControlHostRunbook;
+  evidenceFileHandoff?: PhaseFiveRegisteredPullEvidenceFileHandoff;
+  operatorNextCommands?: string[];
+  returnToControlHost: {
+    copyFragmentTo: string;
+    statusCommand: string;
+    mergeCommand: string;
+    finalCheckCommand: string;
+  };
+  steps: string[];
+  notes: string[];
+};
+
+type PhaseFiveRegisteredPullRunbook = {
+  targetId: string;
+  statusFile: string;
+  stopFile: string;
+  stages: Array<{
+    id: string;
+    label: string;
+    commandName: string;
+    commandHint?: string;
+    evidenceFields: string[];
+  }>;
+  evidenceFieldHints: PhaseFiveRegisteredPullEvidenceFieldHint[];
+  notes: string[];
+};
+
+type PhaseFiveRegisteredPullControlHostRunbook = {
+  targetId: string;
+  targetGuidePath: string;
+  targetFragmentPath: string;
+  controlFragmentPath: string;
+  stages: Array<{
+    id: string;
+    label: string;
+    commandName: string;
+    commandHint?: string;
+    evidenceFields: string[];
+    waitsFor?: string;
+  }>;
+  evidenceFieldHints: PhaseFiveRegisteredPullEvidenceFieldHint[];
+  notes: string[];
+};
+
+type PhaseFiveRegisteredPullEvidenceFieldHint = {
+  field: string;
+  evidencePath: string;
+  source: "selected-target" | "control-plane-host" | "selected-target-status-file";
+  stageId: string;
+  commandName: string;
+};
+
+type PhaseFiveRegisteredPullEvidenceFileHandoff = {
+  selectedTargetProduces: Array<{
+    path: string;
+    controlHostCopyTo: string;
+    consumedBy: "registered-pull-evidence-patch";
+  }>;
+  controlHostProduces: Array<{
+    path: string;
+    consumedBy: "registered-pull-evidence-patch" | "control-plane-fragment-paste";
+  }>;
+  patchInputs: string[];
+  patchOutputFile: string;
+  pastePath: "room.registeredAgentPull";
+};
+
+type PhaseFiveSmokeCommandOmission = {
+  group: "registered-agent-pull";
+  targetId: string;
+  reason: string;
+};
+
+type PhaseFiveCollectorPackArgs = {
+  outputDirPath?: string;
+  targetId?: string;
+  registeredPullTargetId?: string;
+  includeSmokeCommands: boolean;
+  force: boolean;
+  json: boolean;
+};
+
+type PhaseFiveCollectorPackResult = {
+  phase: "phase5";
+  action: "collector-pack";
+  status: "pass";
+  generatedAt: string;
+  force: boolean;
+  includeSmokeCommands: boolean;
+  registeredPullTargetId?: string;
+  targetIds: string[];
+  guidesDir: {
+    path: string;
+  };
+  guides: Array<{
+    targetId: string;
+    role: string;
+    fragmentPath: string;
+    preflightCommand: string;
+    statusCommand: string;
+    collectorGuideCommand: string;
+    operatorNextCommands?: string[];
+    evidenceFileHandoff?: PhaseFiveRegisteredPullEvidenceFileHandoff;
+    path: string;
+    bytes: number;
+    overwritten: boolean;
+  }>;
+  nextCommands: string[];
+  notes: string[];
+};
+
+type PhaseFiveEvidenceInitArgs = {
+  filePath?: string;
+  targetDirPath?: string;
+  registeredPullTargetId?: string;
+  force: boolean;
+  json: boolean;
+};
+
+type PhaseFiveEvidenceInitResult = {
+  phase: "phase5";
+  action: "evidence-init";
+  status: "pass";
+  generatedAt: string;
+  force: boolean;
+  registeredPullTargetId?: string;
+  baseEvidenceFile: PhaseFiveEvidenceInitFile;
+  fragmentsDir: {
+    path: string;
+  };
+  fragments: Array<PhaseFiveEvidenceInitFile & {
+    targetId: string;
+    role: string;
+    templateCommand: string;
+    preflightCommand: string;
+    statusCommand: string;
+    collectorGuideCommand: string;
+  }>;
+  nextCommands: string[];
+};
+
+type PhaseFiveEvidenceInitFile = {
+  path: string;
+  bytes: number;
+  overwritten: boolean;
+};
+
+function buildPhaseFiveEvidencePlan(options: { registeredPullTargetId?: string } = {}): PhaseFiveEvidencePlan {
+  const fragmentsDir = "phase5-fragments";
+  const baseEvidenceFile = "phase5-evidence.json";
+  const mergedEvidenceFile = "phase5-evidence.merged.json";
+  const registeredPullTargetId = resolvePhaseFiveEvidencePlanRegisteredPullTargetId(options.registeredPullTargetId);
+  const template = buildPhaseFiveEvidenceTemplate();
+  const targetById = new Map(template.targets.map((target) => [target.id, target]));
+  const targets = PHASE_FIVE_REQUIRED_TARGET_IDS.map((targetId) => {
+    const target = targetById.get(targetId);
+    const fragmentFileName = `${targetId}.json`;
+    const fragmentPath = `${fragmentsDir}/${fragmentFileName}`;
+    return {
+      id: targetId,
+      label: optionalNonEmptyString(target?.label) ?? targetId,
+      role: optionalNonEmptyString(target?.role) ?? (targetId === "control-plane-host" ? "control-plane" : "remote-agent"),
+      fragmentFileName,
+      fragmentPath,
+      matrixCommand: `soloclaw phase5 matrix-template --target ${targetId} --json`,
+      templateCommand: registeredPullTargetId
+        ? `soloclaw phase5 evidence-template --target ${targetId} --registered-pull-target ${registeredPullTargetId} --json`
+        : `soloclaw phase5 evidence-template --target ${targetId} --json`,
+      preflightCommand: `soloclaw phase5 evidence-check --file ${fragmentPath} --target ${targetId} --json`,
+      statusCommand: phaseFiveEvidenceStatusCommand(baseEvidenceFile, fragmentsDir, {
+        registeredPullTargetId,
+        targetId,
+      }),
+      collectorGuideCommand: phaseFiveCollectorGuideCommand(targetId, registeredPullTargetId),
+    };
+  });
+  return {
+    phase: "phase5",
+    action: "evidence-plan",
+    generatedAt: new Date().toISOString(),
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    fragmentsDir,
+    baseEvidenceFile,
+    mergedEvidenceFile,
+    requiredTargetIds: [...PHASE_FIVE_REQUIRED_TARGET_IDS],
+    targets,
+    controlHostCommands: [
+      registeredPullTargetId
+        ? `soloclaw phase5 evidence-template --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 evidence-template --json",
+      registeredPullTargetId
+        ? `soloclaw phase5 collection-runbook --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 collection-runbook --json",
+      registeredPullTargetId
+        ? `soloclaw phase5 collection-prepare --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 collection-prepare --json",
+      registeredPullTargetId
+        ? `soloclaw phase5 collector-pack --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 collector-pack --json",
+      `soloclaw phase5 evidence-merge --file ${baseEvidenceFile} --target-dir ${fragmentsDir} --output ${mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${mergedEvidenceFile} --json`,
+    ],
+    notes: [
+      "Save the full evidence template as the base evidence file before merging fragments.",
+      "Save each per-target evidence-template JSON as the listed fragment path after filling paste-safe observations.",
+      "Preflight every fragment with its target-specific evidence-check before sending it back to the control host.",
+      "Do not record control tokens, invite tokens, API keys, bearer tokens, raw invite bundles, raw SSE text, signed envelopes, or private keys.",
+    ],
+  };
+}
+
+function resolvePhaseFiveEvidencePlanRegisteredPullTargetId(targetId: string | undefined): string | undefined {
+  if (!targetId) {
+    return undefined;
+  }
+  if (!PHASE_FIVE_REMOTE_TARGET_IDS.some((candidate) => candidate === targetId)) {
+    throw new Error(`Unknown Phase 5 registered-agent pull target: ${targetId}. Expected one of: ${PHASE_FIVE_REMOTE_TARGET_IDS.join(", ")}`);
+  }
+  return targetId;
+}
+
+function formatPhaseFiveEvidencePlan(plan: PhaseFiveEvidencePlan): string {
+  return [
+    "Phase 5 evidence collection plan",
+    `fragmentsDir=${plan.fragmentsDir}`,
+    `base=${plan.baseEvidenceFile}`,
+    `merged=${plan.mergedEvidenceFile}`,
+    "",
+    "Targets:",
+    ...plan.targets.map((target) => `- ${target.id} (${target.role}) -> ${target.fragmentPath} guide=${target.collectorGuideCommand}`),
+    "",
+    "Control host commands:",
+    ...plan.controlHostCommands.map((command) => `- ${command}`),
+    "",
+    "Per-target commands are available with `--json`.",
+  ].join("\n");
+}
+
+function phaseFiveEvidenceStatusCommand(
+  baseEvidenceFile: string,
+  fragmentsDir: string,
+  options: { registeredPullTargetId?: string; targetId?: string } = {},
+): string {
+  const args = [
+    "soloclaw phase5 evidence-status",
+    `--file ${baseEvidenceFile}`,
+    `--target-dir ${fragmentsDir}`,
+    ...(options.targetId ? [`--target ${options.targetId}`] : []),
+    ...(options.registeredPullTargetId ? [`--registered-pull-target ${options.registeredPullTargetId}`] : []),
+    "--json",
+  ];
+  return args.join(" ");
+}
+
+function buildPhaseFiveCollectionRunbook(options: { registeredPullTargetId?: string } = {}): PhaseFiveCollectionRunbook {
+  const plan = buildPhaseFiveEvidencePlan();
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, plan);
+  const guidesDir = "phase5-collector-guides";
+  const commands = {
+    initializeEvidence: registeredPullTargetId
+      ? `soloclaw phase5 evidence-init --registered-pull-target ${registeredPullTargetId} --json`
+      : "soloclaw phase5 evidence-init --json",
+    writeCollectorGuides: registeredPullTargetId
+      ? `soloclaw phase5 collector-pack --registered-pull-target ${registeredPullTargetId} --json`
+      : "soloclaw phase5 collector-pack --json",
+    collectionStatus: phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, { registeredPullTargetId }),
+    mergeFragments: `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+    finalEvidenceCheck: `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+  };
+  const registeredPullControlHostRunbook = registeredPullTargetId
+    ? buildPhaseFiveRegisteredPullControlHostRunbook(registeredPullTargetId, {
+      fragmentsDir: plan.fragmentsDir,
+      guidesDir,
+    })
+    : undefined;
+  const registeredPullEvidenceFileHandoff = registeredPullTargetId
+    ? buildPhaseFiveRegisteredPullEvidenceFileHandoff()
+    : undefined;
+  const targetGuides = plan.targets.map((target) => {
+    const templateCommand = registeredPullTargetId
+      ? `soloclaw phase5 evidence-template --target ${target.id} --registered-pull-target ${registeredPullTargetId} --json`
+      : target.templateCommand;
+    const statusCommand = phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, {
+      registeredPullTargetId,
+      targetId: target.id,
+    });
+    const mergeCommand = `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`;
+    const finalCheckCommand = `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`;
+    const registeredPullRunbook = registeredPullTargetId === target.id
+      ? buildPhaseFiveRegisteredPullRunbook(target.id)
+      : undefined;
+    const operatorNextCommands = buildPhaseFiveCollectorGuideOperatorNextCommands({
+      templateCommand,
+      preflightCommand: target.preflightCommand,
+      registeredPullRunbook,
+      registeredPullControlHostRunbook: target.id === "control-plane-host" ? registeredPullControlHostRunbook : undefined,
+      returnToControlHost: {
+        copyFragmentTo: target.fragmentPath,
+        statusCommand,
+        mergeCommand,
+        finalCheckCommand,
+      },
+    });
+    const evidenceFileHandoff = registeredPullEvidenceFileHandoff && (target.id === registeredPullTargetId || target.id === "control-plane-host")
+      ? registeredPullEvidenceFileHandoff
+      : undefined;
+    return {
+      targetId: target.id,
+      label: target.label,
+      role: target.role,
+      guidePath: `${guidesDir}/${target.id}.md`,
+      fragmentPath: target.fragmentPath,
+      matrixCommand: target.matrixCommand,
+      templateCommand,
+      preflightCommand: target.preflightCommand,
+      statusCommand,
+      collectorGuideCommand: phaseFiveCollectorGuideCommand(target.id, registeredPullTargetId),
+      isRegisteredPullTarget: registeredPullTargetId === target.id,
+      ...(operatorNextCommands.length > 0 ? { operatorNextCommands } : {}),
+      ...(evidenceFileHandoff ? { evidenceFileHandoff } : {}),
+    };
+  });
+  return {
+    phase: "phase5",
+    action: "collection-runbook",
+    generatedAt: new Date().toISOString(),
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    fragmentsDir: plan.fragmentsDir,
+    guidesDir,
+    baseEvidenceFile: plan.baseEvidenceFile,
+    mergedEvidenceFile: plan.mergedEvidenceFile,
+    requiredTargetIds: [...plan.requiredTargetIds],
+    commands,
+    targetGuides,
+    ...(registeredPullEvidenceFileHandoff ? { registeredPullEvidenceFileHandoff } : {}),
+    ...(registeredPullControlHostRunbook ? { registeredPullControlHostRunbook } : {}),
+    steps: [
+      {
+        id: "initialize-evidence",
+        label: "Initialize base and target fragments",
+        command: commands.initializeEvidence,
+        summary: "Create the base matrix template plus one token-safe fragment template per required target.",
+      },
+      {
+        id: "write-collector-guides",
+        label: "Write per-target collector guides",
+        command: commands.writeCollectorGuides,
+        summary: "Generate Markdown handoffs under the guide directory without adding JSON files to the fragment directory.",
+      },
+      {
+        id: "distribute-target-materials",
+        label: "Distribute each target's material",
+        summary: "Send each operator only their matching guide, target-specific invite bundle, and fragment template path.",
+      },
+      {
+        id: "collect-fragments",
+        label: "Collect preflighted target fragments",
+        summary: "Each target runs its preflight command before returning the filled JSON fragment to the control host.",
+      },
+      {
+        id: "watch-status",
+        label: "Watch collection status",
+        command: commands.collectionStatus,
+        summary: "Read valid fragments, invalid-fragment diagnostics, room readiness, and remaining targets without writing a merge output.",
+      },
+      {
+        id: "merge-fragments",
+        label: "Merge collected fragments",
+        command: commands.mergeFragments,
+        summary: "Batch-merge first-level JSON fragments and write the merged matrix for final validation.",
+      },
+      {
+        id: "final-evidence-check",
+        label: "Run final evidence gate",
+        command: commands.finalEvidenceCheck,
+        summary: "Validate the merged real-machine matrix evidence before counting Phase 5 as accepted.",
+      },
+    ],
+    notes: [
+      "This runbook is a control-host collection helper; final Phase 5 acceptance still requires the merged real-machine evidence-check gate to pass.",
+      registeredPullTargetId
+        ? `Registered-agent pull target is ${registeredPullTargetId}: that target runs remote register, the control host runs room pull-agent, the target confirms remote invitations, runs remote accept-room, and then runs remote run after the control host sends the routed task.`
+        : "For registered-agent pull evidence, choose one real remote target as <registered-pull-target-id>: that target runs remote register, the control host runs room pull-agent, the target confirms remote invitations, runs remote accept-room, and then runs remote run after the control host sends the routed task.",
+      "Default collector guides are token-safe and omit target smoke commands; add --include-smoke-commands only for a separate execution handoff with placeholders.",
+      "Do not record control tokens, invite tokens, API keys, bearer tokens, raw invite bundles, raw SSE text, signed envelopes, or private keys.",
+      "Keep guide files under phase5-collector-guides and filled JSON fragments under phase5-fragments so status and merge commands read only evidence JSON.",
+    ],
+  };
+}
+
+function formatPhaseFiveCollectionRunbook(runbook: PhaseFiveCollectionRunbook): string {
+  return [
+    "Phase 5 collection runbook",
+    `base=${runbook.baseEvidenceFile}`,
+    `fragmentsDir=${runbook.fragmentsDir}`,
+    `guidesDir=${runbook.guidesDir}`,
+    `merged=${runbook.mergedEvidenceFile}`,
+    `registeredPullTarget=${runbook.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    "",
+    "Steps:",
+    ...runbook.steps.map((step) => `- ${step.id}: ${step.command ?? step.summary}`),
+    "",
+    "Target guides:",
+    ...runbook.targetGuides.map((target) => `- ${target.targetId} (${target.role}) guide=${target.guidePath} fragment=${target.fragmentPath} status=${target.statusCommand} collectorGuide=${target.collectorGuideCommand}${target.isRegisteredPullTarget ? " registeredPullTarget=true" : ""}`),
+    ...runbook.targetGuides.flatMap((target) => target.operatorNextCommands?.length
+      ? [
+        "",
+        `Operator next commands for ${target.targetId}:`,
+        ...target.operatorNextCommands.map((command) => `- ${command}`),
+      ]
+      : []),
+    ...(runbook.registeredPullEvidenceFileHandoff
+      ? [
+        "",
+        ...formatPhaseFiveRegisteredPullEvidenceFileHandoff(runbook.registeredPullEvidenceFileHandoff),
+      ]
+      : []),
+    "",
+    ...(runbook.registeredPullControlHostRunbook
+      ? [
+        "Registered-agent pull control-host runbook:",
+        `- target=${runbook.registeredPullControlHostRunbook.targetId}`,
+        `- targetGuide=${runbook.registeredPullControlHostRunbook.targetGuidePath}`,
+        `- targetFragment=${runbook.registeredPullControlHostRunbook.targetFragmentPath}`,
+        `- controlFragment=${runbook.registeredPullControlHostRunbook.controlFragmentPath}`,
+        ...runbook.registeredPullControlHostRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        "Registered-agent pull evidence field hints:",
+        ...runbook.registeredPullControlHostRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+        "",
+      ]
+      : []),
+    "Notes:",
+    ...runbook.notes.map((note) => `- ${note}`),
+  ].join("\n");
+}
+
+function formatPhaseFiveCollectionRunbookMarkdown(runbook: PhaseFiveCollectionRunbook): string {
+  return [
+    "# Phase 5 Collection Runbook",
+    "",
+    `- Base evidence file: ${runbook.baseEvidenceFile}`,
+    `- Fragments directory: ${runbook.fragmentsDir}`,
+    `- Collector guides directory: ${runbook.guidesDir}`,
+    `- Merged evidence file: ${runbook.mergedEvidenceFile}`,
+    `- Registered-agent pull target: ${runbook.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    "",
+    "## Commands",
+    "",
+    "```text",
+    runbook.commands.initializeEvidence,
+    runbook.commands.writeCollectorGuides,
+    runbook.commands.collectionStatus,
+    runbook.commands.mergeFragments,
+    runbook.commands.finalEvidenceCheck,
+    "```",
+    "",
+    "## Steps",
+    "",
+    ...runbook.steps.map((step) => `- ${step.id}: ${step.command ?? step.summary}`),
+    "",
+    "## Target Guides",
+    "",
+    ...runbook.targetGuides.map((target) => `- ${target.targetId}: guide=${target.guidePath}, fragment=${target.fragmentPath}, preflight=${target.preflightCommand}, status=${target.statusCommand}, collectorGuide=${target.collectorGuideCommand}, registeredPullTarget=${target.isRegisteredPullTarget ? "true" : "false"}`),
+    "",
+    ...(runbook.targetGuides.some((target) => target.operatorNextCommands?.length)
+      ? [
+        "## Target Operator Next Commands",
+        "",
+        ...runbook.targetGuides.flatMap((target) => target.operatorNextCommands?.length
+          ? [
+            `### ${target.targetId}`,
+            "",
+            "```text",
+            ...target.operatorNextCommands,
+            "```",
+            "",
+          ]
+          : []),
+      ]
+      : []),
+    ...(runbook.registeredPullEvidenceFileHandoff
+      ? [
+        ...formatPhaseFiveRegisteredPullEvidenceFileHandoffMarkdown(runbook.registeredPullEvidenceFileHandoff),
+      ]
+      : []),
+    ...(runbook.registeredPullControlHostRunbook
+      ? [
+        "## Registered-Agent Pull Control-Host Runbook",
+        "",
+        `- Target: ${runbook.registeredPullControlHostRunbook.targetId}`,
+        `- Target guide: ${runbook.registeredPullControlHostRunbook.targetGuidePath}`,
+        `- Target fragment: ${runbook.registeredPullControlHostRunbook.targetFragmentPath}`,
+        `- Control fragment: ${runbook.registeredPullControlHostRunbook.controlFragmentPath}`,
+        "",
+        ...runbook.registeredPullControlHostRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        "",
+        "Evidence field hints:",
+        "",
+        ...runbook.registeredPullControlHostRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+        "",
+        ...runbook.registeredPullControlHostRunbook.notes.map((note) => `- ${note}`),
+        "",
+      ]
+      : []),
+    "## Notes",
+    "",
+    ...runbook.notes.map((note) => `- ${note}`),
+    "",
+  ].join("\n");
+}
+
+function parsePhaseFiveRunbookOutputPathOption(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--output" || arg === "--runbook-file") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      return value;
+    }
+    if (arg.startsWith("--output=")) {
+      const value = arg.slice("--output=".length);
+      if (!value) {
+        throw new Error("Missing value for --output.");
+      }
+      return value;
+    }
+    if (arg.startsWith("--runbook-file=")) {
+      const value = arg.slice("--runbook-file=".length);
+      if (!value) {
+        throw new Error("Missing value for --runbook-file.");
+      }
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function parsePhaseFiveCollectionPrepareArgs(args: string[]): PhaseFiveCollectionPrepareArgs {
+  let runbookFilePath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--runbook-file") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --runbook-file.");
+      }
+      runbookFilePath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--runbook-file=")) {
+      const value = arg.slice("--runbook-file=".length);
+      if (!value) {
+        throw new Error("Missing value for --runbook-file.");
+      }
+      runbookFilePath = value;
+      continue;
+    }
+  }
+  return {
+    runbookFilePath,
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    force: args.includes("--force"),
+    json: args.includes("--json"),
+  };
+}
+
+async function buildPhaseFiveCollectionPrepare(cwd: string, options: PhaseFiveCollectionPrepareArgs): Promise<PhaseFiveCollectionPrepareResult> {
+  const plan = buildPhaseFiveEvidencePlan();
+  const evidenceInit = await buildPhaseFiveEvidenceInit(cwd, {
+    force: options.force,
+    registeredPullTargetId: options.registeredPullTargetId,
+    json: false,
+  });
+  const collectorPack = await buildPhaseFiveCollectorPack(cwd, {
+    force: options.force,
+    includeSmokeCommands: false,
+    registeredPullTargetId: options.registeredPullTargetId,
+    json: false,
+  });
+  const runbook = buildPhaseFiveCollectionRunbook({
+    registeredPullTargetId: options.registeredPullTargetId,
+  });
+  const runbookFilePath = options.runbookFilePath ?? "phase5-collection-runbook.md";
+  const runbookFile = await writeTextFileInsideWorkspace(cwd, runbookFilePath, formatPhaseFiveCollectionRunbookMarkdown(runbook), {
+    force: options.force,
+    optionName: "--runbook-file",
+    description: "Phase 5 collection runbook output",
+  });
+  const registeredPullTargetId = evidenceInit.registeredPullTargetId;
+  const registeredPullOperatorNext = registeredPullTargetId
+    ? buildPhaseFiveRegisteredPullOperatorNextForTarget(registeredPullTargetId, { status: "incomplete" })
+    : undefined;
+  const registeredPullOperatorNextFile = registeredPullOperatorNext
+    ? await writeJsonFileInsideWorkspace(cwd, "phase5-registered-pull-operator-next.json", registeredPullOperatorNext, {
+      force: options.force,
+      optionName: "--registered-pull-target",
+    })
+    : undefined;
+  return {
+    phase: "phase5",
+    action: "collection-prepare",
+    status: "pass",
+    generatedAt: new Date().toISOString(),
+    force: options.force,
+    registeredPullTargetId,
+    baseEvidenceFile: evidenceInit.baseEvidenceFile,
+    fragmentsDir: evidenceInit.fragmentsDir,
+    fragments: evidenceInit.fragments,
+    guidesDir: collectorPack.guidesDir,
+    guides: collectorPack.guides,
+    runbookFile,
+    ...(registeredPullOperatorNextFile ? { registeredPullOperatorNextFile } : {}),
+    ...(registeredPullOperatorNext ? { registeredPullOperatorNext } : {}),
+    nextCommands: [
+      phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, { registeredPullTargetId }),
+      `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+    ],
+    notes: [
+      "This command writes token-safe collection scaffolding only; it does not create control tokens, invite tokens, private keys, or signed envelopes.",
+      "Distribute each guide with the matching target-specific invite bundle, then collect only the filled JSON fragment back into phase5-fragments.",
+      options.registeredPullTargetId
+        ? `Registered-agent pull target is ${options.registeredPullTargetId}; only that target should run the registered-pull remote register/invitations/accept/run sequence.`
+        : "Choose one remote target for registered-agent pull before real collection, or pass --registered-pull-target <target-id> to mark the selected guide.",
+      "Final Phase 5 acceptance still requires real merged cross-machine evidence to pass the full evidence-check gate.",
+    ],
+  };
+}
+
+function formatPhaseFiveCollectionPrepare(result: PhaseFiveCollectionPrepareResult): string {
+  return [
+    "Phase 5 collection prepare: pass",
+    `base=${result.baseEvidenceFile.path}`,
+    `fragmentsDir=${result.fragmentsDir.path}`,
+    `fragments=${result.fragments.length}`,
+    `guidesDir=${result.guidesDir.path}`,
+    `guides=${result.guides.length}`,
+    `runbook=${result.runbookFile.path}`,
+    ...(result.registeredPullOperatorNextFile ? [`registeredPullOperatorNext=${path.basename(result.registeredPullOperatorNextFile.path)}`] : []),
+    `registeredPullTarget=${result.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    result.force ? "overwrite=force" : "overwrite=false",
+    "",
+    "Fragments:",
+    ...result.fragments.map((fragment) => `- ${fragment.targetId} (${fragment.role}) -> ${fragment.path} template=${fragment.templateCommand} preflight=${fragment.preflightCommand} status=${fragment.statusCommand} guide=${fragment.collectorGuideCommand}`),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].join("\n");
+}
+
+function parsePhaseFiveRegisteredPullOperatorNextArgs(args: string[]): PhaseFiveRegisteredPullOperatorNextArgs {
+  let outputPath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--output") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --output.");
+      }
+      outputPath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--output=")) {
+      const value = arg.slice("--output=".length);
+      if (!value) {
+        throw new Error("Missing value for --output.");
+      }
+      outputPath = value;
+      continue;
+    }
+  }
+  return {
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    outputPath,
+    force: args.includes("--force"),
+    json: args.includes("--json"),
+  };
+}
+
+async function buildPhaseFiveRegisteredPullOperatorNext(
+  cwd: string,
+  options: PhaseFiveRegisteredPullOperatorNextArgs,
+): Promise<PhaseFiveRegisteredPullOperatorNextResult> {
+  const basePlan = buildPhaseFiveEvidencePlan();
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, basePlan);
+  if (!registeredPullTargetId) {
+    throw new Error("Missing --registered-pull-target for Phase 5 registered-pull-operator-next.");
+  }
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+  const registeredPullOperatorNext = buildPhaseFiveRegisteredPullOperatorNextForTarget(registeredPullTargetId, {
+    status: "incomplete",
+  });
+  const outputFile = await writeJsonFileInsideWorkspace(
+    cwd,
+    options.outputPath ?? "phase5-registered-pull-operator-next.json",
+    registeredPullOperatorNext,
+    {
+      force: options.force,
+      optionName: "--output",
+    },
+  );
+  return {
+    phase: "phase5",
+    action: "registered-pull-operator-next",
+    status: "pass",
+    generatedAt: new Date().toISOString(),
+    force: options.force,
+    registeredPullTargetId,
+    outputFile,
+    registeredPullOperatorNext,
+    nextCommands: [
+      phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, { registeredPullTargetId }),
+      `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+    ],
+    notes: [
+      "This command writes only the registered-agent pull operator-next handoff; it does not modify base evidence, fragments, collector guides, or runbooks.",
+      "The handoff uses placeholders and AGENT_CONTROL_TOKEN references instead of raw control tokens, invite tokens, private keys, signed envelopes, or raw SSE text.",
+      "Final Phase 5 acceptance still requires real merged cross-machine evidence to pass the full evidence-check gate.",
+    ],
+  };
+}
+
+function formatPhaseFiveRegisteredPullOperatorNext(result: PhaseFiveRegisteredPullOperatorNextResult): string {
+  return [
+    "Phase 5 registered-pull operator next: pass",
+    `target=${result.registeredPullTargetId}`,
+    `output=${result.outputFile.path}`,
+    result.force ? "overwrite=force" : "overwrite=false",
+    "",
+    "Selected-target commands:",
+    ...result.registeredPullOperatorNext.selectedTarget.operatorNextCommands.map((command) => `- ${command}`),
+    "",
+    "Control-host commands:",
+    ...result.registeredPullOperatorNext.controlHost.operatorNextCommands.map((command) => `- ${command}`),
+    "",
+    ...formatPhaseFiveRegisteredPullEvidenceFileHandoff(result.registeredPullOperatorNext.evidenceFileHandoff),
+    "",
+    "Evidence field hints:",
+    ...result.registeredPullOperatorNext.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].join("\n");
+}
+
+function formatPhaseFiveRegisteredPullEvidenceFileHandoff(
+  handoff: PhaseFiveRegisteredPullEvidenceFileHandoff,
+): string[] {
+  return [
+    "Evidence file handoff:",
+    "Selected target produces:",
+    ...handoff.selectedTargetProduces.map((file) => `- ${file.path} -> ${file.controlHostCopyTo}`),
+    "Control host produces:",
+    ...handoff.controlHostProduces.map((file) => `- ${file.path} -> ${file.consumedBy}`),
+    "Patch inputs:",
+    `- ${handoff.patchInputs.join(", ")}`,
+    `Patch output=${handoff.patchOutputFile} pastePath=${handoff.pastePath}`,
+  ];
+}
+
+function formatPhaseFiveRegisteredPullEvidenceFileHandoffMarkdown(
+  handoff: PhaseFiveRegisteredPullEvidenceFileHandoff,
+): string[] {
+  return [
+    "## Evidence File Handoff",
+    "",
+    "Selected target produces:",
+    "",
+    ...handoff.selectedTargetProduces.map((file) => `- ${file.path} -> ${file.controlHostCopyTo}`),
+    "",
+    "Control host produces:",
+    "",
+    ...handoff.controlHostProduces.map((file) => `- ${file.path} -> ${file.consumedBy}`),
+    "",
+    "Patch inputs:",
+    "",
+    `- ${handoff.patchInputs.join(", ")}`,
+    "",
+    `Patch output=${handoff.patchOutputFile} pastePath=${handoff.pastePath}`,
+    "",
+  ];
+}
+
+function parsePhaseFiveRegisteredPullEvidencePatchArgs(args: string[]): PhaseFiveRegisteredPullEvidencePatchArgs {
+  let statusFilePath = ".agent/tmp/phase5-registered-pull-status.json";
+  let pullAgentFilePath: string | undefined;
+  let invitationsFilePath: string | undefined;
+  let acceptRoomFilePath: string | undefined;
+  let roomShowFilePath: string | undefined;
+  let deliveryStatusFilePath: string | undefined;
+  let outputPath: string | undefined;
+  let controlFragmentFilePath: string | undefined;
+  let patchedControlFragmentOutputPath: string | undefined;
+  let agentId: string | undefined;
+  let role: string | undefined;
+  let taskMessageId: string | undefined;
+  let replyMessageId: string | undefined;
+  let replySignatureStatus: string | undefined;
+  let deliveryStatusPendingCount: number | undefined;
+  const aliases: string[] = [];
+  const transcriptEventKinds: string[] = [];
+
+  const consumeValue = (index: number, name: string): { value: string; index: number } => {
+    const arg = args[index];
+    if (arg.startsWith(`${name}=`)) {
+      const value = arg.slice(name.length + 1);
+      if (!value) {
+        throw new Error(`Missing value for ${name}.`);
+      }
+      return { value, index };
+    }
+    const value = args[index + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`Missing value for ${name}.`);
+    }
+    return { value, index: index + 1 };
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--registered" || arg === "--invitation-listed" || arg === "--accepted" || arg === "--force" || arg === "--json") {
+      continue;
+    }
+    if (arg === "--status-file" || arg.startsWith("--status-file=")) {
+      const consumed = consumeValue(index, "--status-file");
+      statusFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--pull-agent-file" || arg.startsWith("--pull-agent-file=")) {
+      const consumed = consumeValue(index, "--pull-agent-file");
+      pullAgentFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--invitations-file" || arg.startsWith("--invitations-file=")) {
+      const consumed = consumeValue(index, "--invitations-file");
+      invitationsFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--accept-room-file" || arg.startsWith("--accept-room-file=")) {
+      const consumed = consumeValue(index, "--accept-room-file");
+      acceptRoomFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--room-show-file" || arg.startsWith("--room-show-file=")) {
+      const consumed = consumeValue(index, "--room-show-file");
+      roomShowFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--delivery-status-file" || arg.startsWith("--delivery-status-file=")) {
+      const consumed = consumeValue(index, "--delivery-status-file");
+      deliveryStatusFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--output" || arg.startsWith("--output=")) {
+      const consumed = consumeValue(index, "--output");
+      outputPath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--control-fragment-file" || arg.startsWith("--control-fragment-file=")) {
+      const consumed = consumeValue(index, "--control-fragment-file");
+      controlFragmentFilePath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--patched-control-fragment-output" || arg.startsWith("--patched-control-fragment-output=")) {
+      const consumed = consumeValue(index, "--patched-control-fragment-output");
+      patchedControlFragmentOutputPath = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--agent-id" || arg.startsWith("--agent-id=")) {
+      const consumed = consumeValue(index, "--agent-id");
+      agentId = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--role" || arg.startsWith("--role=")) {
+      const consumed = consumeValue(index, "--role");
+      role = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--alias" || arg.startsWith("--alias=")) {
+      const consumed = consumeValue(index, "--alias");
+      aliases.push(consumed.value);
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--task-message-id" || arg.startsWith("--task-message-id=")) {
+      const consumed = consumeValue(index, "--task-message-id");
+      taskMessageId = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--reply-message-id" || arg.startsWith("--reply-message-id=")) {
+      const consumed = consumeValue(index, "--reply-message-id");
+      replyMessageId = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--reply-signature-status" || arg.startsWith("--reply-signature-status=")) {
+      const consumed = consumeValue(index, "--reply-signature-status");
+      replySignatureStatus = consumed.value;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--delivery-status-pending-count" || arg.startsWith("--delivery-status-pending-count=")) {
+      const consumed = consumeValue(index, "--delivery-status-pending-count");
+      const parsed = Number(consumed.value);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        throw new Error("--delivery-status-pending-count must be a non-negative integer.");
+      }
+      deliveryStatusPendingCount = parsed;
+      index = consumed.index;
+      continue;
+    }
+    if (arg === "--transcript-event-kind" || arg.startsWith("--transcript-event-kind=")) {
+      const consumed = consumeValue(index, "--transcript-event-kind");
+      transcriptEventKinds.push(consumed.value);
+      index = consumed.index;
+      continue;
+    }
+  }
+
+  if (controlFragmentFilePath && !patchedControlFragmentOutputPath) {
+    throw new Error("--control-fragment-file requires --patched-control-fragment-output.");
+  }
+  if (patchedControlFragmentOutputPath && !controlFragmentFilePath) {
+    throw new Error("--patched-control-fragment-output requires --control-fragment-file.");
+  }
+
+  return {
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    statusFilePath,
+    pullAgentFilePath,
+    invitationsFilePath,
+    acceptRoomFilePath,
+    roomShowFilePath,
+    deliveryStatusFilePath,
+    outputPath,
+    controlFragmentFilePath,
+    patchedControlFragmentOutputPath,
+    force: args.includes("--force"),
+    json: args.includes("--json"),
+    agentId,
+    registered: args.includes("--registered"),
+    invitationListed: args.includes("--invitation-listed"),
+    accepted: args.includes("--accepted"),
+    role,
+    aliases,
+    taskMessageId,
+    replyMessageId,
+    replySignatureStatus,
+    deliveryStatusPendingCount,
+    transcriptEventKinds,
+  };
+}
+
+async function buildPhaseFiveRegisteredPullCommandSummary(
+  cwd: string,
+  options: PhaseFiveRegisteredPullEvidencePatchArgs,
+): Promise<PhaseFiveRegisteredPullCommandSummary> {
+  const pullAgent = options.pullAgentFilePath
+    ? parsePhaseFiveRegisteredPullAgentFile(await readPhaseFiveRegisteredPullCommandFile(cwd, options.pullAgentFilePath, "--pull-agent-file"))
+    : { aliases: [] };
+  const invitations = options.invitationsFilePath
+    ? parsePhaseFiveRegisteredPullInvitationsFile(await readPhaseFiveRegisteredPullCommandFile(cwd, options.invitationsFilePath, "--invitations-file"))
+    : { aliases: [] };
+  const acceptRoom = options.acceptRoomFilePath
+    ? parsePhaseFiveRegisteredPullAcceptRoomFile(await readPhaseFiveRegisteredPullCommandFile(cwd, options.acceptRoomFilePath, "--accept-room-file"))
+    : { aliases: [] };
+  return {
+    agentId: acceptRoom.agentId ?? pullAgent.agentId ?? invitations.agentId,
+    registered: pullAgent.registered === true,
+    invitationListed: invitations.invitationListed === true,
+    accepted: acceptRoom.accepted === true,
+    role: pullAgent.role ?? acceptRoom.role ?? invitations.role,
+    aliases: pullAgent.aliases.length > 0 ? pullAgent.aliases : acceptRoom.aliases.length > 0 ? acceptRoom.aliases : invitations.aliases,
+  };
+}
+
+async function readPhaseFiveRegisteredPullCommandFile(cwd: string, inputPath: string, optionName: string): Promise<unknown> {
+  const filePath = assertPathInsideWorkspace(cwd, inputPath, optionName);
+  return JSON.parse(await readUtf8(filePath));
+}
+
+function parsePhaseFiveRegisteredPullAgentFile(value: unknown): PhaseFiveRegisteredPullCommandSummary {
+  if (!isRecord(value)) {
+    throw new Error("Phase 5 registered-pull --pull-agent-file must be a JSON object.");
+  }
+  const member = isRecord(value.member) ? value.member : {};
+  const actor = isRecord(member.actor) ? member.actor : {};
+  const agentId = actor.type === "agent" ? optionalNonEmptyString(actor.id) : undefined;
+  return {
+    agentId,
+    registered: Boolean(agentId),
+    role: optionalNonEmptyString(member.role),
+    aliases: stringArrayEvidenceField(member.aliases),
+  };
+}
+
+function parsePhaseFiveRegisteredPullInvitationsFile(value: unknown): PhaseFiveRegisteredPullCommandSummary {
+  if (!isRecord(value)) {
+    throw new Error("Phase 5 registered-pull --invitations-file must be a JSON object.");
+  }
+  const agent = isRecord(value.agent) ? value.agent : {};
+  const invitations = Array.isArray(value.invitations) ? value.invitations : [];
+  const listedInvitation = invitations.find((candidate) => {
+    if (!isRecord(candidate)) {
+      return false;
+    }
+    const member = isRecord(candidate.member) ? candidate.member : {};
+    const status = optionalNonEmptyString(member.status);
+    return status === "invited" || status === "active";
+  });
+  const member = isRecord(listedInvitation) && isRecord(listedInvitation.member) ? listedInvitation.member : {};
+  return {
+    agentId: optionalNonEmptyString(agent.id),
+    invitationListed: Boolean(listedInvitation),
+    role: optionalNonEmptyString(member.role),
+    aliases: stringArrayEvidenceField(member.aliases),
+  };
+}
+
+function parsePhaseFiveRegisteredPullAcceptRoomFile(value: unknown): PhaseFiveRegisteredPullCommandSummary {
+  if (!isRecord(value)) {
+    throw new Error("Phase 5 registered-pull --accept-room-file must be a JSON object.");
+  }
+  const agent = isRecord(value.agent) ? value.agent : {};
+  const member = isRecord(value.member) ? value.member : {};
+  const actor = isRecord(member.actor) ? member.actor : {};
+  const pullEvidence = isRecord(value.pullEvidence) ? value.pullEvidence : {};
+  const actorAgentId = actor.type === "agent" ? optionalNonEmptyString(actor.id) : undefined;
+  const status = optionalNonEmptyString(member.status);
+  return {
+    agentId: actorAgentId ?? optionalNonEmptyString(agent.id),
+    accepted: pullEvidence.acceptedFromRoomInvitation === true || status === "active",
+    role: optionalNonEmptyString(member.role),
+    aliases: stringArrayEvidenceField(member.aliases),
+  };
+}
+
+async function buildPhaseFiveRegisteredPullControlSummary(
+  cwd: string,
+  options: PhaseFiveRegisteredPullEvidencePatchArgs,
+  input: { agentId?: string; taskMessageId?: string },
+): Promise<PhaseFiveRegisteredPullControlSummary> {
+  const roomShow = options.roomShowFilePath
+    ? parsePhaseFiveRegisteredPullRoomShowFile(
+        await readPhaseFiveRegisteredPullCommandFile(cwd, options.roomShowFilePath, "--room-show-file"),
+        input,
+      )
+    : { transcriptEventKinds: [] };
+  const deliveryStatus = options.deliveryStatusFilePath
+    ? parsePhaseFiveRegisteredPullDeliveryStatusFile(
+        await readPhaseFiveRegisteredPullCommandFile(cwd, options.deliveryStatusFilePath, "--delivery-status-file"),
+        input.agentId,
+      )
+    : { transcriptEventKinds: [] };
+  return {
+    replyMessageId: roomShow.replyMessageId,
+    replySignatureStatus: roomShow.replySignatureStatus,
+    deliveryStatusPendingCount: deliveryStatus.deliveryStatusPendingCount,
+    transcriptEventKinds: roomShow.transcriptEventKinds,
+  };
+}
+
+function parsePhaseFiveRegisteredPullRoomShowFile(
+  value: unknown,
+  input: { taskMessageId?: string },
+): PhaseFiveRegisteredPullControlSummary {
+  if (!isRecord(value)) {
+    throw new Error("Phase 5 registered-pull --room-show-file must be a JSON object.");
+  }
+  const messages = Array.isArray(value.messages) ? value.messages.filter(isRecord) : [];
+  const taskMessage = input.taskMessageId
+    ? messages.find((message) => optionalNonEmptyString(message.id) === input.taskMessageId)
+    : messages.find((message) => optionalNonEmptyString(message.kind) === "task");
+  const replyMessage = messages.find((message) => {
+    if (optionalNonEmptyString(message.id) === optionalNonEmptyString(taskMessage?.id)) {
+      return false;
+    }
+    const kind = optionalNonEmptyString(message.kind);
+    const metadata = isRecord(message.metadata) ? message.metadata : {};
+    const remoteIntentSignatureStatus = optionalNonEmptyString(metadata.remoteIntentSignatureStatus);
+    return (kind === "chat" || kind === "decision") && Boolean(remoteIntentSignatureStatus ?? optionalNonEmptyString(message.signatureStatus));
+  });
+  const replyMetadata = isRecord(replyMessage?.metadata) ? replyMessage.metadata : {};
+  const transcriptEventKinds = [
+    optionalNonEmptyString(taskMessage?.kind),
+    optionalNonEmptyString(replyMessage?.kind),
+  ].filter((kind, index, all): kind is string => Boolean(kind) && all.indexOf(kind) === index);
+  return {
+    replyMessageId: optionalNonEmptyString(replyMessage?.id),
+    replySignatureStatus: optionalNonEmptyString(replyMetadata.remoteIntentSignatureStatus) ?? optionalNonEmptyString(replyMessage?.signatureStatus),
+    transcriptEventKinds,
+  };
+}
+
+function parsePhaseFiveRegisteredPullDeliveryStatusFile(
+  value: unknown,
+  agentId: string | undefined,
+): PhaseFiveRegisteredPullControlSummary {
+  if (!isRecord(value)) {
+    throw new Error("Phase 5 registered-pull --delivery-status-file must be a JSON object.");
+  }
+  const agents = Array.isArray(value.agents) ? value.agents.filter(isRecord) : [];
+  const selectedAgent = agentId
+    ? agents.find((agent) => optionalNonEmptyString(agent.agentId) === agentId)
+    : agents[0];
+  const pendingRoutedCount = selectedAgent && typeof selectedAgent.pendingRoutedCount === "number" && Number.isFinite(selectedAgent.pendingRoutedCount)
+    ? selectedAgent.pendingRoutedCount
+    : undefined;
+  return {
+    deliveryStatusPendingCount: pendingRoutedCount,
+    transcriptEventKinds: [],
+  };
+}
+
+async function buildPhaseFiveRegisteredPullEvidencePatch(
+  cwd: string,
+  options: PhaseFiveRegisteredPullEvidencePatchArgs,
+): Promise<PhaseFiveRegisteredPullEvidencePatchResult> {
+  const basePlan = buildPhaseFiveEvidencePlan();
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, basePlan);
+  if (!registeredPullTargetId) {
+    throw new Error("Missing --registered-pull-target for Phase 5 registered-pull-evidence-patch.");
+  }
+  const statusFilePath = assertPathInsideWorkspace(cwd, options.statusFilePath, "--status-file");
+  const runnerStatus = parsePhaseFiveRegisteredPullRunnerStatus(JSON.parse(await readUtf8(statusFilePath)), statusFilePath);
+  const commandSummary = await buildPhaseFiveRegisteredPullCommandSummary(cwd, options);
+  const lastHeartbeat = isRecord(runnerStatus.lastHeartbeat) ? runnerStatus.lastHeartbeat : undefined;
+  const lastAckMessageId = optionalNonEmptyString(runnerStatus.lastAckMessageId);
+  const taskMessageId = options.taskMessageId ?? lastAckMessageId;
+  const agentId = options.agentId ?? commandSummary.agentId ?? optionalNonEmptyString(runnerStatus.agentId);
+  const controlSummary = await buildPhaseFiveRegisteredPullControlSummary(cwd, options, { agentId, taskMessageId });
+  const messagesProcessed = typeof runnerStatus.messagesProcessed === "number" && Number.isFinite(runnerStatus.messagesProcessed)
+    ? runnerStatus.messagesProcessed
+    : 0;
+  const aliases = options.aliases.length > 0 ? options.aliases : commandSummary.aliases.length > 0 ? commandSummary.aliases : ["registered-pull"];
+  const replyMessageId = options.replyMessageId ?? controlSummary.replyMessageId;
+  const transcriptEventKinds = options.transcriptEventKinds.length > 0 ? options.transcriptEventKinds : controlSummary.transcriptEventKinds;
+  const deliveryStatusPendingCount = options.deliveryStatusPendingCount ?? controlSummary.deliveryStatusPendingCount;
+  const registeredAgentPull: Record<string, unknown> = {
+    targetId: registeredPullTargetId,
+    ...(agentId ? { agentId } : {}),
+    registered: options.registered || commandSummary.registered === true,
+    invitationListed: options.invitationListed || commandSummary.invitationListed === true,
+    accepted: options.accepted || commandSummary.accepted === true,
+    role: options.role ?? commandSummary.role ?? "executor",
+    aliases,
+    ...(taskMessageId ? { taskMessageId } : {}),
+    ...(replyMessageId ? { replyMessageId } : {}),
+    handledMessages: lastAckMessageId ? [lastAckMessageId] : taskMessageId ? [taskMessageId] : [],
+    messagesProcessed,
+    ackSigned: runnerStatus.lastAckSigned === true,
+    replySignatureStatus: options.replySignatureStatus ?? controlSummary.replySignatureStatus ?? "unknown",
+    heartbeatStatus: optionalNonEmptyString(lastHeartbeat?.status) ?? "unknown",
+    runStopReason: optionalNonEmptyString(runnerStatus.stopReason) ?? "unknown",
+    ...(deliveryStatusPendingCount !== undefined ? { deliveryStatusPendingCount } : {}),
+    transcriptEventKinds,
+  };
+  const targetById = new Map<string, Record<string, unknown>>();
+  if (agentId) {
+    targetById.set(registeredPullTargetId, { agentId });
+  }
+  const validation = validatePhaseFiveRegisteredAgentPull(registeredAgentPull, targetById);
+  const patch = {
+    room: {
+      registeredAgentPull,
+    },
+  };
+  const outputFile = options.outputPath
+    ? await writeTextFileInsideWorkspace(cwd, options.outputPath, `${JSON.stringify(patch, null, 2)}\n`, {
+      force: options.force,
+      optionName: "--output",
+      description: "Phase 5 registered-pull evidence patch output",
+    })
+    : undefined;
+  const patchedControlFragmentFile = await writePhaseFiveRegisteredPullPatchedControlFragment(cwd, options, registeredAgentPull);
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+  const controlHost = plan.targets.find((target) => target.id === "control-plane-host");
+  if (!controlHost) {
+    throw new Error("Unable to build Phase 5 control-plane next commands.");
+  }
+  const controlPreflightCommand = patchedControlFragmentFile
+    ? `soloclaw phase5 evidence-check --file ${phaseFiveCommandPath(options.patchedControlFragmentOutputPath ?? controlHost.fragmentPath)} --target control-plane-host --json`
+    : controlHost.preflightCommand;
+  return {
+    phase: "phase5",
+    action: "registered-pull-evidence-patch",
+    status: validation.issues.length === 0 ? "pass" : "incomplete",
+    generatedAt: new Date().toISOString(),
+    force: options.force,
+    registeredPullTargetId,
+    statusFile: {
+      path: statusFilePath,
+      kind: optionalNonEmptyString(runnerStatus.kind),
+      runnerStatus: optionalNonEmptyString(runnerStatus.status),
+      stopReason: optionalNonEmptyString(runnerStatus.stopReason),
+      messagesProcessed,
+      ...(lastAckMessageId ? { lastAckMessageId } : {}),
+      ...(typeof runnerStatus.lastAckSigned === "boolean" ? { lastAckSigned: runnerStatus.lastAckSigned } : {}),
+      heartbeatStatus: optionalNonEmptyString(lastHeartbeat?.status),
+    },
+    pastePath: "room.registeredAgentPull",
+    patch,
+    missingFields: validation.issues,
+    ...(outputFile ? { outputFile } : {}),
+    ...(patchedControlFragmentFile ? { patchedControlFragmentFile } : {}),
+    nextCommands: [
+      controlHost.templateCommand,
+      controlPreflightCommand,
+      controlHost.statusCommand,
+      `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+    ],
+    notes: [
+      "This command reads only token-safe runner status fields, whitelisted command JSON summaries, transcript/delivery summaries, and control-host summary arguments.",
+      "Paste patch.room.registeredAgentPull into the control-plane fragment at room.registeredAgentPull, then preflight that fragment.",
+      "It never copies control tokens, invite tokens, private keys, signed envelopes, or raw SSE text from the input files.",
+    ],
+  };
+}
+
+async function writePhaseFiveRegisteredPullPatchedControlFragment(
+  cwd: string,
+  options: PhaseFiveRegisteredPullEvidencePatchArgs,
+  registeredAgentPull: Record<string, unknown>,
+): Promise<PhaseFiveRegisteredPullEvidencePatchResult["patchedControlFragmentFile"]> {
+  if (!options.controlFragmentFilePath && !options.patchedControlFragmentOutputPath) {
+    return undefined;
+  }
+  if (!options.controlFragmentFilePath || !options.patchedControlFragmentOutputPath) {
+    throw new Error("--control-fragment-file and --patched-control-fragment-output must be provided together.");
+  }
+  const sourcePath = assertPathInsideWorkspace(cwd, options.controlFragmentFilePath, "--control-fragment-file");
+  const parsed = JSON.parse(await readUtf8(sourcePath)) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("Phase 5 --control-fragment-file must be a JSON object.");
+  }
+  const room = isRecord(parsed.room) ? parsed.room : {};
+  const patched = {
+    ...parsed,
+    room: {
+      ...room,
+      registeredAgentPull,
+    },
+  };
+  const content = `${JSON.stringify(patched, null, 2)}\n`;
+  const written = await writeTextFileInsideWorkspace(cwd, options.patchedControlFragmentOutputPath, content, {
+    force: options.force,
+    optionName: "--patched-control-fragment-output",
+    description: "Phase 5 registered-pull patched control fragment output",
+  });
+  return {
+    ...written,
+    sourcePath,
+    pastePath: "room.registeredAgentPull",
+  };
+}
+
+function parsePhaseFiveRegisteredPullRunnerStatus(value: unknown, filePath: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`Registered-pull runner status must be a JSON object: ${filePath}`);
+  }
+  if (value.kind !== "soloclaw.remote_room_runner_status") {
+    throw new Error(`Registered-pull runner status must have kind=soloclaw.remote_room_runner_status: ${filePath}`);
+  }
+  return value;
+}
+
+function formatPhaseFiveRegisteredPullEvidencePatch(result: PhaseFiveRegisteredPullEvidencePatchResult): string {
+  return [
+    `Phase 5 registered-pull evidence patch: ${result.status}`,
+    `target=${result.registeredPullTargetId}`,
+    `statusFile=${result.statusFile.path}`,
+    result.outputFile ? `output=${result.outputFile.path}` : undefined,
+    result.outputFile ? (result.outputFile.overwritten ? "overwrite=force" : "overwrite=false") : undefined,
+    result.patchedControlFragmentFile ? `patchedControlFragment=${result.patchedControlFragmentFile.path}` : undefined,
+    result.patchedControlFragmentFile ? `controlFragmentSource=${result.patchedControlFragmentFile.sourcePath}` : undefined,
+    result.patchedControlFragmentFile ? (result.patchedControlFragmentFile.overwritten ? "patchedControlFragmentOverwrite=force" : "patchedControlFragmentOverwrite=false") : undefined,
+    `pastePath=${result.pastePath}`,
+    result.missingFields.length > 0 ? `missing=${result.missingFields.join(",")}` : "missing=none",
+    "",
+    "Patch:",
+    JSON.stringify(result.patch, null, 2),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function buildPhaseFiveCollectorGuide(targetId: string, options: { includeSmokeCommands?: boolean; registeredPullTargetId?: string } = {}): PhaseFiveCollectorGuide {
+  const plan = buildPhaseFiveEvidencePlan();
+  const target = plan.targets.find((entry) => entry.id === targetId);
+  if (!target) {
+    throw new Error(`Unknown Phase 5 matrix target: ${targetId}. Expected one of: ${plan.targets.map((entry) => entry.id).join(", ")}`);
+  }
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, plan);
+  const isControlPlaneHost = target.id === "control-plane-host";
+  const isRegisteredPullTarget = registeredPullTargetId === target.id;
+  const matrixTarget = buildPhaseFiveMatrixTemplate().targets.find((entry) => entry.id === targetId);
+  if (!matrixTarget) {
+    throw new Error(`Unknown Phase 5 matrix target: ${targetId}. Expected one of: ${plan.targets.map((entry) => entry.id).join(", ")}`);
+  }
+  const templateCommand = registeredPullTargetId
+    ? `soloclaw phase5 evidence-template --target ${target.id} --registered-pull-target ${registeredPullTargetId} --json`
+    : target.templateCommand;
+  const includeSmokeCommands = options.includeSmokeCommands === true;
+  const smokeCommandPlan = includeSmokeCommands
+    ? phaseFiveCollectorGuideSmokeCommandPlan(matrixTarget.commands, {
+      registeredPullTargetId,
+      isRegisteredPullTarget,
+      isControlPlaneHost,
+    })
+    : undefined;
+  const statusCommand = phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, {
+    registeredPullTargetId,
+    targetId: target.id,
+  });
+  const mergeCommand = `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`;
+  const finalCheckCommand = `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`;
+  const registeredPullRunbook = isRegisteredPullTarget ? buildPhaseFiveRegisteredPullRunbook(target.id) : undefined;
+  const registeredPullControlHostRunbook = registeredPullTargetId && isControlPlaneHost
+    ? buildPhaseFiveRegisteredPullControlHostRunbook(registeredPullTargetId, {
+      fragmentsDir: plan.fragmentsDir,
+      guidesDir: "phase5-collector-guides",
+    })
+    : undefined;
+  const returnToControlHost = {
+    copyFragmentTo: target.fragmentPath,
+    statusCommand,
+    mergeCommand,
+    finalCheckCommand,
+  };
+  const operatorNextCommands = buildPhaseFiveCollectorGuideOperatorNextCommands({
+    templateCommand,
+    preflightCommand: target.preflightCommand,
+    registeredPullRunbook,
+    registeredPullControlHostRunbook,
+    returnToControlHost,
+  });
+  const evidenceFileHandoff = registeredPullTargetId && (isRegisteredPullTarget || isControlPlaneHost)
+    ? buildPhaseFiveRegisteredPullEvidenceFileHandoff()
+    : undefined;
+  const targetSpecificNotes = target.id === "linux-shell-agent"
+    ? [
+      "For WSL/Linux collection, run the remote agent from a Linux-native workspace such as ~/soloclaw-phase5-remote, not a Windows-mounted /mnt/* checkout; the remote runner stores local SQLite state under cwd/.agent, and Windows-mounted filesystems can reject SQLite WAL writes. Invoke this repo's CLI by absolute path if needed.",
+    ]
+    : [];
+  return {
+    phase: "phase5",
+    action: "collector-guide",
+    generatedAt: new Date().toISOString(),
+    targetId: target.id,
+    label: target.label,
+    role: target.role,
+    fragmentPath: target.fragmentPath,
+    matrixCommand: target.matrixCommand,
+    templateCommand,
+    preflightCommand: target.preflightCommand,
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    isRegisteredPullTarget,
+    includeSmokeCommands,
+    ...(smokeCommandPlan ? {
+      smokeCommands: smokeCommandPlan.smokeCommands,
+      ...(smokeCommandPlan.smokeCommandOmissions.length > 0 ? { smokeCommandOmissions: smokeCommandPlan.smokeCommandOmissions } : {}),
+    } : {}),
+    ...(registeredPullRunbook ? { registeredPullRunbook } : {}),
+    ...(registeredPullControlHostRunbook ? { registeredPullControlHostRunbook } : {}),
+    ...(evidenceFileHandoff ? { evidenceFileHandoff } : {}),
+    ...(operatorNextCommands.length > 0 ? { operatorNextCommands } : {}),
+    returnToControlHost,
+    steps: [
+      `Run ${target.matrixCommand} to see the target-specific smoke commands.`,
+      `Run ${templateCommand} and save the JSON output as ${target.fragmentPath}.`,
+      `Fill ${target.fragmentPath} with paste-safe observations from this target only.`,
+      `Run ${target.preflightCommand} before returning the fragment.`,
+      `Return only ${target.fragmentPath} to the control host, then the control host runs ${statusCommand}.`,
+      `When all fragments are present, the control host runs ${mergeCommand} and ${finalCheckCommand}.`,
+    ],
+    notes: [
+      "Do not record control tokens, invite tokens, API keys, bearer tokens, raw invite bundles, raw SSE text, signed envelopes, or private keys.",
+      "Keep evidence paste-safe: record ids, status values, counts, signature status summaries, and runner/service-plan summary fields only.",
+      ...targetSpecificNotes,
+      registeredPullTargetId
+        ? isRegisteredPullTarget
+          ? `This target is the registered-agent pull target (${target.id}); run remote register, wait for the control host to run room pull-agent, confirm remote invitations, run remote accept-room, then run remote run after the control host sends the routed task.`
+          : isControlPlaneHost
+            ? `Control-plane host coordinates registered-agent pull for ${registeredPullTargetId}; wait for remote register, run room pull-agent, send the routed task, check delivery status, and record room.registeredAgentPull in the control-plane fragment.`
+            : `Registered-agent pull target is ${registeredPullTargetId}. Do not run registered-agent pull-only commands on this target; collect only this target's normal room evidence.`
+        : "For registered-agent pull evidence, choose one real remote target as <registered-pull-target-id>: that target runs remote register, the control host runs room pull-agent, the target confirms remote invitations, runs remote accept-room, and then runs remote run after the control host sends the routed task.",
+      "This default handoff omits target smoke commands; rerun collector-guide or collector-pack with --include-smoke-commands only for an execution copy with placeholders.",
+      "This guide is a collection helper only; final Phase 5 acceptance still requires the merged real-machine evidence-check gate to pass.",
+    ],
+  };
+}
+
+function buildPhaseFiveCollectorGuideOperatorNextCommands(options: {
+  templateCommand: string;
+  preflightCommand: string;
+  registeredPullRunbook?: PhaseFiveRegisteredPullRunbook;
+  registeredPullControlHostRunbook?: PhaseFiveRegisteredPullControlHostRunbook;
+  returnToControlHost: PhaseFiveCollectorGuide["returnToControlHost"];
+}): string[] {
+  const runbook = options.registeredPullRunbook ?? options.registeredPullControlHostRunbook;
+  if (!runbook) {
+    return [];
+  }
+  const commands: string[] = [];
+  const pushCommand = (command: string | undefined) => {
+    if (command && !commands.includes(command)) {
+      commands.push(command);
+    }
+  };
+  pushCommand(options.templateCommand);
+  for (const stage of runbook.stages) {
+    pushCommand(stage.commandHint);
+  }
+  pushCommand(options.preflightCommand);
+  pushCommand(options.returnToControlHost.statusCommand);
+  pushCommand(options.returnToControlHost.mergeCommand);
+  pushCommand(options.returnToControlHost.finalCheckCommand);
+  return commands;
+}
+
+function buildPhaseFiveRegisteredPullRunbook(targetId: string): PhaseFiveRegisteredPullRunbook {
+  const controlToken = phaseFiveRemoteControlTokenReference(targetId);
+  const stages = [
+    {
+      id: "register",
+      label: "Publish this remote machine identity to the control plane",
+      commandName: "agent remote register",
+      commandHint: `agent remote register --control-url <control-url> --control-token ${controlToken} --display-name <registered-pull-label> --json`,
+      evidenceFields: ["registered", "agentId", "targetId"],
+    },
+    {
+      id: "wait-for-control-host-pull",
+      label: "Wait until the control host pulls this registered agent into the room",
+      commandName: "agent rooms pull-agent",
+      commandHint: "control host captures pull-agent.json with agent rooms pull-agent <room-id> <registered-pull-agent-id> --alias registered-pull --role executor --local-agent --json > pull-agent.json",
+      evidenceFields: ["role", "aliases"],
+    },
+    {
+      id: "list-invitations",
+      label: "Confirm the pending room invitation is visible on this remote machine",
+      commandName: "agent remote invitations",
+      commandHint: `agent remote invitations --control-url <control-url> --control-token ${controlToken} --json > invitations.json`,
+      evidenceFields: ["invitationListed"],
+    },
+    {
+      id: "accept-room",
+      label: "Accept the pulled room invitation and submit an online heartbeat",
+      commandName: "agent remote accept-room",
+      commandHint: `agent remote accept-room --control-url <control-url> --control-token ${controlToken} --room <room-id> --json > accept-room.json`,
+      evidenceFields: ["accepted", "heartbeatStatus"],
+    },
+    {
+      id: "run-pulled-agent",
+      label: "Run the pulled agent after the control host sends the routed task",
+      commandName: "agent remote run",
+      commandHint: `agent remote run --control-url <control-url> --control-token ${controlToken} --room <room-id> --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file .agent/tmp/phase5-registered-pull-status.json --stop-file .agent/tmp/phase5-registered-pull.stop --reply-template "@agent:<owner-agent-id> registered-pull handled {messageId}" --json`,
+      evidenceFields: ["taskMessageId", "handledMessages", "messagesProcessed", "ackSigned", "replyMessageId", "replySignatureStatus", "runStopReason"],
+    },
+    {
+      id: "inspect-status-file",
+      label: "Copy only token-safe runner status summary fields into room.registeredAgentPull",
+      commandName: "read runner status file",
+      commandHint: "inspect .agent/tmp/phase5-registered-pull-status.json and copy only token-safe summary fields",
+      evidenceFields: ["deliveryStatusPendingCount", "transcriptEventKinds"],
+    },
+  ];
+  return {
+    targetId,
+    statusFile: ".agent/tmp/phase5-registered-pull-status.json",
+    stopFile: ".agent/tmp/phase5-registered-pull.stop",
+    stages,
+    evidenceFieldHints: buildPhaseFiveRegisteredPullEvidenceFieldHints(stages, {
+      register: "selected-target",
+      "wait-for-control-host-pull": "control-plane-host",
+      "list-invitations": "selected-target",
+      "accept-room": "selected-target",
+      "run-pulled-agent": "selected-target",
+      "inspect-status-file": "selected-target-status-file",
+    }),
+    notes: [
+      "Use --include-smoke-commands on collector-guide or collector-pack when you need placeholder command lines for this sequence.",
+      "Do not paste control tokens, raw invite bundles, signed envelopes, private keys, or raw room message bodies into evidence.",
+      "Record this sequence under room.registeredAgentPull in the control-plane fragment and this target's fragment summary.",
+    ],
+  };
+}
+
+function buildPhaseFiveRegisteredPullEvidenceFieldHints(
+  stages: Array<{ id: string; commandName: string; evidenceFields: string[] }>,
+  sourceByStageId: Record<string, PhaseFiveRegisteredPullEvidenceFieldHint["source"]>,
+): PhaseFiveRegisteredPullEvidenceFieldHint[] {
+  return stages.flatMap((stage) => stage.evidenceFields.map((field) => ({
+    field,
+    evidencePath: phaseFiveRegisteredPullEvidencePath(field),
+    source: sourceByStageId[stage.id] ?? "control-plane-host",
+    stageId: stage.id,
+    commandName: stage.commandName,
+  })));
+}
+
+function phaseFiveRegisteredPullEvidencePath(field: string): string {
+  return field.startsWith("room.")
+    ? field
+    : `room.registeredAgentPull.${field}`;
+}
+
+function phaseFiveRemoteControlTokenReference(targetId: string): string {
+  if (targetId === "windows-powershell-agent") {
+    return "$env:AGENT_CONTROL_TOKEN";
+  }
+  if (targetId === "windows-cmd-agent") {
+    return "%AGENT_CONTROL_TOKEN%";
+  }
+  return "$AGENT_CONTROL_TOKEN";
+}
+
+function phaseFiveRegisteredPullEvidencePatchCommand(targetId: string): string {
+  return `soloclaw phase5 registered-pull-evidence-patch --registered-pull-target ${targetId} --status-file .agent/tmp/phase5-registered-pull-status.json --pull-agent-file pull-agent.json --invitations-file invitations.json --accept-room-file accept-room.json --room-show-file room-show.json --delivery-status-file delivery-status.json --output phase5-registered-pull-evidence-patch.json --control-fragment-file phase5-fragments/control-plane-host.json --patched-control-fragment-output phase5-fragments/control-plane-host.json --force --json`;
+}
+
+function buildPhaseFiveRegisteredPullControlHostRunbook(
+  targetId: string,
+  paths: { fragmentsDir: string; guidesDir: string },
+): PhaseFiveRegisteredPullControlHostRunbook {
+  const stages = [
+    {
+      id: "wait-for-registration",
+      label: "Wait for the selected remote target to publish its registered identity",
+      commandName: "agent remote register",
+      commandHint: "agent remote register --control-url <control-url> --control-token $AGENT_CONTROL_TOKEN --display-name <registered-pull-label> --json",
+      evidenceFields: ["registered", "agentId", "targetId"],
+      waitsFor: "selected target operator",
+    },
+    {
+      id: "pull-registered-agent",
+      label: "Pull the registered remote identity into the room",
+      commandName: "agent rooms pull-agent",
+      commandHint: "agent rooms pull-agent <room-id> <registered-pull-agent-id> --alias registered-pull --role executor --local-agent --json > pull-agent.json",
+      evidenceFields: ["role", "aliases"],
+    },
+    {
+      id: "wait-for-remote-acceptance",
+      label: "Wait for the remote target to list and accept the room invitation",
+      commandName: "agent remote accept-room",
+      commandHint: "agent remote invitations --control-url <control-url> --control-token $AGENT_CONTROL_TOKEN --json > invitations.json; agent remote accept-room --control-url <control-url> --control-token $AGENT_CONTROL_TOKEN --room <room-id> --json > accept-room.json",
+      evidenceFields: ["invitationListed", "accepted", "heartbeatStatus"],
+      waitsFor: "selected target operator",
+    },
+    {
+      id: "send-routed-task",
+      label: "Send one routed task to the pulled agent after acceptance",
+      commandName: "agent rooms say",
+      commandHint: "agent rooms say <room-id> \"@agent:<registered-pull-agent-id> phase5 registered-agent pull smoke: reply when accepted\" --local-agent --json",
+      evidenceFields: ["taskMessageId", "transcriptEventKinds"],
+    },
+    {
+      id: "check-delivery-status",
+      label: "Check token-safe delivery status after the pulled agent runs",
+      commandName: "control-plane delivery-status",
+      commandHint: "curl -H \"x-agent-control-token: $AGENT_CONTROL_TOKEN\" \"<control-url>/api/rooms/<room-id>/delivery-status\" > delivery-status.json",
+      evidenceFields: ["deliveryStatusPendingCount", "deliveryStatusAckMessageIds"],
+    },
+    {
+      id: "inspect-transcript-and-runner",
+      label: "Confirm the reply transcript and selected target runner status summaries",
+      commandName: "agent rooms show and runner status file",
+      commandHint: "agent rooms show <room-id> --local-agent --json > room-show.json; inspect .agent/tmp/phase5-registered-pull-status.json from the selected target fragment",
+      evidenceFields: ["handledMessages", "messagesProcessed", "ackSigned", "replyMessageId", "replySignatureStatus", "runStopReason"],
+      waitsFor: "selected target runner status file",
+    },
+    {
+      id: "record-control-fragment",
+      label: "Copy paste-safe registered-pull summaries into the control-plane fragment",
+      commandName: "fill room.registeredAgentPull",
+      commandHint: phaseFiveRegisteredPullEvidencePatchCommand(targetId),
+      evidenceFields: ["room.registeredAgentPull"],
+    },
+  ];
+  return {
+    targetId,
+    targetGuidePath: `${paths.guidesDir}/${targetId}.md`,
+    targetFragmentPath: `${paths.fragmentsDir}/${targetId}.json`,
+    controlFragmentPath: `${paths.fragmentsDir}/control-plane-host.json`,
+    stages,
+    evidenceFieldHints: buildPhaseFiveRegisteredPullEvidenceFieldHints(stages, {
+      "wait-for-registration": "selected-target",
+      "pull-registered-agent": "control-plane-host",
+      "wait-for-remote-acceptance": "selected-target",
+      "send-routed-task": "control-plane-host",
+      "check-delivery-status": "control-plane-host",
+      "inspect-transcript-and-runner": "selected-target-status-file",
+      "record-control-fragment": "control-plane-host",
+    }),
+    notes: [
+      "Use this control-host sequence together with the selected target guide; the remote target still runs the register, invitations, accept-room, and remote-run commands.",
+      "Capture pull-agent.json, invitations.json, accept-room.json, room-show.json, and delivery-status.json, then run registered-pull-evidence-patch to write the patch file and intentionally refresh the control-plane fragment.",
+      "Record only ids, roles, aliases, counts, signature status summaries, transcript event kinds, and runner status summaries in the control-plane fragment under room.registeredAgentPull.",
+      "Do not paste control tokens, raw invite bundles, signed envelopes, private keys, or raw room message bodies into the runbook or evidence.",
+    ],
+  };
+}
+
+function formatPhaseFiveRegisteredPullRunbookStage(stage: {
+  id: string;
+  commandName: string;
+  commandHint?: string;
+  evidenceFields: string[];
+  waitsFor?: string;
+}): string {
+  return [
+    `- ${stage.id}: ${stage.commandName}`,
+    `evidence=${stage.evidenceFields.join(",")}`,
+    stage.waitsFor ? `waitsFor=${stage.waitsFor}` : undefined,
+    stage.commandHint ? `commandHint=${stage.commandHint}` : undefined,
+  ].filter(Boolean).join("; ");
+}
+
+function formatPhaseFiveRegisteredPullEvidenceFieldHint(hint: PhaseFiveRegisteredPullEvidenceFieldHint): string {
+  return `- field=${hint.field} path=${hint.evidencePath} source=${hint.source} stage=${hint.stageId} command=${hint.commandName}`;
+}
+
+function phaseFiveCollectorGuideSmokeCommandPlan(
+  commands: string[],
+  options: { registeredPullTargetId?: string; isRegisteredPullTarget: boolean; isControlPlaneHost: boolean },
+): { smokeCommands: string[]; smokeCommandOmissions: PhaseFiveSmokeCommandOmission[] } {
+  if (!options.registeredPullTargetId || options.isRegisteredPullTarget || options.isControlPlaneHost) {
+    return { smokeCommands: [...commands], smokeCommandOmissions: [] };
+  }
+  const smokeCommands = commands.filter((command) => !isPhaseFiveRegisteredPullSmokeCommand(command));
+  const omittedCount = commands.length - smokeCommands.length;
+  return {
+    smokeCommands,
+    smokeCommandOmissions: omittedCount > 0
+      ? [{
+        group: "registered-agent-pull",
+        targetId: options.registeredPullTargetId,
+        reason: `Omitted ${omittedCount} registered-agent-pull smoke commands because this target is not the registered-agent pull target.`,
+      }]
+      : [],
+  };
+}
+
+function isPhaseFiveRegisteredPullSmokeCommand(command: string): boolean {
+  return command.includes("<registered-pull-target-id>") ||
+    command.includes("<registered-pull-agent-id>") ||
+    command.includes("phase5-registered-pull");
+}
+
+function formatPhaseFiveCollectorGuide(guide: PhaseFiveCollectorGuide): string {
+  return [
+    "Phase 5 collector guide",
+    `target=${guide.targetId}`,
+    `label=${guide.label}`,
+    `role=${guide.role}`,
+    `fragment=${guide.fragmentPath}`,
+    `registeredPullTarget=${guide.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    `isRegisteredPullTarget=${guide.isRegisteredPullTarget}`,
+    "",
+    "Commands:",
+    `- ${guide.matrixCommand}`,
+    `- ${guide.templateCommand}`,
+    `- ${guide.preflightCommand}`,
+    ...(guide.includeSmokeCommands && guide.smokeCommands?.length
+      ? [
+        "",
+        "Target smoke commands:",
+        ...guide.smokeCommands.map((command) => `- ${command}`),
+      ]
+      : []),
+    ...(guide.includeSmokeCommands && guide.smokeCommandOmissions?.length
+      ? [
+        "",
+        "Omitted smoke commands:",
+        ...guide.smokeCommandOmissions.map((omission) => `- ${omission.group}: target=${omission.targetId}; ${omission.reason}`),
+      ]
+      : []),
+    ...(guide.registeredPullRunbook
+      ? [
+        "",
+        "Registered-agent pull runbook:",
+        ...guide.registeredPullRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        `- statusFile=${guide.registeredPullRunbook.statusFile}`,
+        `- stopFile=${guide.registeredPullRunbook.stopFile}`,
+        "Registered-agent pull evidence field hints:",
+        ...guide.registeredPullRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+      ]
+      : []),
+    ...(guide.registeredPullControlHostRunbook
+      ? [
+        "",
+        "Registered-agent pull control-host runbook:",
+        `- target=${guide.registeredPullControlHostRunbook.targetId}`,
+        `- targetGuide=${guide.registeredPullControlHostRunbook.targetGuidePath}`,
+        `- targetFragment=${guide.registeredPullControlHostRunbook.targetFragmentPath}`,
+        `- controlFragment=${guide.registeredPullControlHostRunbook.controlFragmentPath}`,
+        ...guide.registeredPullControlHostRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        "Registered-agent pull evidence field hints:",
+        ...guide.registeredPullControlHostRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+      ]
+      : []),
+    ...(guide.operatorNextCommands?.length
+      ? [
+        "",
+        "Operator next commands:",
+        ...guide.operatorNextCommands.map((command) => `- ${command}`),
+      ]
+      : []),
+    ...(guide.evidenceFileHandoff
+      ? [
+        "",
+        ...formatPhaseFiveRegisteredPullEvidenceFileHandoff(guide.evidenceFileHandoff),
+      ]
+      : []),
+    "",
+    "Return to control host:",
+    `- copyFragmentTo=${guide.returnToControlHost.copyFragmentTo}`,
+    `- ${guide.returnToControlHost.statusCommand}`,
+    `- ${guide.returnToControlHost.mergeCommand}`,
+    `- ${guide.returnToControlHost.finalCheckCommand}`,
+    "",
+    "Steps:",
+    ...guide.steps.map((step) => `- ${step}`),
+    "",
+    "Notes:",
+    ...guide.notes.map((note) => `- ${note}`),
+  ].join("\n");
+}
+
+function formatPhaseFiveCollectorGuideMarkdown(guide: PhaseFiveCollectorGuide): string {
+  return [
+    `# Phase 5 Collector Guide: ${guide.targetId}`,
+    "",
+    `- Target: ${guide.label}`,
+    `- Role: ${guide.role}`,
+    `- Fragment: ${guide.fragmentPath}`,
+    `- Registered-agent pull target: ${guide.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    `- This target handles registered-agent pull: ${guide.isRegisteredPullTarget ? "yes" : "no"}`,
+    "",
+    "## Commands",
+    "",
+    "```text",
+    guide.matrixCommand,
+    guide.templateCommand,
+    guide.preflightCommand,
+    "```",
+    "",
+    ...(guide.includeSmokeCommands && guide.smokeCommands?.length
+      ? [
+        "## Target Smoke Commands",
+        "",
+        "These commands include placeholders for the operator to replace during execution. Do not write real tokens, raw invite bundles, signed envelopes, or private keys into this guide.",
+        "",
+        "```text",
+        ...guide.smokeCommands,
+        "```",
+        "",
+      ]
+      : []),
+    ...(guide.includeSmokeCommands && guide.smokeCommandOmissions?.length
+      ? [
+        "## Omitted Smoke Commands",
+        "",
+        ...guide.smokeCommandOmissions.map((omission) => `- ${omission.group}: target=${omission.targetId}; ${omission.reason}`),
+        "",
+      ]
+      : []),
+    ...(guide.registeredPullRunbook
+      ? [
+        "## Registered-Agent Pull Runbook",
+        "",
+        `- Target: ${guide.registeredPullRunbook.targetId}`,
+        `- Status file: ${guide.registeredPullRunbook.statusFile}`,
+        `- Stop file: ${guide.registeredPullRunbook.stopFile}`,
+        "",
+        ...guide.registeredPullRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        "",
+        "Evidence field hints:",
+        "",
+        ...guide.registeredPullRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+        "",
+        ...guide.registeredPullRunbook.notes.map((note) => `- ${note}`),
+        "",
+      ]
+      : []),
+    ...(guide.registeredPullControlHostRunbook
+      ? [
+        "## Registered-Agent Pull Control-Host Runbook",
+        "",
+        `- Target: ${guide.registeredPullControlHostRunbook.targetId}`,
+        `- Target guide: ${guide.registeredPullControlHostRunbook.targetGuidePath}`,
+        `- Target fragment: ${guide.registeredPullControlHostRunbook.targetFragmentPath}`,
+        `- Control fragment: ${guide.registeredPullControlHostRunbook.controlFragmentPath}`,
+        "",
+        ...guide.registeredPullControlHostRunbook.stages.map(formatPhaseFiveRegisteredPullRunbookStage),
+        "",
+        "Evidence field hints:",
+        "",
+        ...guide.registeredPullControlHostRunbook.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+        "",
+        ...guide.registeredPullControlHostRunbook.notes.map((note) => `- ${note}`),
+        "",
+      ]
+      : []),
+    ...(guide.operatorNextCommands?.length
+      ? [
+        "## Operator Next Commands",
+        "",
+        "```text",
+        ...guide.operatorNextCommands,
+        "```",
+        "",
+      ]
+      : []),
+    ...(guide.evidenceFileHandoff
+      ? [
+        ...formatPhaseFiveRegisteredPullEvidenceFileHandoffMarkdown(guide.evidenceFileHandoff),
+      ]
+      : []),
+    "## Return To Control Host",
+    "",
+    "```text",
+    `copyFragmentTo=${guide.returnToControlHost.copyFragmentTo}`,
+    guide.returnToControlHost.statusCommand,
+    guide.returnToControlHost.mergeCommand,
+    guide.returnToControlHost.finalCheckCommand,
+    "```",
+    "",
+    "## Steps",
+    "",
+    ...guide.steps.map((step) => `- ${step}`),
+    "",
+    "## Notes",
+    "",
+    ...guide.notes.map((note) => `- ${note}`),
+    "",
+  ].join("\n");
+}
+
+function parsePhaseFiveCollectorPackArgs(args: string[]): PhaseFiveCollectorPackArgs {
+  let outputDirPath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--output-dir" || arg === "--guides-dir") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      outputDirPath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--output-dir=")) {
+      const value = arg.slice("--output-dir=".length);
+      if (!value) {
+        throw new Error("Missing value for --output-dir.");
+      }
+      outputDirPath = value;
+      continue;
+    }
+    if (arg.startsWith("--guides-dir=")) {
+      const value = arg.slice("--guides-dir=".length);
+      if (!value) {
+        throw new Error("Missing value for --guides-dir.");
+      }
+      outputDirPath = value;
+      continue;
+    }
+  }
+  return {
+    outputDirPath,
+    targetId: parsePhaseFiveMatrixTargetOption(args),
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    includeSmokeCommands: args.includes("--include-smoke-commands") || args.includes("--include-matrix-commands"),
+    force: args.includes("--force"),
+    json: args.includes("--json"),
+  };
+}
+
+async function buildPhaseFiveCollectorPack(cwd: string, options: PhaseFiveCollectorPackArgs): Promise<PhaseFiveCollectorPackResult> {
+  const outputDir = options.outputDirPath ?? "phase5-collector-guides";
+  const plan = buildPhaseFiveEvidencePlan();
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, plan);
+  const targetIds = options.targetId ? [options.targetId] : [...PHASE_FIVE_REQUIRED_TARGET_IDS];
+  const guides: PhaseFiveCollectorPackResult["guides"] = [];
+  for (const targetId of targetIds) {
+    const guide = buildPhaseFiveCollectorGuide(targetId, {
+      includeSmokeCommands: options.includeSmokeCommands,
+      registeredPullTargetId,
+    });
+    const guidePath = path.join(outputDir, `${guide.targetId}.md`);
+    const written = await writeTextFileInsideWorkspace(cwd, guidePath, formatPhaseFiveCollectorGuideMarkdown(guide), {
+      force: options.force,
+      optionName: "--output-dir",
+      description: "Phase 5 collector pack output",
+    });
+    guides.push({
+      targetId: guide.targetId,
+      role: guide.role,
+      fragmentPath: guide.fragmentPath,
+      preflightCommand: guide.preflightCommand,
+      statusCommand: guide.returnToControlHost.statusCommand,
+      collectorGuideCommand: phaseFiveCollectorGuideCommand(guide.targetId, registeredPullTargetId),
+      ...(guide.operatorNextCommands?.length ? { operatorNextCommands: guide.operatorNextCommands } : {}),
+      ...(guide.evidenceFileHandoff ? { evidenceFileHandoff: guide.evidenceFileHandoff } : {}),
+      ...written,
+    });
+  }
+  return {
+    phase: "phase5",
+    action: "collector-pack",
+    status: "pass",
+    generatedAt: new Date().toISOString(),
+    force: options.force,
+    includeSmokeCommands: options.includeSmokeCommands,
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    targetIds,
+    guidesDir: {
+      path: assertPathInsideWorkspace(cwd, outputDir, "--output-dir"),
+    },
+    guides,
+    nextCommands: [
+      registeredPullTargetId
+        ? `soloclaw phase5 evidence-init --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 evidence-init --json",
+      phaseFiveEvidenceStatusCommand(plan.baseEvidenceFile, plan.fragmentsDir, { registeredPullTargetId }),
+      `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+    ],
+    notes: [
+      "Distribute only these guide files and target-specific invite bundles to the matching operators.",
+      "Keep filled evidence fragments under phase5-fragments so evidence-status and evidence-merge can read them.",
+      registeredPullTargetId
+        ? `Registered-agent pull target is ${registeredPullTargetId}; only that guide should run the registered-pull-only remote register/invitations/accept/run sequence.`
+        : "Choose one remote target for registered-agent pull before real collection, or pass --registered-pull-target <target-id> to mark the selected guide.",
+      "Default guides omit target smoke commands; --include-smoke-commands writes an execution version with placeholders for the operator to replace.",
+      "Do not store raw control tokens, invite tokens, signed envelopes, raw SSE text, or private keys in guide files.",
+    ],
+  };
+}
+
+function formatPhaseFiveCollectorPack(result: PhaseFiveCollectorPackResult): string {
+  return [
+    "Phase 5 collector pack: pass",
+    `guidesDir=${result.guidesDir.path}`,
+    `targets=${result.targetIds.join(",")}`,
+    `guides=${result.guides.length}`,
+    `includeSmokeCommands=${result.includeSmokeCommands}`,
+    `registeredPullTarget=${result.registeredPullTargetId ?? "<choose-one-remote-target>"}`,
+    result.force ? "overwrite=force" : "overwrite=false",
+    "",
+    "Guides:",
+    ...result.guides.map((guide) => `- ${guide.targetId} (${guide.role}) -> ${guide.path} fragment=${guide.fragmentPath} preflight=${guide.preflightCommand} status=${guide.statusCommand}`),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].join("\n");
+}
+
+function parsePhaseFiveEvidenceInitArgs(args: string[]): PhaseFiveEvidenceInitArgs {
+  let filePath = parsePhaseTwoEvidenceFileOption(args);
+  let targetDirPath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--base-file") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --base-file.");
+      }
+      filePath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--base-file=")) {
+      const value = arg.slice("--base-file=".length);
+      if (!value) {
+        throw new Error("Missing value for --base-file.");
+      }
+      filePath = value;
+      continue;
+    }
+    if (arg === "--target-dir" || arg === "--fragments-dir") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for ${arg}.`);
+      }
+      targetDirPath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--target-dir=")) {
+      const value = arg.slice("--target-dir=".length);
+      if (!value) {
+        throw new Error("Missing value for --target-dir.");
+      }
+      targetDirPath = value;
+      continue;
+    }
+    if (arg.startsWith("--fragments-dir=")) {
+      const value = arg.slice("--fragments-dir=".length);
+      if (!value) {
+        throw new Error("Missing value for --fragments-dir.");
+      }
+      targetDirPath = value;
+      continue;
+    }
+  }
+  return {
+    filePath,
+    targetDirPath,
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    force: args.includes("--force"),
+    json: args.includes("--json"),
+  };
+}
+
+async function buildPhaseFiveEvidenceInit(cwd: string, options: PhaseFiveEvidenceInitArgs): Promise<PhaseFiveEvidenceInitResult> {
+  const basePlan = buildPhaseFiveEvidencePlan();
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, basePlan);
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+  const baseEvidenceFile = options.filePath ?? plan.baseEvidenceFile;
+  const fragmentsDir = options.targetDirPath ?? plan.fragmentsDir;
+  const baseEvidence = await writeJsonFileInsideWorkspace(cwd, baseEvidenceFile, buildPhaseFiveEvidenceTemplate({ registeredPullTargetId }), {
+    force: options.force,
+    optionName: "--file",
+  });
+  const fragments: PhaseFiveEvidenceInitResult["fragments"] = [];
+  for (const target of plan.targets) {
+    const fragmentPath = path.join(fragmentsDir, target.fragmentFileName);
+    const fragmentCommandPath = phaseFiveEvidenceFragmentCommandPath(fragmentsDir, target.fragmentFileName);
+    const fragment = filterPhaseFiveEvidenceTemplate(buildPhaseFiveEvidenceTemplate({ registeredPullTargetId }), target.id);
+    const written = await writeJsonFileInsideWorkspace(cwd, fragmentPath, fragment, {
+      force: options.force,
+      optionName: "--target-dir",
+    });
+    fragments.push({
+      targetId: target.id,
+      role: target.role,
+      templateCommand: target.templateCommand,
+      preflightCommand: `soloclaw phase5 evidence-check --file ${fragmentCommandPath} --target ${target.id} --json`,
+      statusCommand: phaseFiveEvidenceStatusCommand(baseEvidenceFile, fragmentsDir, {
+        registeredPullTargetId,
+        targetId: target.id,
+      }),
+      collectorGuideCommand: phaseFiveCollectorGuideCommand(target.id, registeredPullTargetId),
+      ...written,
+    });
+  }
+  return {
+    phase: "phase5",
+    action: "evidence-init",
+    status: "pass",
+    generatedAt: new Date().toISOString(),
+    force: options.force,
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    baseEvidenceFile: baseEvidence,
+    fragmentsDir: {
+      path: assertPathInsideWorkspace(cwd, fragmentsDir, "--target-dir"),
+    },
+    fragments,
+    nextCommands: [
+      registeredPullTargetId
+        ? `soloclaw phase5 collector-pack --registered-pull-target ${registeredPullTargetId} --json`
+        : "soloclaw phase5 collector-pack --json",
+      phaseFiveEvidenceStatusCommand(baseEvidenceFile, fragmentsDir, { registeredPullTargetId }),
+      `soloclaw phase5 evidence-merge --file ${baseEvidenceFile} --target-dir ${fragmentsDir} --output ${plan.mergedEvidenceFile} --json`,
+      `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`,
+    ],
+  };
+}
+
+function formatPhaseFiveEvidenceInit(result: PhaseFiveEvidenceInitResult): string {
+  return [
+    "Phase 5 evidence init: pass",
+    `base=${result.baseEvidenceFile.path}`,
+    `fragmentsDir=${result.fragmentsDir.path}`,
+    `fragments=${result.fragments.length}`,
+    result.force ? "overwrite=force" : "overwrite=false",
+    "",
+    "Fragments:",
+    ...result.fragments.map((fragment) => `- ${fragment.targetId} (${fragment.role}) -> ${fragment.path} template=${fragment.templateCommand} preflight=${fragment.preflightCommand} status=${fragment.statusCommand} guide=${fragment.collectorGuideCommand}`),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].join("\n");
+}
+
+function phaseFiveEvidenceFragmentCommandPath(fragmentsDir: string, fragmentFileName: string): string {
+  return path.posix.join(fragmentsDir.replace(/\\/g, "/"), fragmentFileName);
+}
+
+function phaseFiveCommandPath(inputPath: string): string {
+  return inputPath.replace(/\\/g, "/");
+}
+
+function buildPhaseFiveEvidenceTemplate(options: { registeredPullTargetId?: string } = {}) {
+  const registeredPullTargetId = resolvePhaseFiveEvidenceTemplateRegisteredPullTargetId(options.registeredPullTargetId);
+  const remoteTarget = (id: string, label: string) => ({
+    id,
+    label,
+    role: "remote-agent",
+    status: "pending",
+    agentId: "<agent-id>",
+    checks: {
+      install: "pending",
+      bootstrap: "pending",
+      enroll: "pending",
+      inbox: "pending",
+      heartbeat: "pending",
+      remoteRun: "pending",
+      servicePlan: "pending",
+      reply: "pending",
+    },
+    evidence: {
+      messagesProcessed: 0,
+      ackSigned: false,
+      heartbeatStatus: "unknown",
+      inviteBundleKind: "unknown",
+      inviteSignatureStatus: "unknown",
+      joinedFromInviteBundle: false,
+      ranFromInviteBundle: false,
+      remoteIntentSignatureStatus: "unknown",
+      replyMessageId: "<reply-message-id>",
+      runnerStatusFile: ".agent/tmp/phase5-remote-room-status.json",
+      runnerStatusKind: "soloclaw.remote_room_runner_status",
+      runnerStatus: "unknown",
+      runnerStopReason: "unknown",
+      runnerLastHeartbeatStatus: "unknown",
+      runnerLastHeartbeatAt: "<status-file-lastHeartbeat.lastHeartbeatAt>",
+      runnerHeartbeatExpiresAt: "<status-file-lastHeartbeat.heartbeatExpiresAt>",
+      runnerLifecyclePhase: "unknown",
+      runnerMetricTickCount: 0,
+      runnerMetricMessagesProcessed: 0,
+      servicePlanKind: "soloclaw.remote_room_service_plan",
+      servicePlanInstallState: "unknown",
+    },
+    notes: "Record command exit status, status-file summary fields, and paste-safe observations only. Do not record control tokens, invite tokens, API keys, raw bundles, or private keys.",
+  });
+  return {
+    phase: "phase5",
+    generatedAt: new Date().toISOString(),
+    source: "soloclaw phase5 matrix-template",
+    room: {
+      id: "<room-id>",
+      ownerAgentId: "<owner-agent-id>",
+      controlPlaneHost: "control-plane-host",
+      peerExchange: {
+        senderTargetId: "windows-powershell-agent",
+        receiverTargetId: "linux-shell-agent",
+        senderAgentId: "<sender-agent-id>",
+        receiverAgentId: "<receiver-agent-id>",
+        messageId: "<agent-to-agent-message-id>",
+        replyMessageId: "<agent-to-agent-reply-message-id>",
+        receiverHandled: false,
+        senderHandledReply: false,
+        messageSignatureStatus: "unknown",
+        replySignatureStatus: "unknown",
+      },
+      assignmentResult: {
+        targetId: "windows-powershell-agent",
+        agentId: "<assignment-target-agent-id>",
+        subtaskId: "<subtask-id>",
+        childSessionId: "<child-session-id>",
+        assignmentMessageId: "<room-assignment-message-id>",
+        resultMessageId: "<room-result-message-id>",
+        assignmentMessageVisible: false,
+        resultMessageVisible: false,
+        resultStatus: "unknown",
+        transcriptEventKinds: ["task", "decision"],
+      },
+      conflictResolution: {
+        resultKey: "<conflict-result-key>",
+        primaryTargetId: "windows-powershell-agent",
+        primaryAgentId: "<conflict-primary-agent-id>",
+        primaryMessageId: "<conflict-primary-message-id>",
+        conflictingTargetId: "linux-shell-agent",
+        conflictingAgentId: "<conflict-secondary-agent-id>",
+        conflictingMessageId: "<conflict-secondary-message-id>",
+        resolutionMessageId: "<conflict-resolution-message-id>",
+        resolvedByAgentId: "<owner-agent-id>",
+        winningAgentId: "<conflict-winning-agent-id>",
+        conflictDetected: false,
+        resolutionRecorded: false,
+        resolutionStatus: "unknown",
+        transcriptEventKinds: ["artifact", "decision"],
+      },
+      resultSync: {
+        targetId: "linux-shell-agent",
+        agentId: "<result-sync-target-agent-id>",
+        artifactId: "<result-sync-artifact-id>",
+        artifactKind: "report",
+        artifactName: "phase5-result-sync.json",
+        artifactRoomId: "<room-id>",
+        artifactStatus: "unknown",
+        artifactSha256: "<result-sync-artifact-sha256>",
+        artifactSizeBytes: 0,
+        artifactRegistered: false,
+        artifactMessageId: "<result-sync-artifact-message-id>",
+        artifactMessageVisible: false,
+        transcriptEventKinds: ["artifact"],
+      },
+      handoff: {
+        handoffId: "<handoff-id>",
+        sourceTargetId: "windows-powershell-agent",
+        sourceAgentId: "<handoff-source-agent-id>",
+        targetTargetId: "linux-shell-agent",
+        targetAgentId: "<handoff-target-agent-id>",
+        handoffMessageId: "<handoff-message-id>",
+        acceptanceMessageId: "<handoff-acceptance-message-id>",
+        resultMessageId: "<handoff-result-message-id>",
+        handoffMessageVisible: false,
+        acceptanceMessageVisible: false,
+        resultMessageVisible: false,
+        handoffAccepted: false,
+        handoffCompleted: false,
+        resultStatus: "unknown",
+        transcriptEventKinds: ["task", "decision"],
+      },
+      registeredAgentPull: {
+        targetId: registeredPullTargetId,
+        agentId: "<registered-pull-agent-id>",
+        registered: false,
+        invitationListed: false,
+        accepted: false,
+        role: "executor",
+        aliases: ["registered-pull"],
+        taskMessageId: "<registered-pull-message-id>",
+        replyMessageId: "<registered-pull-reply-message-id>",
+        handledMessages: ["<registered-pull-message-id>"],
+        messagesProcessed: 0,
+        ackSigned: false,
+        replySignatureStatus: "unknown",
+        heartbeatStatus: "unknown",
+        runStopReason: "unknown",
+        deliveryStatusPendingCount: 0,
+        transcriptEventKinds: ["task", "chat"],
+      },
+      revokedInvite: {
+        targetId: "windows-cmd-agent",
+        agentId: "<revoked-probe-agent-id>",
+        joinBlocked: false,
+        rejection: "unknown",
+      },
+      revokedAgent: {
+        targetId: "windows-cmd-agent",
+        agentId: "<revoked-agent-id>",
+        trustStatus: "unknown",
+        trustUpdated: false,
+        signedSayBlocked: false,
+        signedAckBlocked: false,
+        signedHeartbeatBlocked: false,
+        rejection: "unknown",
+      },
+      keyRotation: {
+        targetId: "windows-powershell-agent",
+        agentId: "<key-rotation-agent-id>",
+        previousFingerprint: "<key-rotation-previous-fingerprint>",
+        rotatedFingerprint: "<key-rotation-rotated-fingerprint>",
+        trustStatusAfter: "unknown",
+        rotationRecorded: false,
+        oldSignedSayBlocked: false,
+        newSignedSayAccepted: false,
+        auditEventVisible: false,
+        transcriptMessageId: "<key-rotation-new-message-id>",
+        transcriptMessageVisible: false,
+        rejection: "unknown",
+        transcriptEventKinds: ["chat"],
+      },
+      suspendedAgent: {
+        targetId: "macos-shell-agent",
+        agentId: "<suspended-agent-id>",
+        status: "suspended",
+        routedMessageId: "<suspended-probe-message-id>",
+        inboxMessageCount: 0,
+        remoteSayBlocked: false,
+        rejection: "unknown",
+      },
+      noBroadcastFallback: {
+        messageId: "<no-broadcast-fallback-message-id>",
+        messageVisible: false,
+        agentIds: ["<remote-agent-id>"],
+        inboxCounts: { "<remote-agent-id>": 0 },
+        runMessagesProcessed: { "<remote-agent-id>": 0 },
+        deliveryStatusPendingCounts: { "<remote-agent-id>": 0 },
+        transcriptEventKinds: ["chat"],
+      },
+      staleAgent: {
+        targetId: "linux-shell-agent",
+        agentId: "<stale-agent-id>",
+        heartbeatStatus: "unknown",
+        healthState: "unknown",
+        heartbeatExpired: false,
+        responsive: true,
+        lastRoomId: "<room-id>",
+      },
+      staleRecovery: {
+        targetId: "linux-shell-agent",
+        agentId: "<stale-agent-id>",
+        recoveryKind: "soloclaw.agent_stale_recovery",
+        recovered: false,
+        memberStatusAfter: "unknown",
+        heartbeatStatusAfter: "unknown",
+        healthStateAfter: "unknown",
+      },
+      stopFileShutdown: {
+        targetId: "windows-powershell-agent",
+        agentId: "<agent-id>",
+        stopFile: ".agent/tmp/phase5-remote-room.stop",
+        runnerStatusFile: ".agent/tmp/phase5-remote-room-stop-status.json",
+        runnerStatusKind: "soloclaw.remote_room_runner_status",
+        runnerStatus: "unknown",
+        runnerStopReason: "unknown",
+      },
+    },
+    targets: [
+      {
+        id: "control-plane-host",
+        label: "Control plane host",
+        role: "control-plane",
+        status: "pending",
+        checks: {
+          health: "pending",
+          roomCreated: "pending",
+          inviteCreated: "pending",
+          transcriptVisible: "pending",
+          stateRoomVisible: "pending",
+          agentHealthVisible: "pending",
+          deliveryStatusVisible: "pending",
+          eventStream: "pending",
+        },
+        evidence: {
+          roomId: "<room-id>",
+          ownerAgentId: "<owner-agent-id>",
+          healthStatus: "pending",
+          transcriptMessageCount: 0,
+          stateRoomVisible: false,
+          stateRoomMessageCount: 0,
+          agentHealthVisible: false,
+          deliveryStatusVisible: false,
+          deliveryStatusAgentIds: ["<remote-agent-id>"],
+          deliveryStatusPendingCounts: { "<remote-agent-id>": 0 },
+          deliveryStatusAckMessageIds: ["<acknowledged-message-id>"],
+          eventStreamConnected: false,
+          eventStreamControlActionTypes: ["control_plane.action"],
+          eventStreamAgentIds: ["<remote-agent-id>"],
+          eventStreamRoomMessageEventTypes: ["room.message.sent"],
+          eventStreamRoomMessageIds: ["<room-message-id>", "<no-broadcast-fallback-message-id>"],
+          eventStreamDeliveryAckEventTypes: ["room.delivery.acknowledged"],
+          eventStreamAckMessageIds: ["<acknowledged-message-id>", "<per-remote-ack-message-id>"],
+          healthAgentIds: ["<remote-agent-id>"],
+          roomHealthAgentIds: ["<remote-agent-id>"],
+          responsiveAgentIds: ["<remote-agent-id>"],
+        },
+        notes: "Keep the web/control token, signed invite token, raw SSE text, and room message bodies out of this file; record only event stream summaries.",
+      },
+      remoteTarget("windows-powershell-agent", "Windows PowerShell remote agent"),
+      remoteTarget("windows-cmd-agent", "Windows CMD remote agent"),
+      remoteTarget("linux-shell-agent", "Linux shell remote agent"),
+      remoteTarget("macos-shell-agent", "macOS shell remote agent"),
+      remoteTarget("android-termux-agent", "Android Termux remote agent"),
+    ],
+  };
+}
+
+function resolvePhaseFiveEvidenceTemplateRegisteredPullTargetId(targetId: string | undefined): string {
+  if (!targetId) {
+    return "macos-shell-agent";
+  }
+  if (!PHASE_FIVE_REMOTE_TARGET_IDS.some((id) => id === targetId)) {
+    throw new Error(`Unknown Phase 5 registered-agent pull target: ${targetId}. Expected one of: ${PHASE_FIVE_REMOTE_TARGET_IDS.join(", ")}`);
+  }
+  return targetId;
+}
+
+function formatPhaseFiveEvidenceTemplate(template: ReturnType<typeof buildPhaseFiveEvidenceTemplate>): string {
+  return [
+    "Phase 5 cross-machine evidence template",
+    "",
+    "Save the JSON template with `--json`, or use `--target <target-id> --json` for one collector, fill each target after running `soloclaw phase5 matrix-template`, then run:",
+    "soloclaw phase5 evidence-check --file <phase5-evidence.json> --json",
+    "",
+    "Targets:",
+    ...template.targets.map((target) => `- ${target.id}: ${target.status}`),
+    "",
+    "Do not record control tokens, invite tokens, API keys, bearer tokens, vault passphrases, or private keys.",
+  ].join("\n");
+}
+
+function filterPhaseFiveEvidenceTemplate(template: ReturnType<typeof buildPhaseFiveEvidenceTemplate>, targetId: string | undefined): ReturnType<typeof buildPhaseFiveEvidenceTemplate> {
+  if (!targetId) {
+    return template;
+  }
+  const targets = template.targets.filter((target) => target.id === targetId);
+  if (targets.length === 0) {
+    throw new Error(`Unknown Phase 5 evidence target: ${targetId}. Expected one of: ${template.targets.map((target) => target.id).join(", ")}`);
+  }
+  return {
+    ...template,
+    source: `soloclaw phase5 evidence-template --target ${targetId}`,
+    targets,
+  };
+}
+
+type PhaseFiveEvidenceMergeArgs = {
+  filePath?: string;
+  targetId?: string;
+  targetFilePaths: string[];
+  targetDirPaths: string[];
+  outputPath?: string;
+  registeredPullTargetId?: string;
+  includeMissingEvidence: boolean;
+  json: boolean;
+};
+
+type PhaseFiveEvidenceMergeResult = {
+  evidence: Record<string, unknown>;
+  baseFilePath: string;
+  targetFilePaths: string[];
+  requiredTargetIds: string[];
+  mergedTargetIds: string[];
+  remainingTargetIds: string[];
+  readyForFinalEvidenceCheck: boolean;
+  collectionStatus: PhaseFiveEvidenceCollectionStatus;
+  roomStatus: PhaseFiveEvidenceMergeRoomStatus;
+  targetStatus: {
+    required: number;
+    passed: number;
+    remaining: number;
+  };
+};
+
+type PhaseFiveEvidenceStatusResult = {
+  phase: "phase5";
+  action: "evidence-status";
+  status: "complete" | "incomplete";
+  generatedAt: string;
+  targetFilterId?: string;
+  registeredPullTargetId?: string;
+  registeredPullTargetOverride?: PhaseFiveRegisteredPullTargetOverride;
+  baseFilePath: string;
+  targetFilePaths: string[];
+  invalidFragmentCount: number;
+  fragmentErrors: PhaseFiveEvidenceFragmentError[];
+  requiredTargetIds: string[];
+  mergedTargetIds: string[];
+  remainingTargetIds: string[];
+  readyForFinalEvidenceCheck: boolean;
+  collectionStatus: PhaseFiveEvidenceCollectionStatus;
+  roomStatus: PhaseFiveEvidenceMergeRoomStatus;
+  targetStatus: PhaseFiveEvidenceMergeResult["targetStatus"];
+  finalEvidenceCheck: ReturnType<typeof summarizePhaseFiveEvidenceMergeFinalCheck>;
+  nextEvidenceScopes: PhaseFiveEvidenceStatusNextScope[];
+  nextRoomEvidence: PhaseFiveEvidenceStatusNextRoomEvidence[];
+  nextTargetEvidence: PhaseFiveEvidenceStatusNextTarget[];
+  registeredPullOperatorNext?: PhaseFiveEvidenceStatusRegisteredPullOperatorNext;
+  missingEvidence?: PhaseFiveMissingEvidence[];
+  nextCommands: string[];
+};
+
+type PhaseFiveEvidenceStatusNextScope = {
+  scope: PhaseFiveMissingEvidence["scope"];
+  missingEvidenceCount: number;
+  guidance: string;
+  checkIds: PhaseFiveEvidenceCheckId[];
+  targetIds?: string[];
+};
+
+type PhaseFiveEvidenceStatusNextRoomEvidence = {
+  kind: "registered-agent-pull";
+  status: PhaseFiveEvidenceRoomSectionStatus["status"];
+  targetId: string;
+  agentId?: string;
+  missingFields: string[];
+  targetFragmentPath: string;
+  controlFragmentPath: string;
+  targetGuideCommand: string;
+  controlGuideCommand: string;
+  controlTemplateCommand: string;
+  controlPreflightCommand: string;
+  controlStatusCommand: string;
+  mergeCommand: string;
+  finalCheckCommand: string;
+  evidenceFieldHints: PhaseFiveRegisteredPullEvidenceFieldHint[];
+  registeredPullControlHostRunbook: PhaseFiveRegisteredPullControlHostRunbook;
+};
+
+type PhaseFiveEvidenceStatusRegisteredPullOperatorNext = {
+  kind: "registered-agent-pull";
+  status: PhaseFiveEvidenceRoomSectionStatus["status"];
+  targetId: string;
+  agentId?: string;
+  missingFields: string[];
+  selectedTarget: {
+    targetId: string;
+    fragmentPath: string;
+    guideCommand: string;
+    templateCommand: string;
+    preflightCommand: string;
+    statusCommand: string;
+    operatorNextCommands: string[];
+  };
+  controlHost: {
+    targetId: "control-plane-host";
+    fragmentPath: string;
+    guideCommand: string;
+    templateCommand: string;
+    preflightCommand: string;
+    statusCommand: string;
+    operatorNextCommands: string[];
+  };
+  evidenceFileHandoff: PhaseFiveRegisteredPullEvidenceFileHandoff;
+  evidenceFieldHints: PhaseFiveRegisteredPullEvidenceFieldHint[];
+  mergeCommand: string;
+  finalCheckCommand: string;
+};
+
+type PhaseFiveEvidenceStatusNextTarget = {
+  targetId: string;
+  role: string;
+  evidenceStatus: string;
+  mergedThisRun: boolean;
+  fragmentPath?: string;
+  sourceFilePath?: string;
+  missingEvidenceCount: number;
+  checkIds: PhaseFiveEvidenceCheckId[];
+  missingFields: string[];
+  templateCommand?: string;
+  statusCommand?: string;
+  preflightCommand?: string;
+  collectorGuideCommand?: string;
+  registeredPullRunbook?: PhaseFiveRegisteredPullRunbook;
+  returnToControlHost?: {
+    copyFragmentTo: string;
+    statusCommand: string;
+    mergeCommand: string;
+    finalCheckCommand: string;
+  };
+};
+
+type PhaseFiveRegisteredPullTargetOverride = {
+  requestedTargetId: string;
+  evidenceTargetId?: string;
+  affects: ["nextCommands", "nextTargetEvidence"];
+  evidenceUnchanged: true;
+  guidance: string;
+  reconcileCommands: {
+    refreshScaffoldBeforeCollection: string;
+    updateControlPlaneFragment: string;
+  };
+};
+
+type PhaseFiveEvidenceFragmentError = {
+  path: string;
+  message: string;
+};
+
+type PhaseFiveEvidenceCollectionStatus = {
+  complete: boolean;
+  mergedCount: number;
+  remainingCount: number;
+  passedCount: number;
+  pendingCount: number;
+  targets: PhaseFiveEvidenceCollectionTargetStatus[];
+};
+
+type PhaseFiveEvidenceCollectionTargetStatus = {
+  id: string;
+  role: string;
+  evidenceStatus: string;
+  mergedThisRun: boolean;
+  sourceFilePath?: string;
+};
+
+type PhaseFiveEvidenceRoomSectionStatus = {
+  status: "missing" | "incomplete" | "complete";
+  targetId?: string;
+  agentId?: string;
+  issues: string[];
+};
+
+type PhaseFiveEvidenceMergeRoomStatus = {
+  required: true;
+  source: "base" | "control-plane-fragment" | "missing";
+  mergedFromControlPlaneFragment: boolean;
+  needsControlPlaneFragment: boolean;
+  evidenceComplete: boolean;
+  registeredAgentPull: PhaseFiveEvidenceRoomSectionStatus;
+};
+
+function parsePhaseFiveEvidenceMergeArgs(args: string[]): PhaseFiveEvidenceMergeArgs {
+  const targetFilePaths: string[] = [];
+  const targetDirPaths: string[] = [];
+  let outputPath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--target-file") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --target-file.");
+      }
+      targetFilePaths.push(value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--target-file=")) {
+      const value = arg.slice("--target-file=".length);
+      if (!value) {
+        throw new Error("Missing value for --target-file.");
+      }
+      targetFilePaths.push(value);
+      continue;
+    }
+    if (arg === "--target-dir") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --target-dir.");
+      }
+      targetDirPaths.push(value);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--target-dir=")) {
+      const value = arg.slice("--target-dir=".length);
+      if (!value) {
+        throw new Error("Missing value for --target-dir.");
+      }
+      targetDirPaths.push(value);
+      continue;
+    }
+    if (arg === "--output") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --output.");
+      }
+      outputPath = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--output=")) {
+      const value = arg.slice("--output=".length);
+      if (!value) {
+        throw new Error("Missing value for --output.");
+      }
+      outputPath = value;
+      continue;
+    }
+  }
+  return {
+    filePath: parsePhaseTwoEvidenceFileOption(args),
+    targetId: parsePhaseFiveMatrixTargetOption(args),
+    targetFilePaths,
+    targetDirPaths,
+    outputPath,
+    registeredPullTargetId: parsePhaseFiveRegisteredPullTargetOption(args),
+    includeMissingEvidence: args.includes("--include-missing-evidence") || args.includes("--details"),
+    json: args.includes("--json"),
+  };
+}
+
+async function expandPhaseFiveEvidenceMergeTargetFiles(targetFilePaths: string[], targetDirPaths: string[]): Promise<string[]> {
+  const expanded = [...targetFilePaths];
+  for (const targetDirPath of targetDirPaths) {
+    const resolvedTargetDirPath = path.resolve(targetDirPath);
+    let entries: Dirent<string>[];
+    try {
+      entries = await fs.readdir(resolvedTargetDirPath, { withFileTypes: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Phase 5 evidence merge target dir ${resolvedTargetDirPath} cannot be read: ${message}`);
+    }
+    const jsonFiles = entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((entry) => path.join(resolvedTargetDirPath, entry.name));
+    if (jsonFiles.length === 0) {
+      throw new Error(`Phase 5 evidence merge target dir ${resolvedTargetDirPath} has no .json evidence fragments.`);
+    }
+    expanded.push(...jsonFiles);
+  }
+  return expanded;
+}
+
+async function expandPhaseFiveEvidenceStatusTargetFiles(targetFilePaths: string[], targetDirPaths: string[]): Promise<string[]> {
+  const expanded = [...targetFilePaths];
+  for (const targetDirPath of targetDirPaths) {
+    const resolvedTargetDirPath = path.resolve(targetDirPath);
+    let entries: Dirent<string>[];
+    try {
+      entries = await fs.readdir(resolvedTargetDirPath, { withFileTypes: true });
+    } catch (error) {
+      const code = nodeErrorCode(error);
+      if (code === "ENOENT" || code === "ENOTDIR") {
+        continue;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Phase 5 evidence status target dir ${resolvedTargetDirPath} cannot be read: ${message}`);
+    }
+    const jsonFiles = entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".json"))
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((entry) => path.join(resolvedTargetDirPath, entry.name));
+    expanded.push(...jsonFiles);
+  }
+  return expanded;
+}
+
+async function buildPhaseFiveEvidenceMerge(filePath: string, targetFilePaths: string[]): Promise<PhaseFiveEvidenceMergeResult> {
+  const baseFilePath = path.resolve(filePath);
+  const base = parsePhaseFiveEvidenceMergeDocument(JSON.parse(await readUtf8(baseFilePath)), "base evidence file");
+  const baseTargets = phaseFiveEvidenceMergeTargets(base, "base evidence file");
+  const requiredTargetIdSet = new Set<string>(PHASE_FIVE_REQUIRED_TARGET_IDS);
+  const expectedTargets = PHASE_FIVE_REQUIRED_TARGET_IDS.join(", ");
+  const targetById = new Map(baseTargets.map((target) => [String(target.id ?? ""), target]));
+  let mergedRoom = isRecord(base.room) ? base.room : undefined;
+  let roomSource: PhaseFiveEvidenceMergeRoomStatus["source"] = mergedRoom ? "base" : "missing";
+  const mergedTargetIds: string[] = [];
+  const resolvedTargetFilePaths: string[] = [];
+  const fragmentTargetSourceById = new Map<string, string>();
+
+  for (const targetFilePath of targetFilePaths) {
+    const resolvedTargetFilePath = path.resolve(targetFilePath);
+    resolvedTargetFilePaths.push(resolvedTargetFilePath);
+    const fragment = parsePhaseFiveEvidenceMergeDocument(JSON.parse(await readUtf8(resolvedTargetFilePath)), `target evidence file ${resolvedTargetFilePath}`);
+    const fragmentTargets = phaseFiveEvidenceMergeTargets(fragment, `target evidence file ${resolvedTargetFilePath}`);
+    if (fragmentTargets.some((target) => optionalNonEmptyString(target.id) === "control-plane-host")) {
+      if (!isRecord(fragment.room)) {
+        throw new Error(`Phase 5 evidence merge control-plane fragment ${resolvedTargetFilePath} must include room evidence.`);
+      }
+      mergedRoom = fragment.room;
+      roomSource = "control-plane-fragment";
+    }
+    for (const target of fragmentTargets) {
+      const targetId = optionalNonEmptyString(target.id);
+      if (!targetId) {
+        throw new Error(`Phase 5 evidence merge target in ${resolvedTargetFilePath} is missing id.`);
+      }
+      if (!requiredTargetIdSet.has(targetId)) {
+        throw new Error(`Unknown Phase 5 evidence merge target: ${targetId}. Expected one of: ${expectedTargets}`);
+      }
+      const previousSourcePath = fragmentTargetSourceById.get(targetId);
+      if (previousSourcePath) {
+        throw new Error(`Duplicate Phase 5 evidence merge target: ${targetId} appears in ${previousSourcePath} and ${resolvedTargetFilePath}. Keep one fragment per target.`);
+      }
+      if (!targetById.has(targetId)) {
+        throw new Error(`Phase 5 evidence merge base is missing target: ${targetId}.`);
+      }
+      fragmentTargetSourceById.set(targetId, resolvedTargetFilePath);
+      targetById.set(targetId, target);
+      if (!mergedTargetIds.includes(targetId)) {
+        mergedTargetIds.push(targetId);
+      }
+    }
+  }
+
+  const targets = baseTargets.map((target) => {
+    const targetId = String(target.id ?? "");
+    return targetById.get(targetId) ?? target;
+  });
+  const evidence: Record<string, unknown> = {
+    ...base,
+    generatedAt: new Date().toISOString(),
+    source: "soloclaw phase5 evidence-merge",
+    targets,
+  };
+  if (mergedRoom) {
+    evidence.room = mergedRoom;
+  }
+  const requiredTargetIds = [...PHASE_FIVE_REQUIRED_TARGET_IDS];
+  const passedTargetIds = requiredTargetIds.filter((targetId) => targetById.get(targetId)?.status === "pass");
+  const remainingTargetIds = requiredTargetIds.filter((targetId) => targetById.get(targetId)?.status !== "pass");
+  const roomStatus = buildPhaseFiveEvidenceMergeRoomStatus(roomSource, mergedRoom, targetById);
+  const readyForFinalEvidenceCheck = remainingTargetIds.length === 0 && roomStatus.evidenceComplete;
+  return {
+    evidence,
+    baseFilePath,
+    targetFilePaths: resolvedTargetFilePaths,
+    requiredTargetIds,
+    mergedTargetIds,
+    remainingTargetIds,
+    readyForFinalEvidenceCheck,
+    collectionStatus: buildPhaseFiveEvidenceMergeCollectionStatus({
+      requiredTargetIds,
+      targetById,
+      fragmentTargetSourceById,
+      mergedTargetIds,
+      remainingTargetIds,
+      complete: readyForFinalEvidenceCheck,
+    }),
+    roomStatus,
+    targetStatus: {
+      required: requiredTargetIds.length,
+      passed: passedTargetIds.length,
+      remaining: remainingTargetIds.length,
+    },
+  };
+}
+
+async function buildPhaseFiveEvidenceStatus(
+  filePath: string,
+  targetFilePaths: string[],
+  options: { registeredPullTargetId?: string; includeMissingEvidence?: boolean; targetId?: string } = {},
+): Promise<PhaseFiveEvidenceStatusResult> {
+  const registeredPullTargetId = resolvePhaseFiveRegisteredPullTargetId(options.registeredPullTargetId, buildPhaseFiveEvidencePlan());
+  const targetFilterId = resolvePhaseFiveEvidenceStatusTargetFilterId(options.targetId);
+  await buildPhaseFiveEvidenceMerge(filePath, []);
+  const validTargetFilePaths: string[] = [];
+  const fragmentErrors: PhaseFiveEvidenceFragmentError[] = [];
+  for (const targetFilePath of targetFilePaths) {
+    const resolvedTargetFilePath = path.resolve(targetFilePath);
+    try {
+      await buildPhaseFiveEvidenceMerge(filePath, [...validTargetFilePaths, resolvedTargetFilePath]);
+      validTargetFilePaths.push(resolvedTargetFilePath);
+    } catch (error) {
+      fragmentErrors.push({
+        path: resolvedTargetFilePath,
+        message: sanitizePhaseFiveEvidenceStatusError(error),
+      });
+    }
+  }
+  const merge = await buildPhaseFiveEvidenceMerge(filePath, validTargetFilePaths);
+  const readyForFinalEvidenceCheck = merge.readyForFinalEvidenceCheck && fragmentErrors.length === 0;
+  const collectionStatus = fragmentErrors.length === 0
+    ? merge.collectionStatus
+    : { ...merge.collectionStatus, complete: false };
+  const status = readyForFinalEvidenceCheck ? "complete" : "incomplete";
+  const statusMerge = {
+    ...merge,
+    readyForFinalEvidenceCheck,
+    collectionStatus,
+  };
+  const finalEvidenceCheck = buildPhaseFiveEvidenceCheckFromDocument(statusMerge.evidence, merge.baseFilePath);
+  const statusMissingEvidence = filterPhaseFiveEvidenceStatusMissingEvidence(finalEvidenceCheck.missingEvidence, targetFilterId);
+  const registeredPullTargetOverride = buildPhaseFiveRegisteredPullTargetOverride(registeredPullTargetId, merge.roomStatus);
+  const statusCommandRegisteredPullTargetId = registeredPullTargetId ?? phaseFiveEvidenceStatusRegisteredPullTargetId(merge.roomStatus);
+  const nextRoomEvidence = buildPhaseFiveEvidenceStatusNextRoomEvidence(merge.roomStatus, statusCommandRegisteredPullTargetId);
+  return {
+    phase: "phase5",
+    action: "evidence-status",
+    status,
+    generatedAt: new Date().toISOString(),
+    ...(targetFilterId ? { targetFilterId } : {}),
+    ...(registeredPullTargetId ? { registeredPullTargetId } : {}),
+    ...(registeredPullTargetOverride ? { registeredPullTargetOverride } : {}),
+    baseFilePath: merge.baseFilePath,
+    targetFilePaths: merge.targetFilePaths,
+    invalidFragmentCount: fragmentErrors.length,
+    fragmentErrors,
+    requiredTargetIds: merge.requiredTargetIds,
+    mergedTargetIds: merge.mergedTargetIds,
+    remainingTargetIds: merge.remainingTargetIds,
+    readyForFinalEvidenceCheck,
+    collectionStatus,
+    roomStatus: merge.roomStatus,
+    targetStatus: merge.targetStatus,
+    finalEvidenceCheck: summarizePhaseFiveEvidenceMergeFinalCheck(finalEvidenceCheck),
+    nextEvidenceScopes: buildPhaseFiveEvidenceStatusNextScopes(statusMissingEvidence),
+    nextRoomEvidence,
+    nextTargetEvidence: buildPhaseFiveEvidenceStatusNextTargets(statusMissingEvidence, collectionStatus, statusCommandRegisteredPullTargetId),
+    ...(nextRoomEvidence.length > 0 ? { registeredPullOperatorNext: buildPhaseFiveEvidenceStatusRegisteredPullOperatorNext(nextRoomEvidence[0]) } : {}),
+    ...(options.includeMissingEvidence ? { missingEvidence: statusMissingEvidence } : {}),
+    nextCommands: buildPhaseFiveEvidenceStatusNextCommands(statusMerge, registeredPullTargetId, targetFilterId),
+  };
+}
+
+function resolvePhaseFiveEvidenceStatusTargetFilterId(targetId: string | undefined): string | undefined {
+  if (!targetId) {
+    return undefined;
+  }
+  if (!PHASE_FIVE_REQUIRED_TARGET_IDS.includes(targetId as typeof PHASE_FIVE_REQUIRED_TARGET_IDS[number])) {
+    throw new Error(`Unknown Phase 5 evidence-status target filter: ${targetId}. Expected one of: ${PHASE_FIVE_REQUIRED_TARGET_IDS.join(", ")}`);
+  }
+  return targetId;
+}
+
+function filterPhaseFiveEvidenceStatusMissingEvidence(
+  missingEvidence: PhaseFiveMissingEvidence[],
+  targetFilterId: string | undefined,
+): PhaseFiveMissingEvidence[] {
+  if (!targetFilterId) {
+    return missingEvidence;
+  }
+  return missingEvidence.filter((item) => item.scope === "target" && item.targetId === targetFilterId);
+}
+
+function buildPhaseFiveRegisteredPullTargetOverride(
+  requestedTargetId: string | undefined,
+  roomStatus: PhaseFiveEvidenceMergeRoomStatus,
+): PhaseFiveRegisteredPullTargetOverride | undefined {
+  if (!requestedTargetId) {
+    return undefined;
+  }
+  const evidenceTargetId = phaseFiveEvidenceStatusRegisteredPullTargetId(roomStatus);
+  if (evidenceTargetId === requestedTargetId) {
+    return undefined;
+  }
+  const evidenceTargetSummary = evidenceTargetId
+    ? `evidence still records ${evidenceTargetId}`
+    : "evidence does not record a registered-agent pull target yet";
+  return {
+    requestedTargetId,
+    ...(evidenceTargetId ? { evidenceTargetId } : {}),
+    affects: ["nextCommands", "nextTargetEvidence"],
+    evidenceUnchanged: true,
+    guidance: `Requested registered-agent pull target only changes suggested commands; ${evidenceTargetSummary}. Refresh scaffolding before collection, or update the control-plane fragment's room.registeredAgentPull target fields after collecting real evidence.`,
+    reconcileCommands: {
+      refreshScaffoldBeforeCollection: `soloclaw phase5 collection-prepare --registered-pull-target ${requestedTargetId} --force --json`,
+      updateControlPlaneFragment: `soloclaw phase5 evidence-template --target control-plane-host --registered-pull-target ${requestedTargetId} --json`,
+    },
+  };
+}
+
+function sanitizePhaseFiveEvidenceStatusError(error: unknown): string {
+  return redactInlineSecretText(error instanceof Error ? error.message : String(error))
+    .replace(/\brinv_[A-Za-z0-9_-]+\b/g, "[REDACTED:invite_id]")
+    .replace(/\bphase5-control-token\b/g, "[REDACTED:control_token]")
+    .replace(/BEGIN (?:OPENSSH|PRIVATE) KEY[\s\S]*?(?:END (?:OPENSSH|PRIVATE) KEY)?/g, "[REDACTED:private_key]");
+}
+
+function buildPhaseFiveEvidenceStatusNextCommands(
+  result: PhaseFiveEvidenceMergeResult,
+  registeredPullTargetOverrideId?: string,
+  targetFilterId?: string,
+): string[] {
+  const registeredPullTargetId = registeredPullTargetOverrideId ?? phaseFiveEvidenceStatusRegisteredPullTargetId(result.roomStatus);
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+  const commands: string[] = [];
+  const pushCommand = (command: string | undefined) => {
+    if (command && !commands.includes(command)) {
+      commands.push(command);
+    }
+  };
+  if (targetFilterId) {
+    const target = plan.targets.find((candidate) => candidate.id === targetFilterId);
+    pushCommand(phaseFiveCollectorGuideCommand(targetFilterId, registeredPullTargetId));
+    if (target) {
+      pushCommand(target.templateCommand);
+    }
+    if (targetFilterId === registeredPullTargetId) {
+      for (const stage of buildPhaseFiveRegisteredPullRunbook(targetFilterId).stages) {
+        pushCommand(stage.commandHint);
+      }
+    }
+    if (targetFilterId === "control-plane-host" && registeredPullTargetId) {
+      for (const stage of buildPhaseFiveRegisteredPullControlHostRunbook(registeredPullTargetId, {
+        fragmentsDir: plan.fragmentsDir,
+        guidesDir: "phase5-collector-guides",
+      }).stages) {
+        pushCommand(stage.commandHint);
+      }
+    }
+  } else {
+    const roomCommands = buildPhaseFiveEvidenceStatusNextRoomEvidence(result.roomStatus, registeredPullTargetId);
+    for (const room of roomCommands) {
+      pushCommand(room.controlGuideCommand);
+      pushCommand(room.controlTemplateCommand);
+      pushCommand(room.controlStatusCommand);
+      pushCommand(room.controlPreflightCommand);
+      pushCommand(room.targetGuideCommand);
+    }
+  }
+  const preflightTargetIds = targetFilterId ? [targetFilterId] : result.remainingTargetIds;
+  for (const targetId of preflightTargetIds) {
+    const target = plan.targets.find((candidate) => candidate.id === targetId);
+    if (target) {
+      pushCommand(target.preflightCommand);
+    }
+  }
+  if (!targetFilterId && !result.roomStatus.evidenceComplete && !result.remainingTargetIds.includes("control-plane-host")) {
+    const control = plan.targets.find((target) => target.id === "control-plane-host");
+    if (control) {
+      pushCommand(control.preflightCommand);
+    }
+  }
+  for (const command of plan.controlHostCommands.slice(1).map((command) => withPhaseFiveRegisteredPullTargetCommand(command, registeredPullTargetId))) {
+    pushCommand(command);
+  }
+  return commands;
+}
+
+function buildPhaseFiveEvidenceStatusNextScopes(missingEvidence: PhaseFiveMissingEvidence[]): PhaseFiveEvidenceStatusNextScope[] {
+  const scopes: PhaseFiveMissingEvidence["scope"][] = ["matrix", "target", "room", "control-plane"];
+  return scopes.flatMap((scope) => {
+    const missingItems = missingEvidence.filter((item) => item.scope === scope);
+    const missingEvidenceCount = missingItems.length;
+    if (missingEvidenceCount === 0) {
+      return [];
+    }
+    const checkIds = [...new Set(missingItems.map((item) => item.checkId))];
+    const targetIds = [...new Set(missingItems.map((item) => item.targetId).filter((targetId): targetId is string => Boolean(targetId)))];
+    return [{
+      scope,
+      missingEvidenceCount,
+      guidance: phaseFiveEvidenceStatusScopeGuidance(scope),
+      checkIds,
+      ...(targetIds.length > 0 ? { targetIds } : {}),
+    }];
+  });
+}
+
+function buildPhaseFiveEvidenceStatusNextRoomEvidence(
+  roomStatus: PhaseFiveEvidenceMergeRoomStatus,
+  registeredPullTargetId?: string,
+): PhaseFiveEvidenceStatusNextRoomEvidence[] {
+  const registeredPull = roomStatus.registeredAgentPull;
+  const targetId = registeredPullTargetId ?? phaseFiveEvidenceStatusRegisteredPullTargetId(roomStatus);
+  if (registeredPull.status === "complete" || !targetId) {
+    return [];
+  }
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId: targetId });
+  const target = plan.targets.find((candidate) => candidate.id === targetId);
+  const control = plan.targets.find((candidate) => candidate.id === "control-plane-host");
+  if (!target || !control) {
+    return [];
+  }
+  const mergeCommand = `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`;
+  const finalCheckCommand = `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`;
+  const registeredPullControlHostRunbook = buildPhaseFiveRegisteredPullControlHostRunbook(targetId, {
+    fragmentsDir: plan.fragmentsDir,
+    guidesDir: "phase5-collector-guides",
+  });
+  return [{
+    kind: "registered-agent-pull",
+    status: registeredPull.status,
+    targetId,
+    ...(registeredPull.agentId ? { agentId: registeredPull.agentId } : {}),
+    missingFields: registeredPull.issues,
+    targetFragmentPath: target.fragmentPath,
+    controlFragmentPath: control.fragmentPath,
+    targetGuideCommand: phaseFiveCollectorGuideCommand(targetId, targetId),
+    controlGuideCommand: phaseFiveCollectorGuideCommand("control-plane-host", targetId),
+    controlTemplateCommand: control.templateCommand,
+    controlPreflightCommand: control.preflightCommand,
+    controlStatusCommand: control.statusCommand,
+    mergeCommand,
+    finalCheckCommand,
+    evidenceFieldHints: prioritizePhaseFiveRegisteredPullEvidenceFieldHints(
+      registeredPullControlHostRunbook.evidenceFieldHints,
+      registeredPull.issues,
+    ),
+    registeredPullControlHostRunbook,
+  }];
+}
+
+function buildPhaseFiveRegisteredPullOperatorNextForTarget(
+  targetId: string,
+  options: {
+    status: PhaseFiveEvidenceRoomSectionStatus["status"];
+    agentId?: string;
+    missingFields?: string[];
+    targetGuideCommand?: string;
+    controlGuideCommand?: string;
+    registeredPullControlHostRunbook?: PhaseFiveRegisteredPullControlHostRunbook;
+    evidenceFieldHints?: PhaseFiveRegisteredPullEvidenceFieldHint[];
+    mergeCommand?: string;
+    finalCheckCommand?: string;
+  },
+): PhaseFiveEvidenceStatusRegisteredPullOperatorNext {
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId: targetId });
+  const selectedTarget = plan.targets.find((target) => target.id === targetId);
+  const controlHost = plan.targets.find((target) => target.id === "control-plane-host");
+  if (!selectedTarget || !controlHost) {
+    throw new Error(`Unable to build registered-agent pull operator next steps for target ${targetId}.`);
+  }
+  const mergeCommand = options.mergeCommand ?? `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`;
+  const finalCheckCommand = options.finalCheckCommand ?? `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`;
+  const registeredPullControlHostRunbook = options.registeredPullControlHostRunbook ?? buildPhaseFiveRegisteredPullControlHostRunbook(targetId, {
+    fragmentsDir: plan.fragmentsDir,
+    guidesDir: "phase5-collector-guides",
+  });
+  const missingFields = options.missingFields ?? [...new Set(registeredPullControlHostRunbook.evidenceFieldHints.map((hint) => hint.field))];
+  const evidenceFieldHints = options.evidenceFieldHints ?? prioritizePhaseFiveRegisteredPullEvidenceFieldHints(
+    registeredPullControlHostRunbook.evidenceFieldHints,
+    missingFields,
+  );
+  const selectedTargetRunbook = buildPhaseFiveRegisteredPullRunbook(targetId);
+  const selectedTargetOperatorNextCommands = buildPhaseFiveCollectorGuideOperatorNextCommands({
+    templateCommand: selectedTarget.templateCommand,
+    preflightCommand: selectedTarget.preflightCommand,
+    registeredPullRunbook: selectedTargetRunbook,
+    returnToControlHost: {
+      copyFragmentTo: selectedTarget.fragmentPath,
+      statusCommand: selectedTarget.statusCommand,
+      mergeCommand,
+      finalCheckCommand,
+    },
+  });
+  const controlHostOperatorNextCommands = buildPhaseFiveCollectorGuideOperatorNextCommands({
+    templateCommand: controlHost.templateCommand,
+    preflightCommand: controlHost.preflightCommand,
+    registeredPullControlHostRunbook,
+    returnToControlHost: {
+      copyFragmentTo: controlHost.fragmentPath,
+      statusCommand: controlHost.statusCommand,
+      mergeCommand,
+      finalCheckCommand,
+    },
+  });
+  return {
+    kind: "registered-agent-pull",
+    status: options.status,
+    targetId,
+    ...(options.agentId ? { agentId: options.agentId } : {}),
+    missingFields,
+    selectedTarget: {
+      targetId: selectedTarget.id,
+      fragmentPath: selectedTarget.fragmentPath,
+      guideCommand: options.targetGuideCommand ?? phaseFiveCollectorGuideCommand(targetId, targetId),
+      templateCommand: selectedTarget.templateCommand,
+      preflightCommand: selectedTarget.preflightCommand,
+      statusCommand: selectedTarget.statusCommand,
+      operatorNextCommands: selectedTargetOperatorNextCommands,
+    },
+    controlHost: {
+      targetId: "control-plane-host",
+      fragmentPath: controlHost.fragmentPath,
+      guideCommand: options.controlGuideCommand ?? phaseFiveCollectorGuideCommand("control-plane-host", targetId),
+      templateCommand: controlHost.templateCommand,
+      preflightCommand: controlHost.preflightCommand,
+      statusCommand: controlHost.statusCommand,
+      operatorNextCommands: controlHostOperatorNextCommands,
+    },
+    evidenceFileHandoff: buildPhaseFiveRegisteredPullEvidenceFileHandoff(),
+    evidenceFieldHints,
+    mergeCommand,
+    finalCheckCommand,
+  };
+}
+
+function buildPhaseFiveRegisteredPullEvidenceFileHandoff(): PhaseFiveRegisteredPullEvidenceFileHandoff {
+  const selectedTargetProduces = [
+    ".agent/tmp/phase5-registered-pull-status.json",
+    "invitations.json",
+    "accept-room.json",
+  ].map((filePath) => ({
+    path: filePath,
+    controlHostCopyTo: filePath,
+    consumedBy: "registered-pull-evidence-patch" as const,
+  }));
+  const controlHostPatchInputs = [
+    "pull-agent.json",
+    "room-show.json",
+    "delivery-status.json",
+  ].map((filePath) => ({
+    path: filePath,
+    consumedBy: "registered-pull-evidence-patch" as const,
+  }));
+  return {
+    selectedTargetProduces,
+    controlHostProduces: [
+      ...controlHostPatchInputs,
+      {
+        path: "phase5-registered-pull-evidence-patch.json",
+        consumedBy: "control-plane-fragment-paste",
+      },
+    ],
+    patchInputs: [
+      ".agent/tmp/phase5-registered-pull-status.json",
+      "pull-agent.json",
+      "invitations.json",
+      "accept-room.json",
+      "room-show.json",
+      "delivery-status.json",
+    ],
+    patchOutputFile: "phase5-registered-pull-evidence-patch.json",
+    pastePath: "room.registeredAgentPull",
+  };
+}
+
+function buildPhaseFiveEvidenceStatusRegisteredPullOperatorNext(
+  room: PhaseFiveEvidenceStatusNextRoomEvidence,
+): PhaseFiveEvidenceStatusRegisteredPullOperatorNext {
+  return buildPhaseFiveRegisteredPullOperatorNextForTarget(room.targetId, {
+    status: room.status,
+    ...(room.agentId ? { agentId: room.agentId } : {}),
+    missingFields: room.missingFields,
+    targetGuideCommand: room.targetGuideCommand,
+    controlGuideCommand: room.controlGuideCommand,
+    registeredPullControlHostRunbook: room.registeredPullControlHostRunbook,
+    evidenceFieldHints: room.evidenceFieldHints,
+    mergeCommand: room.mergeCommand,
+    finalCheckCommand: room.finalCheckCommand,
+  });
+}
+
+function prioritizePhaseFiveRegisteredPullEvidenceFieldHints(
+  hints: PhaseFiveRegisteredPullEvidenceFieldHint[],
+  priorityFields: string[],
+): PhaseFiveRegisteredPullEvidenceFieldHint[] {
+  if (priorityFields.length === 0) {
+    return hints;
+  }
+  const priorityByField = new Map(priorityFields.map((field, index) => [field, index]));
+  return [...hints].sort((left, right) => {
+    const leftPriority = priorityByField.get(left.field);
+    const rightPriority = priorityByField.get(right.field);
+    if (leftPriority === undefined && rightPriority === undefined) {
+      return 0;
+    }
+    if (leftPriority === undefined) {
+      return 1;
+    }
+    if (rightPriority === undefined) {
+      return -1;
+    }
+    return leftPriority - rightPriority;
+  });
+}
+
+function buildPhaseFiveEvidenceStatusNextTargets(
+  missingEvidence: PhaseFiveMissingEvidence[],
+  collectionStatus: PhaseFiveEvidenceCollectionStatus,
+  registeredPullTargetId?: string,
+): PhaseFiveEvidenceStatusNextTarget[] {
+  const plan = buildPhaseFiveEvidencePlan({ registeredPullTargetId });
+  const targetPlanByTargetId = new Map(plan.targets.map((target) => [target.id, target]));
+  const templateCommandByTargetId = new Map(plan.targets.map((target) => [target.id, target.templateCommand]));
+  const statusCommandByTargetId = new Map(plan.targets.map((target) => [target.id, target.statusCommand]));
+  const preflightCommandByTargetId = new Map(plan.targets.map((target) => [target.id, target.preflightCommand]));
+  const mergeCommand = `soloclaw phase5 evidence-merge --file ${plan.baseEvidenceFile} --target-dir ${plan.fragmentsDir} --output ${plan.mergedEvidenceFile} --json`;
+  const finalCheckCommand = `soloclaw phase5 evidence-check --file ${plan.mergedEvidenceFile} --json`;
+  const missingEvidenceByTargetId = new Map<string, PhaseFiveMissingEvidence[]>();
+  for (const item of missingEvidence) {
+    if (item.scope !== "target" || !item.targetId) {
+      continue;
+    }
+    const existing = missingEvidenceByTargetId.get(item.targetId) ?? [];
+    existing.push(item);
+    missingEvidenceByTargetId.set(item.targetId, existing);
+  }
+  return collectionStatus.targets.flatMap((target) => {
+    const missingEvidence = missingEvidenceByTargetId.get(target.id) ?? [];
+    if (missingEvidence.length === 0) {
+      return [];
+    }
+    const checkIds = [...new Set(missingEvidence.map((item) => item.checkId))];
+    const missingFields = [...new Set(missingEvidence.flatMap((item) => item.missing))];
+    const targetPlan = targetPlanByTargetId.get(target.id);
+    const templateCommand = templateCommandByTargetId.get(target.id);
+    const statusCommand = statusCommandByTargetId.get(target.id);
+    const preflightCommand = preflightCommandByTargetId.get(target.id);
+    const collectorGuideCommand = phaseFiveCollectorGuideCommand(target.id, registeredPullTargetId);
+    const registeredPullRunbook = target.id === registeredPullTargetId
+      ? buildPhaseFiveRegisteredPullRunbook(target.id)
+      : undefined;
+    const returnToControlHost = targetPlan && statusCommand ? {
+      copyFragmentTo: targetPlan.fragmentPath,
+      statusCommand,
+      mergeCommand,
+      finalCheckCommand,
+    } : undefined;
+    return [{
+      targetId: target.id,
+      role: target.role,
+      evidenceStatus: target.evidenceStatus,
+      mergedThisRun: target.mergedThisRun,
+      ...(targetPlan ? { fragmentPath: targetPlan.fragmentPath } : {}),
+      ...(target.sourceFilePath ? { sourceFilePath: target.sourceFilePath } : {}),
+      missingEvidenceCount: missingEvidence.length,
+      checkIds,
+      missingFields,
+      ...(templateCommand ? { templateCommand } : {}),
+      ...(statusCommand ? { statusCommand } : {}),
+      ...(preflightCommand ? { preflightCommand } : {}),
+      collectorGuideCommand,
+      ...(registeredPullRunbook ? { registeredPullRunbook } : {}),
+      ...(returnToControlHost ? { returnToControlHost } : {}),
+    }];
+  });
+}
+
+function phaseFiveCollectorGuideCommand(targetId: string, registeredPullTargetId?: string): string {
+  return registeredPullTargetId
+    ? `soloclaw phase5 collector-guide --target ${targetId} --registered-pull-target ${registeredPullTargetId} --json`
+    : `soloclaw phase5 collector-guide --target ${targetId} --json`;
+}
+
+function phaseFiveEvidenceStatusScopeGuidance(scope: PhaseFiveMissingEvidence["scope"]): string {
+  if (scope === "matrix") {
+    return "Fix evidence file shape, required-target coverage, or secret-shape failures before trusting collection status.";
+  }
+  if (scope === "target") {
+    return "Collect and preflight the listed target fragments, then return the filled JSON fragments to the control host.";
+  }
+  if (scope === "control-plane") {
+    return "Refresh the control-plane-host fragment with event-stream, delivery-status, transcript, state, and health summaries.";
+  }
+  return "Fill the shared room evidence in the control-plane-host fragment after the real room scenarios run across joined remote agents.";
+}
+
+function phaseFiveEvidenceStatusRegisteredPullTargetId(roomStatus: PhaseFiveEvidenceMergeRoomStatus): string | undefined {
+  const targetId = roomStatus.registeredAgentPull.targetId;
+  if (!targetId || !PHASE_FIVE_REMOTE_TARGET_IDS.includes(targetId as typeof PHASE_FIVE_REMOTE_TARGET_IDS[number])) {
+    return undefined;
+  }
+  return targetId;
+}
+
+function withPhaseFiveRegisteredPullTargetCommand(command: string, registeredPullTargetId?: string): string {
+  if (!registeredPullTargetId) {
+    return command;
+  }
+  const commandPrefixes = [
+    "soloclaw phase5 collection-runbook",
+    "soloclaw phase5 collection-prepare",
+    "soloclaw phase5 collector-pack",
+  ];
+  if (!commandPrefixes.some((prefix) => command.startsWith(prefix))) {
+    return command;
+  }
+  if (command.includes(" --registered-pull-target ")) {
+    return command;
+  }
+  return command.replace(" --json", ` --registered-pull-target ${registeredPullTargetId} --json`);
+}
+
+function buildPhaseFiveEvidenceMergeCollectionStatus(input: {
+  requiredTargetIds: string[];
+  targetById: Map<string, Record<string, unknown>>;
+  fragmentTargetSourceById: Map<string, string>;
+  mergedTargetIds: string[];
+  remainingTargetIds: string[];
+  complete: boolean;
+}): PhaseFiveEvidenceCollectionStatus {
+  return {
+    complete: input.complete,
+    mergedCount: input.mergedTargetIds.length,
+    remainingCount: input.remainingTargetIds.length,
+    passedCount: input.requiredTargetIds.length - input.remainingTargetIds.length,
+    pendingCount: input.remainingTargetIds.length,
+    targets: input.requiredTargetIds.map((targetId) => {
+      const target = input.targetById.get(targetId);
+      const sourceFilePath = input.fragmentTargetSourceById.get(targetId);
+      return {
+        id: targetId,
+        role: optionalNonEmptyString(target?.role) ?? (targetId === "control-plane-host" ? "control-plane" : "remote-agent"),
+        evidenceStatus: optionalNonEmptyString(target?.status) ?? "missing",
+        mergedThisRun: Boolean(sourceFilePath),
+        sourceFilePath,
+      };
+    }),
+  };
+}
+
+function buildPhaseFiveEvidenceMergeRoomStatus(
+  source: PhaseFiveEvidenceMergeRoomStatus["source"],
+  room: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): PhaseFiveEvidenceMergeRoomStatus {
+  const mergedFromControlPlaneFragment = source === "control-plane-fragment";
+  const evidenceComplete = phaseFiveMergedRoomEvidenceLooksCollected(room);
+  const registeredAgentPull = phaseFiveRegisteredAgentPullStatus(room, targetById);
+  return {
+    required: true,
+    source,
+    mergedFromControlPlaneFragment,
+    needsControlPlaneFragment: !mergedFromControlPlaneFragment && !evidenceComplete,
+    evidenceComplete,
+    registeredAgentPull,
+  };
+}
+
+function phaseFiveRegisteredAgentPullStatus(
+  room: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): PhaseFiveEvidenceRoomSectionStatus {
+  const registeredAgentPull = room && isRecord(room.registeredAgentPull) ? room.registeredAgentPull : undefined;
+  const validation = validatePhaseFiveRegisteredAgentPull(registeredAgentPull, targetById);
+  const status = registeredAgentPull
+    ? validation.issues.length === 0 ? "complete" : "incomplete"
+    : "missing";
+  return {
+    status,
+    ...(validation.targetId ? { targetId: validation.targetId } : {}),
+    ...(validation.agentId ? { agentId: validation.agentId } : {}),
+    issues: validation.issues,
+  };
+}
+
+function phaseFiveMergedRoomEvidenceLooksCollected(room: Record<string, unknown> | undefined): boolean {
+  if (!room) {
+    return false;
+  }
+  const revokedInvite = isRecord(room.revokedInvite) ? room.revokedInvite : undefined;
+  const revokedAgent = isRecord(room.revokedAgent) ? room.revokedAgent : undefined;
+  const keyRotation = isRecord(room.keyRotation) ? room.keyRotation : undefined;
+  const suspendedAgent = isRecord(room.suspendedAgent) ? room.suspendedAgent : undefined;
+  const noBroadcastFallback = isRecord(room.noBroadcastFallback) ? room.noBroadcastFallback : undefined;
+  const staleAgent = isRecord(room.staleAgent) ? room.staleAgent : undefined;
+  const staleRecovery = isRecord(room.staleRecovery) ? room.staleRecovery : undefined;
+  const stopFileShutdown = isRecord(room.stopFileShutdown) ? room.stopFileShutdown : undefined;
+  const peerExchange = isRecord(room.peerExchange) ? room.peerExchange : undefined;
+  const registeredAgentPull = isRecord(room.registeredAgentPull) ? room.registeredAgentPull : undefined;
+  const assignmentResult = isRecord(room.assignmentResult) ? room.assignmentResult : undefined;
+  const conflictResolution = isRecord(room.conflictResolution) ? room.conflictResolution : undefined;
+  const resultSync = isRecord(room.resultSync) ? room.resultSync : undefined;
+  const handoff = isRecord(room.handoff) ? room.handoff : undefined;
+
+  return revokedInvite?.joinBlocked === true &&
+    revokedAgent?.signedSayBlocked === true &&
+    revokedAgent?.signedAckBlocked === true &&
+    revokedAgent?.signedHeartbeatBlocked === true &&
+    keyRotation?.oldSignedSayBlocked === true &&
+    keyRotation?.newSignedSayAccepted === true &&
+    keyRotation?.auditEventVisible === true &&
+    suspendedAgent?.remoteSayBlocked === true &&
+    noBroadcastFallback?.messageVisible === true &&
+    staleAgent?.healthState === "stale" &&
+    staleAgent?.heartbeatExpired === true &&
+    staleAgent?.responsive === false &&
+    staleRecovery?.recovered === true &&
+    staleRecovery?.memberStatusAfter === "suspended" &&
+    staleRecovery?.healthStateAfter === "offline" &&
+    stopFileShutdown?.runnerStopReason === "shutdown_requested" &&
+    peerExchange?.receiverHandled === true &&
+    peerExchange?.senderHandledReply === true &&
+    registeredAgentPull?.registered === true &&
+    registeredAgentPull?.invitationListed === true &&
+    registeredAgentPull?.accepted === true &&
+    registeredAgentPull?.ackSigned === true &&
+    registeredAgentPull?.replySignatureStatus === "valid" &&
+    assignmentResult?.resultStatus === "completed" &&
+    conflictResolution?.resolutionStatus === "resolved" &&
+    resultSync?.artifactRegistered === true &&
+    resultSync?.artifactMessageVisible === true &&
+    handoff?.handoffAccepted === true &&
+    handoff?.handoffCompleted === true;
+}
+
+function parsePhaseFiveEvidenceMergeDocument(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`Phase 5 evidence merge ${label} must be a JSON object.`);
+  }
+  if (value.phase !== "phase5" || !Array.isArray(value.targets)) {
+    throw new Error(`Phase 5 evidence merge ${label} must have phase=phase5 and targets[].`);
+  }
+  return value;
+}
+
+function phaseFiveEvidenceMergeTargets(document: Record<string, unknown>, label: string): Record<string, unknown>[] {
+  if (!Array.isArray(document.targets)) {
+    throw new Error(`Phase 5 evidence merge ${label} must have targets[].`);
+  }
+  const targets = document.targets.filter(isRecord);
+  if (targets.length !== document.targets.length) {
+    throw new Error(`Phase 5 evidence merge ${label} targets[] must contain only objects.`);
+  }
+  return targets;
+}
+
+function formatPhaseFiveEvidenceMerge(result: PhaseFiveEvidenceMergeResult, output?: { path: string; bytes: number }): string {
+  return [
+    "Phase 5 evidence merge: pass",
+    `base=${result.baseFilePath}`,
+    `targets=${result.mergedTargetIds.join(",") || "-"}`,
+    `remaining=${result.remainingTargetIds.join(",") || "-"}`,
+    `passed=${result.collectionStatus.passedCount}`,
+    `pending=${result.collectionStatus.pendingCount}`,
+    `roomEvidence=${result.roomStatus.source}${result.roomStatus.needsControlPlaneFragment ? " (needs control-plane fragment)" : ""}`,
+    `readyForFinalEvidenceCheck=${result.readyForFinalEvidenceCheck}`,
+    output ? `output=${output.path}` : undefined,
+  ].filter(Boolean).join("\n");
+}
+
+function formatPhaseFiveEvidenceStatus(result: PhaseFiveEvidenceStatusResult): string {
+  return [
+    `Phase 5 evidence collection status: ${result.status}`,
+    `base=${result.baseFilePath}`,
+    `targets=${result.mergedTargetIds.join(",") || "-"}`,
+    `remaining=${result.remainingTargetIds.join(",") || "-"}`,
+    `passed=${result.collectionStatus.passedCount}`,
+    `pending=${result.collectionStatus.pendingCount}`,
+    `invalidFragments=${result.invalidFragmentCount}`,
+    `roomEvidence=${result.roomStatus.source}${result.roomStatus.needsControlPlaneFragment ? " (needs control-plane fragment)" : ""}`,
+    `roomEvidenceComplete=${result.roomStatus.evidenceComplete}`,
+    `registeredAgentPull=${result.roomStatus.registeredAgentPull.status}`,
+    `finalEvidenceCheck=${result.finalEvidenceCheck.status} missing=${result.finalEvidenceCheck.missingEvidenceCount} matrix=${result.finalEvidenceCheck.missingEvidenceByScope.matrix} target=${result.finalEvidenceCheck.missingEvidenceByScope.target} room=${result.finalEvidenceCheck.missingEvidenceByScope.room} controlPlane=${result.finalEvidenceCheck.missingEvidenceByScope.controlPlane}`,
+    result.nextEvidenceScopes.length > 0 ? "Next evidence scopes:" : undefined,
+    ...result.nextEvidenceScopes.map(formatPhaseFiveEvidenceStatusNextScope),
+    result.registeredPullOperatorNext ? formatPhaseFiveEvidenceStatusRegisteredPullOperatorNext(result.registeredPullOperatorNext) : undefined,
+    result.nextRoomEvidence.length > 0 ? "Next room evidence:" : undefined,
+    ...result.nextRoomEvidence.map(formatPhaseFiveEvidenceStatusNextRoomEvidence),
+    result.nextTargetEvidence.length > 0 ? "Next target evidence:" : undefined,
+    ...result.nextTargetEvidence.map(formatPhaseFiveEvidenceStatusNextTarget),
+    result.missingEvidence && result.missingEvidence.length > 0 ? "Missing evidence details:" : undefined,
+    ...(result.missingEvidence ?? []).map(formatPhaseFiveEvidenceStatusMissingEvidence),
+    result.registeredPullTargetOverride
+      ? `registeredPullTargetOverride=${result.registeredPullTargetOverride.requestedTargetId} (evidenceTarget=${result.registeredPullTargetOverride.evidenceTargetId ?? "-"}, affects=nextCommands, evidenceUnchanged=true)`
+      : undefined,
+    result.registeredPullTargetOverride ? `overrideGuidance=${result.registeredPullTargetOverride.guidance}` : undefined,
+    result.registeredPullTargetOverride ? "Override reconciliation commands:" : undefined,
+    result.registeredPullTargetOverride ? `- ${result.registeredPullTargetOverride.reconcileCommands.refreshScaffoldBeforeCollection}` : undefined,
+    result.registeredPullTargetOverride ? `- ${result.registeredPullTargetOverride.reconcileCommands.updateControlPlaneFragment}` : undefined,
+    `readyForFinalEvidenceCheck=${result.readyForFinalEvidenceCheck}`,
+    result.fragmentErrors.length > 0 ? "" : undefined,
+    result.fragmentErrors.length > 0 ? "Invalid fragments:" : undefined,
+    ...result.fragmentErrors.map((fragment) => `- ${fragment.path}: ${fragment.message}`),
+    "",
+    "Next commands:",
+    ...result.nextCommands.map((command) => `- ${command}`),
+  ].filter((line): line is string => typeof line === "string").join("\n");
+}
+
+function formatPhaseFiveEvidenceStatusNextScope(scope: PhaseFiveEvidenceStatusNextScope): string {
+  const targetSummary = scope.targetIds && scope.targetIds.length > 0 ? ` targets=${scope.targetIds.join(",")}` : "";
+  const checkSummary = scope.checkIds.length > 0 ? ` checks=${scope.checkIds.join(",")}` : "";
+  return `- ${scope.scope} missing=${scope.missingEvidenceCount}${targetSummary}${checkSummary}: ${scope.guidance}`;
+}
+
+function formatPhaseFiveEvidenceStatusRegisteredPullOperatorNext(next: PhaseFiveEvidenceStatusRegisteredPullOperatorNext): string {
+  const missingSummary = next.missingFields.length > 0 ? ` missing=${next.missingFields.join(",")}` : "";
+  return [
+    "Registered-agent pull operator next:",
+    `- target=${next.targetId} status=${next.status}${missingSummary}`,
+    "Control-host commands:",
+    ...next.controlHost.operatorNextCommands.map((command) => `- ${command}`),
+    "Selected-target commands:",
+    ...next.selectedTarget.operatorNextCommands.map((command) => `- ${command}`),
+    ...formatPhaseFiveRegisteredPullEvidenceFileHandoff(next.evidenceFileHandoff),
+    "Registered-agent pull operator field hints:",
+    ...next.evidenceFieldHints.map(formatPhaseFiveRegisteredPullEvidenceFieldHint),
+  ].join("\n");
+}
+
+function formatPhaseFiveEvidenceStatusNextRoomEvidence(room: PhaseFiveEvidenceStatusNextRoomEvidence): string {
+  const missingSummary = room.missingFields.length > 0 ? ` missing=${room.missingFields.join(",")}` : "";
+  return [
+    `- ${room.kind} target=${room.targetId} status=${room.status}${missingSummary} targetFragment=${room.targetFragmentPath} controlFragment=${room.controlFragmentPath} targetGuide=${room.targetGuideCommand} controlGuide=${room.controlGuideCommand} controlTemplate=${room.controlTemplateCommand} controlPreflight=${room.controlPreflightCommand} controlStatus=${room.controlStatusCommand} merge=${room.mergeCommand} final=${room.finalCheckCommand}`,
+    "  registered-agent-pull stages:",
+    ...room.registeredPullControlHostRunbook.stages.map((stage) => `  ${formatPhaseFiveRegisteredPullRunbookStage(stage)}`),
+    "  registered-agent-pull field hints:",
+    ...room.evidenceFieldHints.map((hint) => `  ${formatPhaseFiveRegisteredPullEvidenceFieldHint(hint)}`),
+  ].join("\n");
+}
+
+function formatPhaseFiveEvidenceStatusNextTarget(target: PhaseFiveEvidenceStatusNextTarget): string {
+  const fragmentSummary = target.fragmentPath ? ` fragment=${target.fragmentPath}` : "";
+  const sourceSummary = target.sourceFilePath ? ` source=${target.sourceFilePath}` : "";
+  const checkSummary = target.checkIds.length > 0 ? ` checks=${target.checkIds.join(",")}` : "";
+  const fieldSummary = target.missingFields.length > 0 ? ` fields=${target.missingFields.join(",")}` : "";
+  const templateSummary = target.templateCommand ? ` template=${target.templateCommand}` : "";
+  const statusSummary = target.statusCommand ? ` statusCommand=${target.statusCommand}` : "";
+  const preflightSummary = target.preflightCommand ? ` preflight=${target.preflightCommand}` : "";
+  const guideSummary = target.collectorGuideCommand ? ` guide=${target.collectorGuideCommand}` : "";
+  const returnSummary = target.returnToControlHost
+    ? ` copyTo=${target.returnToControlHost.copyFragmentTo} merge=${target.returnToControlHost.mergeCommand} final=${target.returnToControlHost.finalCheckCommand}`
+    : "";
+  const summary = `- ${target.targetId} (${target.role}) status=${target.evidenceStatus} merged=${target.mergedThisRun} missing=${target.missingEvidenceCount}${fragmentSummary}${sourceSummary}${checkSummary}${fieldSummary}${templateSummary}${statusSummary}${preflightSummary}${guideSummary}${returnSummary}`;
+  if (!target.registeredPullRunbook) {
+    return summary;
+  }
+  return [
+    summary,
+    "  remote registered-agent-pull stages:",
+    ...target.registeredPullRunbook.stages.map((stage) => `  ${formatPhaseFiveRegisteredPullRunbookStage(stage)}`),
+    "  remote registered-agent-pull field hints:",
+    ...target.registeredPullRunbook.evidenceFieldHints.map((hint) => `  ${formatPhaseFiveRegisteredPullEvidenceFieldHint(hint)}`),
+  ].join("\n");
+}
+
+function formatPhaseFiveEvidenceStatusMissingEvidence(item: PhaseFiveMissingEvidence): string {
+  return `- ${item.scope}${item.targetId ? `:${item.targetId}` : ""} ${item.checkId}: ${item.missing.join(",")}`;
+}
+
+function summarizePhaseFiveEvidenceMergeFinalCheck(result: PhaseFiveEvidenceCheckResult): {
+  gate: PhaseFiveEvidenceCheckResult["gate"];
+  status: PhaseFiveEvidenceCheckResult["status"];
+  missingEvidenceCount: number;
+  missingEvidenceByScope: PhaseFiveMissingEvidenceScopeSummary;
+} {
+  return {
+    gate: result.gate,
+    status: result.status,
+    missingEvidenceCount: result.missingEvidence.length,
+    missingEvidenceByScope: result.summary.missingEvidenceByScope,
+  };
+}
+
+async function buildPhaseFiveEvidenceCheck(filePath: string): Promise<PhaseFiveEvidenceCheckResult> {
+  const absolutePath = path.resolve(filePath);
+  const parsed = JSON.parse(await readUtf8(absolutePath)) as unknown;
+  return buildPhaseFiveEvidenceCheckFromDocument(parsed, absolutePath);
+}
+
+function buildPhaseFiveEvidenceCheckFromDocument(parsed: unknown, filePath: string): PhaseFiveEvidenceCheckResult {
+  const checks: PhaseFiveEvidenceCheck[] = [];
+  const root = isRecord(parsed) ? parsed : {};
+  const targets = Array.isArray(root.targets) ? root.targets.filter(isRecord) : [];
+  const targetById = new Map(targets.map((target) => [String(target.id ?? ""), target]));
+  const roomId = optionalNonEmptyString(isRecord(root.room) ? root.room.id : undefined);
+
+  const evidenceShapePass = root.phase === "phase5" && Array.isArray(root.targets);
+  checks.push({
+    id: "evidence-shape",
+    label: "evidence shape",
+    status: evidenceShapePass ? "pass" : "fail",
+    summary: evidenceShapePass ? `targets=${targets.length}` : "expected JSON with phase=phase5 and targets[]",
+  });
+
+  const missingTargets = PHASE_FIVE_REQUIRED_TARGET_IDS.filter((id) => !targetById.has(id));
+  checks.push({
+    id: "required-targets",
+    label: "required target coverage",
+    status: missingTargets.length === 0 ? "pass" : "fail",
+    summary: missingTargets.length === 0 ? "all required Phase 5 targets are present" : `missing=${missingTargets.join(",")}`,
+    metadata: { requiredTargets: PHASE_FIVE_REQUIRED_TARGET_IDS, missingTargets },
+  });
+
+  const failingSmokeTargets = PHASE_FIVE_REQUIRED_TARGET_IDS.filter((id) => {
+    const target = targetById.get(id);
+    if (!target || target.status !== "pass") {
+      return true;
+    }
+    const requiredChecks = id === "control-plane-host"
+      ? ["health", "roomCreated", "inviteCreated", "transcriptVisible", "stateRoomVisible", "agentHealthVisible", "deliveryStatusVisible", "eventStream"]
+      : ["install", "bootstrap", "enroll", "inbox", "heartbeat", "remoteRun", "reply"];
+    return requiredChecks.some((check) => !phaseFiveEvidenceFieldPassed(target, check));
+  });
+  checks.push({
+    id: "target-smoke-results",
+    label: "target smoke results",
+    status: failingSmokeTargets.length === 0 ? "pass" : "fail",
+    summary: failingSmokeTargets.length === 0 ? "all target smoke checks passed" : `failing=${failingSmokeTargets.join(",")}`,
+    metadata: { failingTargets: failingSmokeTargets },
+  });
+
+  const revokedInvite = phaseFiveRevokedInviteObject(root);
+  const revokedInviteValidation = validatePhaseFiveRevokedInvite(revokedInvite);
+  checks.push({
+    id: "revoked-invite-join-blocked",
+    label: "revoked invite join blocked",
+    status: revokedInviteValidation.issues.length === 0 ? "pass" : "fail",
+    summary: revokedInviteValidation.issues.length === 0
+      ? `target=${revokedInviteValidation.targetId}, blocked=true`
+      : `incomplete=${revokedInviteValidation.issues.join(",")}`,
+    metadata: revokedInviteValidation,
+  });
+
+  const revokedAgent = phaseFiveRevokedAgentObject(root);
+  const revokedAgentValidation = validatePhaseFiveRevokedAgent(revokedAgent, targetById);
+  checks.push({
+    id: "revoked-agent-signed-ops-blocked",
+    label: "revoked agent signed operations blocked",
+    status: revokedAgentValidation.issues.length === 0 ? "pass" : "fail",
+    summary: revokedAgentValidation.issues.length === 0
+      ? `target=${revokedAgentValidation.targetId}, trust=revoked, signedOps=blocked`
+      : `incomplete=${revokedAgentValidation.issues.join(",")}`,
+    metadata: revokedAgentValidation,
+  });
+
+  const keyRotation = phaseFiveKeyRotationObject(root);
+  const keyRotationValidation = validatePhaseFiveKeyRotation(keyRotation, targetById);
+  checks.push({
+    id: "room-key-rotation-evidence",
+    label: "room key rotation evidence",
+    status: keyRotationValidation.issues.length === 0 ? "pass" : "fail",
+    summary: keyRotationValidation.issues.length === 0
+      ? `target=${keyRotationValidation.targetId}, ${keyRotationValidation.previousFingerprint}->${keyRotationValidation.rotatedFingerprint}, signedOps=rotated`
+      : `incomplete=${keyRotationValidation.issues.join(",")}`,
+    metadata: keyRotationValidation,
+  });
+
+  const suspendedAgent = phaseFiveSuspendedAgentObject(root);
+  const suspendedAgentValidation = validatePhaseFiveSuspendedAgent(suspendedAgent, targetById);
+  checks.push({
+    id: "suspended-agent-blocked",
+    label: "suspended agent blocked",
+    status: suspendedAgentValidation.issues.length === 0 ? "pass" : "fail",
+    summary: suspendedAgentValidation.issues.length === 0
+      ? `target=${suspendedAgentValidation.targetId}, inbox=0, sayBlocked=true`
+      : `incomplete=${suspendedAgentValidation.issues.join(",")}`,
+    metadata: suspendedAgentValidation,
+  });
+
+  const eventStreamValidation = validatePhaseFiveControlPlaneEventStream(targetById);
+  checks.push({
+    id: "control-plane-event-stream",
+    label: "control-plane event stream",
+    status: eventStreamValidation.issues.length === 0 ? "pass" : "fail",
+    summary: eventStreamValidation.issues.length === 0
+      ? `events=${eventStreamValidation.controlActionTypes.join(",")}, roomEvents=${eventStreamValidation.roomMessageEventTypes.join(",")}, ackEvents=${eventStreamValidation.deliveryAckEventTypes.join(",")}, agents=${eventStreamValidation.eventStreamAgentIds.length}/${eventStreamValidation.remoteAgentIds.length}, roomMessages=${eventStreamValidation.roomMessageIds.length}, acks=${eventStreamValidation.ackMessageIds.length}`
+      : `incomplete=${eventStreamValidation.issues.join(",")}`,
+    metadata: eventStreamValidation,
+  });
+
+  const unsignedTargets = PHASE_FIVE_REMOTE_TARGET_IDS.filter((id) => {
+    const evidence = phaseFiveEvidenceObject(targetById.get(id));
+    return !(
+      Number(evidence?.messagesProcessed ?? 0) >= 1 &&
+      evidence?.ackSigned === true &&
+      typeof evidence?.heartbeatStatus === "string" &&
+      evidence.heartbeatStatus !== "unknown" &&
+      evidence.remoteIntentSignatureStatus === "valid" &&
+      typeof evidence.replyMessageId === "string" &&
+      evidence.replyMessageId.trim().length > 0
+    );
+  });
+  checks.push({
+    id: "signed-room-exchange",
+    label: "signed room exchange",
+    status: unsignedTargets.length === 0 ? "pass" : "fail",
+    summary: unsignedTargets.length === 0 ? "all remote targets have signed ack, heartbeat, and reply evidence" : `incomplete=${unsignedTargets.join(",")}`,
+    metadata: { incompleteTargets: unsignedTargets },
+  });
+
+  const registeredAgentPull = phaseFiveRegisteredAgentPullObject(root);
+  const registeredAgentPullValidation = validatePhaseFiveRegisteredAgentPull(registeredAgentPull, targetById);
+  checks.push({
+    id: "registered-agent-pull-communication-evidence",
+    label: "registered-agent pull communication evidence",
+    status: registeredAgentPullValidation.issues.length === 0 ? "pass" : "fail",
+    summary: registeredAgentPullValidation.issues.length === 0
+      ? `target=${registeredAgentPullValidation.targetId}, agent=${registeredAgentPullValidation.agentId}, reply=${registeredAgentPullValidation.replyMessageId}`
+      : `incomplete=${registeredAgentPullValidation.issues.join(",")}`,
+    metadata: registeredAgentPullValidation,
+  });
+
+  const noBroadcastFallback = phaseFiveNoBroadcastFallbackObject(root);
+  const noBroadcastFallbackValidation = validatePhaseFiveNoBroadcastFallback(noBroadcastFallback, targetById);
+  checks.push({
+    id: "no-broadcast-fallback-execution-evidence",
+    label: "no broadcast fallback execution evidence",
+    status: noBroadcastFallbackValidation.issues.length === 0 ? "pass" : "fail",
+    summary: noBroadcastFallbackValidation.issues.length === 0
+      ? `message=${noBroadcastFallbackValidation.messageId}, agents=${noBroadcastFallbackValidation.agentIds.length}, handled=0`
+      : `incomplete=${noBroadcastFallbackValidation.issues.join(",")}`,
+    metadata: noBroadcastFallbackValidation,
+  });
+
+  const staleAgent = phaseFiveStaleAgentObject(root);
+  const staleAgentValidation = validatePhaseFiveStaleAgent(staleAgent, targetById, roomId);
+  checks.push({
+    id: "stale-agent-health-detected",
+    label: "stale agent health detected",
+    status: staleAgentValidation.issues.length === 0 ? "pass" : "fail",
+    summary: staleAgentValidation.issues.length === 0
+      ? `target=${staleAgentValidation.targetId}, healthState=stale`
+      : `incomplete=${staleAgentValidation.issues.join(",")}`,
+    metadata: staleAgentValidation,
+  });
+
+  const staleRecovery = phaseFiveStaleRecoveryObject(root);
+  const staleRecoveryValidation = validatePhaseFiveStaleRecovery(staleRecovery, targetById, staleAgentValidation);
+  checks.push({
+    id: "stale-agent-recovery",
+    label: "stale agent recovery",
+    status: staleRecoveryValidation.issues.length === 0 ? "pass" : "fail",
+    summary: staleRecoveryValidation.issues.length === 0
+      ? `target=${staleRecoveryValidation.targetId}, member=suspended, health=offline`
+      : `incomplete=${staleRecoveryValidation.issues.join(",")}`,
+    metadata: staleRecoveryValidation,
+  });
+
+  const missingBootstrapTargets = PHASE_FIVE_REMOTE_TARGET_IDS.filter((id) => {
+    return validatePhaseFiveOneFileBootstrapEvidence(targetById.get(id)).length > 0;
+  });
+  const bootstrapIssues = Object.fromEntries(
+    PHASE_FIVE_REMOTE_TARGET_IDS
+      .map((id) => [id, validatePhaseFiveOneFileBootstrapEvidence(targetById.get(id))] as const)
+      .filter(([, issues]) => issues.length > 0),
+  );
+  checks.push({
+    id: "one-file-room-bootstrap-evidence",
+    label: "one-file room bootstrap evidence",
+    status: missingBootstrapTargets.length === 0 ? "pass" : "fail",
+    summary: missingBootstrapTargets.length === 0
+      ? "all remote targets joined and ran through one-file invite bundles"
+      : `incomplete=${missingBootstrapTargets.join(",")}`,
+    metadata: { incompleteTargets: missingBootstrapTargets, issuesByTarget: bootstrapIssues },
+  });
+
+  const missingRemoteServicePlanTargets = PHASE_FIVE_REMOTE_TARGET_IDS.filter((id) => {
+    const target = targetById.get(id);
+    const evidence = phaseFiveEvidenceObject(target);
+    return !(
+      target &&
+      phaseFiveEvidenceFieldPassed(target, "servicePlan") &&
+      evidence?.servicePlanKind === "soloclaw.remote_room_service_plan" &&
+      evidence.servicePlanInstallState === "plan_only"
+    );
+  });
+  checks.push({
+    id: "remote-service-plan-evidence",
+    label: "remote service-plan evidence",
+    status: missingRemoteServicePlanTargets.length === 0 ? "pass" : "fail",
+    summary: missingRemoteServicePlanTargets.length === 0
+      ? "all remote targets have token-safe remote service-plan evidence"
+      : `incomplete=${missingRemoteServicePlanTargets.join(",")}`,
+    metadata: { incompleteTargets: missingRemoteServicePlanTargets },
+  });
+
+  const missingRunnerStatusTargets = PHASE_FIVE_REMOTE_TARGET_IDS.filter((id) => {
+    return validatePhaseFiveRunnerStatusEvidence(targetById.get(id)).length > 0;
+  });
+  const runnerStatusIssues = Object.fromEntries(
+    PHASE_FIVE_REMOTE_TARGET_IDS
+      .map((id) => [id, validatePhaseFiveRunnerStatusEvidence(targetById.get(id))] as const)
+      .filter(([, issues]) => issues.length > 0),
+  );
+  checks.push({
+    id: "runner-status-file-evidence",
+    label: "runner status-file evidence",
+    status: missingRunnerStatusTargets.length === 0 ? "pass" : "fail",
+    summary: missingRunnerStatusTargets.length === 0
+      ? "all remote targets have stopped idle runner status-file evidence with heartbeat and lifecycle summaries"
+      : `incomplete=${missingRunnerStatusTargets.join(",")}`,
+    metadata: { incompleteTargets: missingRunnerStatusTargets, issuesByTarget: runnerStatusIssues },
+  });
+
+  const stopFileShutdown = phaseFiveStopFileShutdownObject(root);
+  const stopFileShutdownValidation = validatePhaseFiveStopFileShutdown(stopFileShutdown, targetById);
+  checks.push({
+    id: "runner-stop-file-shutdown",
+    label: "runner stop-file shutdown",
+    status: stopFileShutdownValidation.issues.length === 0 ? "pass" : "fail",
+    summary: stopFileShutdownValidation.issues.length === 0
+      ? `target=${stopFileShutdownValidation.targetId}, stopReason=${stopFileShutdownValidation.runnerStopReason}`
+      : `incomplete=${stopFileShutdownValidation.issues.join(",")}`,
+    metadata: stopFileShutdownValidation,
+  });
+
+  const peerExchange = phaseFivePeerExchangeObject(root);
+  const peerExchangeIssues = validatePhaseFivePeerExchange(peerExchange, targetById);
+  checks.push({
+    id: "agent-to-agent-exchange",
+    label: "agent-to-agent exchange",
+    status: peerExchangeIssues.length === 0 ? "pass" : "fail",
+    summary: peerExchangeIssues.length === 0
+      ? `sender=${peerExchange?.senderTargetId}, receiver=${peerExchange?.receiverTargetId}, reply=${peerExchange?.replyMessageId}`
+      : `incomplete=${peerExchangeIssues.join(",")}`,
+    metadata: {
+      issues: peerExchangeIssues,
+      senderTargetId: peerExchange?.senderTargetId,
+      receiverTargetId: peerExchange?.receiverTargetId,
+      messageId: peerExchange?.messageId,
+      replyMessageId: peerExchange?.replyMessageId,
+    },
+  });
+
+  const assignmentResult = phaseFiveAssignmentResultObject(root);
+  const assignmentResultValidation = validatePhaseFiveAssignmentResult(assignmentResult, targetById);
+  checks.push({
+    id: "room-assignment-result-evidence",
+    label: "room assignment/result evidence",
+    status: assignmentResultValidation.issues.length === 0 ? "pass" : "fail",
+    summary: assignmentResultValidation.issues.length === 0
+      ? `target=${assignmentResultValidation.targetId}, subtask=${assignmentResultValidation.subtaskId}, result=completed`
+      : `incomplete=${assignmentResultValidation.issues.join(",")}`,
+    metadata: assignmentResultValidation,
+  });
+
+  const conflictResolution = phaseFiveConflictResolutionObject(root);
+  const conflictResolutionValidation = validatePhaseFiveConflictResolution(conflictResolution, targetById);
+  checks.push({
+    id: "room-conflict-resolution-evidence",
+    label: "room conflict resolution evidence",
+    status: conflictResolutionValidation.issues.length === 0 ? "pass" : "fail",
+    summary: conflictResolutionValidation.issues.length === 0
+      ? `resultKey=${conflictResolutionValidation.resultKey}, winner=${conflictResolutionValidation.winningAgentId}, status=resolved`
+      : `incomplete=${conflictResolutionValidation.issues.join(",")}`,
+    metadata: conflictResolutionValidation,
+  });
+
+  const resultSync = phaseFiveResultSyncObject(root);
+  const resultSyncValidation = validatePhaseFiveResultSync(resultSync, targetById, roomId);
+  checks.push({
+    id: "room-result-sync-evidence",
+    label: "room result sync evidence",
+    status: resultSyncValidation.issues.length === 0 ? "pass" : "fail",
+    summary: resultSyncValidation.issues.length === 0
+      ? `target=${resultSyncValidation.targetId}, artifact=${resultSyncValidation.artifactId}, message=${resultSyncValidation.artifactMessageId}`
+      : `incomplete=${resultSyncValidation.issues.join(",")}`,
+    metadata: resultSyncValidation,
+  });
+
+  const handoff = phaseFiveHandoffObject(root);
+  const handoffValidation = validatePhaseFiveHandoff(handoff, targetById);
+  checks.push({
+    id: "room-handoff-evidence",
+    label: "room handoff evidence",
+    status: handoffValidation.issues.length === 0 ? "pass" : "fail",
+    summary: handoffValidation.issues.length === 0
+      ? `handoff=${handoffValidation.handoffId}, source=${handoffValidation.sourceTargetId}, target=${handoffValidation.targetTargetId}, result=completed`
+      : `incomplete=${handoffValidation.issues.join(",")}`,
+    metadata: handoffValidation,
+  });
+
+  const operatorVisibility = validatePhaseFiveOperatorVisibility(targetById);
+  checks.push({
+    id: "operator-room-visibility",
+    label: "operator room visibility",
+    status: operatorVisibility.issues.length === 0 ? "pass" : "fail",
+    summary: operatorVisibility.issues.length === 0
+      ? `transcript=${operatorVisibility.transcriptMessageCount}, state=${operatorVisibility.stateRoomMessageCount}, health=${operatorVisibility.roomHealthAgentIds.length}/${operatorVisibility.remoteAgentIds.length}`
+      : `incomplete=${operatorVisibility.issues.join(",")}`,
+    metadata: operatorVisibility,
+  });
+
+  const secretMatches = countPhaseFiveEvidenceSecretShapes(parsed);
+  checks.push({
+    id: "secret-shape-scan",
+    label: "secret shape scan",
+    status: secretMatches === 0 ? "pass" : "fail",
+    summary: `secretMatches=${secretMatches}`,
+  });
+
+  const remoteTargetsPassed = PHASE_FIVE_REMOTE_TARGET_IDS.filter((id) => {
+    const target = targetById.get(id);
+    return target?.status === "pass" &&
+      !failingSmokeTargets.includes(id) &&
+      !unsignedTargets.includes(id) &&
+      !missingBootstrapTargets.includes(id) &&
+      !missingRemoteServicePlanTargets.includes(id) &&
+      !missingRunnerStatusTargets.includes(id);
+  }).length;
+  const missingEvidence = summarizePhaseFiveMissingEvidence(checks);
+  return {
+    phase: "phase5",
+    gate: "matrix-evidence",
+    status: checks.every((check) => check.status === "pass") ? "pass" : "fail",
+    generatedAt: new Date().toISOString(),
+    filePath,
+    summary: {
+      requiredTargets: PHASE_FIVE_REQUIRED_TARGET_IDS.length,
+      targetsPresent: PHASE_FIVE_REQUIRED_TARGET_IDS.length - missingTargets.length,
+      remoteTargetsPassed,
+      missingEvidenceByScope: countPhaseFiveMissingEvidenceByScope(missingEvidence),
+    },
+    missingEvidence,
+    checks,
+  };
+}
+
+async function buildPhaseFiveTargetEvidenceCheck(filePath: string, targetId: string): Promise<PhaseFiveEvidenceCheckResult> {
+  const absolutePath = path.resolve(filePath);
+  const parsed = JSON.parse(await readUtf8(absolutePath)) as unknown;
+  const checks: PhaseFiveEvidenceCheck[] = [];
+  const root = isRecord(parsed) ? parsed : {};
+  const targets = Array.isArray(root.targets) ? root.targets.filter(isRecord) : [];
+  const targetById = new Map(targets.map((target) => [String(target.id ?? ""), target]));
+  const roomId = optionalNonEmptyString(isRecord(root.room) ? root.room.id : undefined);
+  const expectedTargets = PHASE_FIVE_REQUIRED_TARGET_IDS.join(", ");
+
+  if (!PHASE_FIVE_REQUIRED_TARGET_IDS.includes(targetId as typeof PHASE_FIVE_REQUIRED_TARGET_IDS[number])) {
+    throw new Error(`Unknown Phase 5 target evidence target: ${targetId}. Expected one of: ${expectedTargets}`);
+  }
+
+  const evidenceShapePass = root.phase === "phase5" && Array.isArray(root.targets);
+  checks.push({
+    id: "evidence-shape",
+    label: "evidence shape",
+    status: evidenceShapePass ? "pass" : "fail",
+    summary: evidenceShapePass ? `targets=${targets.length}` : "expected JSON with phase=phase5 and targets[]",
+  });
+
+  const target = targetById.get(targetId);
+  checks.push({
+    id: "required-targets",
+    label: "required target coverage",
+    status: target ? "pass" : "fail",
+    summary: target ? `target=${targetId}` : `missing=${targetId}`,
+    metadata: { requiredTargets: [targetId], missingTargets: target ? [] : [targetId] },
+  });
+
+  const requiredChecks = targetId === "control-plane-host"
+    ? ["health", "roomCreated", "inviteCreated", "transcriptVisible", "stateRoomVisible", "agentHealthVisible", "deliveryStatusVisible", "eventStream"]
+    : ["install", "bootstrap", "enroll", "inbox", "heartbeat", "remoteRun", "reply"];
+  const failingSmokeTargets = !target || target.status !== "pass" || requiredChecks.some((check) => !phaseFiveEvidenceFieldPassed(target, check))
+    ? [targetId]
+    : [];
+  checks.push({
+    id: "target-smoke-results",
+    label: "target smoke results",
+    status: failingSmokeTargets.length === 0 ? "pass" : "fail",
+    summary: failingSmokeTargets.length === 0 ? `target=${targetId} smoke checks passed` : `failing=${targetId}`,
+    metadata: { failingTargets: failingSmokeTargets },
+  });
+
+  if (targetId === "control-plane-host") {
+    pushPhaseFiveControlPlaneRoomFragmentChecks(checks, root, targetById, roomId, "before-event-stream");
+
+    const eventStreamValidation = validatePhaseFiveControlPlaneTargetEventStream(target);
+    checks.push({
+      id: "control-plane-event-stream",
+      label: "control-plane event stream",
+      status: eventStreamValidation.issues.length === 0 ? "pass" : "fail",
+      summary: eventStreamValidation.issues.length === 0
+        ? `events=${eventStreamValidation.controlActionTypes.join(",")}, roomEvents=${eventStreamValidation.roomMessageEventTypes.join(",")}, ackEvents=${eventStreamValidation.deliveryAckEventTypes.join(",")}, agents=${eventStreamValidation.eventStreamAgentIds.length}, roomMessages=${eventStreamValidation.roomMessageIds.length}, acks=${eventStreamValidation.ackMessageIds.length}`
+        : `incomplete=${eventStreamValidation.issues.join(",")}`,
+      metadata: eventStreamValidation,
+    });
+
+    pushPhaseFiveControlPlaneRoomFragmentChecks(checks, root, targetById, roomId, "after-event-stream");
+
+    const operatorVisibility = validatePhaseFiveControlPlaneTargetVisibility(target);
+    checks.push({
+      id: "operator-room-visibility",
+      label: "operator room visibility",
+      status: operatorVisibility.issues.length === 0 ? "pass" : "fail",
+      summary: operatorVisibility.issues.length === 0
+        ? `transcript=${operatorVisibility.transcriptMessageCount}, state=${operatorVisibility.stateRoomMessageCount}, health=${operatorVisibility.roomHealthAgentIds.length}, delivery=${operatorVisibility.deliveryStatusAgentIds.length}`
+        : `incomplete=${operatorVisibility.issues.join(",")}`,
+      metadata: operatorVisibility,
+    });
+
+    const secretMatches = countPhaseFiveEvidenceSecretShapes(parsed);
+    checks.push({
+      id: "secret-shape-scan",
+      label: "secret shape scan",
+      status: secretMatches === 0 ? "pass" : "fail",
+      summary: `secretMatches=${secretMatches}`,
+    });
+
+    const status = checks.every((check) => check.status === "pass") ? "pass" : "fail";
+    const missingEvidence = summarizePhaseFiveMissingEvidence(checks);
+    return {
+      phase: "phase5",
+      gate: "target-evidence",
+      status,
+      generatedAt: new Date().toISOString(),
+      filePath: absolutePath,
+      targetId,
+      summary: {
+        requiredTargets: 1,
+        targetsPresent: target ? 1 : 0,
+        remoteTargetsPassed: status === "pass" ? 1 : 0,
+        missingEvidenceByScope: countPhaseFiveMissingEvidenceByScope(missingEvidence),
+      },
+      missingEvidence,
+      checks,
+    };
+  }
+
+  const evidence = phaseFiveEvidenceObject(target);
+  const unsignedTargets = !(
+    target &&
+    Number(evidence?.messagesProcessed ?? 0) >= 1 &&
+    evidence?.ackSigned === true &&
+    typeof evidence?.heartbeatStatus === "string" &&
+    evidence.heartbeatStatus !== "unknown" &&
+    evidence.remoteIntentSignatureStatus === "valid" &&
+    typeof evidence.replyMessageId === "string" &&
+    evidence.replyMessageId.trim().length > 0
+  ) ? [targetId] : [];
+  checks.push({
+    id: "signed-room-exchange",
+    label: "signed room exchange",
+    status: unsignedTargets.length === 0 ? "pass" : "fail",
+    summary: unsignedTargets.length === 0 ? `target=${targetId} has signed ack, heartbeat, and reply evidence` : `incomplete=${targetId}`,
+    metadata: { incompleteTargets: unsignedTargets },
+  });
+
+  const bootstrapIssues = validatePhaseFiveOneFileBootstrapEvidence(target);
+  checks.push({
+    id: "one-file-room-bootstrap-evidence",
+    label: "one-file room bootstrap evidence",
+    status: bootstrapIssues.length === 0 ? "pass" : "fail",
+    summary: bootstrapIssues.length === 0 ? `target=${targetId} joined and ran through one-file invite bundle` : `incomplete=${targetId}`,
+    metadata: {
+      incompleteTargets: bootstrapIssues.length === 0 ? [] : [targetId],
+      issuesByTarget: bootstrapIssues.length === 0 ? {} : { [targetId]: bootstrapIssues },
+    },
+  });
+
+  const servicePlanMissing = !(
+    target &&
+    phaseFiveEvidenceFieldPassed(target, "servicePlan") &&
+    evidence?.servicePlanKind === "soloclaw.remote_room_service_plan" &&
+    evidence.servicePlanInstallState === "plan_only"
+  );
+  checks.push({
+    id: "remote-service-plan-evidence",
+    label: "remote service-plan evidence",
+    status: servicePlanMissing ? "fail" : "pass",
+    summary: servicePlanMissing ? `incomplete=${targetId}` : `target=${targetId} has token-safe remote service-plan evidence`,
+    metadata: { incompleteTargets: servicePlanMissing ? [targetId] : [] },
+  });
+
+  const runnerStatusIssues = validatePhaseFiveRunnerStatusEvidence(target);
+  checks.push({
+    id: "runner-status-file-evidence",
+    label: "runner status-file evidence",
+    status: runnerStatusIssues.length === 0 ? "pass" : "fail",
+    summary: runnerStatusIssues.length === 0 ? `target=${targetId} has idle runner status-file evidence` : `incomplete=${targetId}`,
+    metadata: {
+      incompleteTargets: runnerStatusIssues.length === 0 ? [] : [targetId],
+      issuesByTarget: runnerStatusIssues.length === 0 ? {} : { [targetId]: runnerStatusIssues },
+    },
+  });
+
+  const secretMatches = countPhaseFiveEvidenceSecretShapes(parsed);
+  checks.push({
+    id: "secret-shape-scan",
+    label: "secret shape scan",
+    status: secretMatches === 0 ? "pass" : "fail",
+    summary: `secretMatches=${secretMatches}`,
+  });
+
+  const status = checks.every((check) => check.status === "pass") ? "pass" : "fail";
+  const missingEvidence = summarizePhaseFiveMissingEvidence(checks);
+  return {
+    phase: "phase5",
+    gate: "target-evidence",
+    status,
+    generatedAt: new Date().toISOString(),
+    filePath: absolutePath,
+    targetId,
+    summary: {
+      requiredTargets: 1,
+      targetsPresent: target ? 1 : 0,
+      remoteTargetsPassed: status === "pass" ? 1 : 0,
+      missingEvidenceByScope: countPhaseFiveMissingEvidenceByScope(missingEvidence),
+    },
+    missingEvidence,
+    checks,
+  };
+}
+
+function formatPhaseFiveEvidenceCheck(result: PhaseFiveEvidenceCheckResult): string {
+  return [
+    result.gate === "target-evidence"
+      ? `Phase 5 target evidence: ${result.status}`
+      : `Phase 5 matrix evidence: ${result.status}`,
+    `file=${result.filePath}`,
+    result.targetId ? `target=${result.targetId}` : undefined,
+    `targets=${result.summary.targetsPresent}/${result.summary.requiredTargets}`,
+    `remoteTargetsPassed=${result.summary.remoteTargetsPassed}`,
+    result.missingEvidence.length > 0 ? "Missing evidence:" : undefined,
+    ...result.missingEvidence.map((item) =>
+      `- ${item.scope}${item.targetId ? `:${item.targetId}` : ""} ${item.checkId}: ${item.missing.join(",")}`,
+    ),
+    ...result.checks.map((check) => `[${check.status}] ${check.id}: ${check.summary}`),
+  ].filter((line): line is string => typeof line === "string").join("\n");
+}
+
+function phaseFiveEvidenceFieldPassed(target: Record<string, unknown>, key: string): boolean {
+  const checks = isRecord(target.checks) ? target.checks : {};
+  return checks[key] === "pass" || checks[key] === true;
+}
+
+function summarizePhaseFiveMissingEvidence(checks: PhaseFiveEvidenceCheck[]): PhaseFiveMissingEvidence[] {
+  const items: PhaseFiveMissingEvidence[] = [];
+  for (const check of checks) {
+    if (check.status === "pass") {
+      continue;
+    }
+    const metadata = isRecord(check.metadata) ? check.metadata : {};
+    const incompleteTargets = phaseFiveStringArray(metadata.incompleteTargets)
+      ?? phaseFiveStringArray(metadata.failingTargets)
+      ?? phaseFiveStringArray(metadata.missingTargets);
+    if (incompleteTargets && incompleteTargets.length > 0) {
+      for (const targetId of incompleteTargets) {
+        const issuesByTarget = isRecord(metadata.issuesByTarget) ? metadata.issuesByTarget : {};
+        const targetIssues = phaseFiveStringArray(issuesByTarget[targetId]);
+        items.push({
+          scope: "target",
+          targetId,
+          checkId: check.id,
+          label: check.label,
+          missing: targetIssues && targetIssues.length > 0 ? targetIssues : [check.id],
+          summary: check.summary,
+        });
+      }
+      continue;
+    }
+
+    const targetId = optionalNonEmptyString(metadata.targetId);
+    const issues = phaseFiveStringArray(metadata.issues);
+    items.push({
+      scope: targetId && PHASE_FIVE_REQUIRED_TARGET_IDS.includes(targetId as typeof PHASE_FIVE_REQUIRED_TARGET_IDS[number])
+        ? "target"
+        : phaseFiveMissingEvidenceScope(check.id),
+      targetId: targetId && PHASE_FIVE_REQUIRED_TARGET_IDS.includes(targetId as typeof PHASE_FIVE_REQUIRED_TARGET_IDS[number])
+        ? targetId
+        : undefined,
+      checkId: check.id,
+      label: check.label,
+      missing: issues && issues.length > 0 ? issues : [check.id],
+      summary: check.summary,
+    });
+  }
+  return items;
+}
+
+function countPhaseFiveMissingEvidenceByScope(items: PhaseFiveMissingEvidence[]): PhaseFiveMissingEvidenceScopeSummary {
+  const summary: PhaseFiveMissingEvidenceScopeSummary = {
+    matrix: 0,
+    target: 0,
+    room: 0,
+    controlPlane: 0,
+  };
+  for (const item of items) {
+    if (item.scope === "control-plane") {
+      summary.controlPlane += 1;
+      continue;
+    }
+    summary[item.scope] += 1;
+  }
+  return summary;
+}
+
+function phaseFiveStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const strings = value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+  return strings.length === value.length ? strings : undefined;
+}
+
+function phaseFiveMissingEvidenceScope(checkId: PhaseFiveEvidenceCheckId): PhaseFiveMissingEvidence["scope"] {
+  if (checkId === "evidence-shape" || checkId === "required-targets" || checkId === "target-smoke-results" || checkId === "secret-shape-scan") {
+    return "matrix";
+  }
+  if (checkId === "control-plane-event-stream" || checkId === "operator-room-visibility") {
+    return "control-plane";
+  }
+  return "room";
+}
+
+function phaseFiveEvidenceObject(target: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!target || !isRecord(target.evidence)) {
+    return undefined;
+  }
+  return target.evidence;
+}
+
+function pushPhaseFiveControlPlaneRoomFragmentChecks(
+  checks: PhaseFiveEvidenceCheck[],
+  root: Record<string, unknown>,
+  targetById: Map<string, Record<string, unknown>>,
+  roomId: string | undefined,
+  section: "before-event-stream" | "after-event-stream",
+): void {
+  if (section === "after-event-stream") {
+    const noBroadcastFallback = phaseFiveNoBroadcastFallbackObject(root);
+    const noBroadcastFallbackValidation = validatePhaseFiveNoBroadcastFallback(noBroadcastFallback, targetById);
+    const noBroadcastFallbackIssues = phaseFiveControlFragmentRoomIssues(noBroadcastFallbackValidation.issues);
+    checks.push({
+      id: "no-broadcast-fallback-execution-evidence",
+      label: "no broadcast fallback execution evidence",
+      status: noBroadcastFallbackIssues.length === 0 ? "pass" : "fail",
+      summary: noBroadcastFallbackIssues.length === 0
+        ? `message=${noBroadcastFallbackValidation.messageId}, agents=${noBroadcastFallbackValidation.agentIds.length}, handled=0`
+        : `incomplete=${noBroadcastFallbackIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(noBroadcastFallbackValidation),
+    });
+
+    const staleAgent = phaseFiveStaleAgentObject(root);
+    const staleAgentValidation = validatePhaseFiveStaleAgent(staleAgent, targetById, roomId);
+    const staleAgentIssues = phaseFiveControlFragmentRoomIssues(staleAgentValidation.issues);
+    checks.push({
+      id: "stale-agent-health-detected",
+      label: "stale agent health detected",
+      status: staleAgentIssues.length === 0 ? "pass" : "fail",
+      summary: staleAgentIssues.length === 0
+        ? `target=${staleAgentValidation.targetId}, healthState=stale`
+        : `incomplete=${staleAgentIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(staleAgentValidation),
+    });
+
+    const staleRecovery = phaseFiveStaleRecoveryObject(root);
+    const staleRecoveryValidation = validatePhaseFiveStaleRecovery(staleRecovery, targetById, staleAgentValidation);
+    const staleRecoveryIssues = phaseFiveControlFragmentRoomIssues(staleRecoveryValidation.issues);
+    checks.push({
+      id: "stale-agent-recovery",
+      label: "stale agent recovery",
+      status: staleRecoveryIssues.length === 0 ? "pass" : "fail",
+      summary: staleRecoveryIssues.length === 0
+        ? `target=${staleRecoveryValidation.targetId}, member=suspended, health=offline`
+        : `incomplete=${staleRecoveryIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(staleRecoveryValidation),
+    });
+
+    const stopFileShutdown = phaseFiveStopFileShutdownObject(root);
+    const stopFileShutdownValidation = validatePhaseFiveStopFileShutdown(stopFileShutdown, targetById);
+    const stopFileShutdownIssues = phaseFiveControlFragmentRoomIssues(stopFileShutdownValidation.issues);
+    checks.push({
+      id: "runner-stop-file-shutdown",
+      label: "runner stop-file shutdown",
+      status: stopFileShutdownIssues.length === 0 ? "pass" : "fail",
+      summary: stopFileShutdownIssues.length === 0
+        ? `target=${stopFileShutdownValidation.targetId}, stopReason=${stopFileShutdownValidation.runnerStopReason}`
+        : `incomplete=${stopFileShutdownIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(stopFileShutdownValidation),
+    });
+
+    const peerExchange = phaseFivePeerExchangeObject(root);
+    const peerExchangeIssues = phaseFiveControlFragmentRoomIssues(validatePhaseFivePeerExchange(peerExchange, targetById));
+    checks.push({
+      id: "agent-to-agent-exchange",
+      label: "agent-to-agent exchange",
+      status: peerExchangeIssues.length === 0 ? "pass" : "fail",
+      summary: peerExchangeIssues.length === 0
+        ? `sender=${peerExchange?.senderTargetId}, receiver=${peerExchange?.receiverTargetId}, reply=${peerExchange?.replyMessageId}`
+        : `incomplete=${peerExchangeIssues.join(",")}`,
+      metadata: {
+        issues: peerExchangeIssues,
+        senderTargetId: peerExchange?.senderTargetId,
+        receiverTargetId: peerExchange?.receiverTargetId,
+        messageId: peerExchange?.messageId,
+        replyMessageId: peerExchange?.replyMessageId,
+      },
+    });
+
+    const registeredAgentPull = phaseFiveRegisteredAgentPullObject(root);
+    const registeredAgentPullValidation = validatePhaseFiveRegisteredAgentPull(registeredAgentPull, targetById);
+    const registeredAgentPullIssues = phaseFiveControlFragmentRoomIssues(registeredAgentPullValidation.issues);
+    checks.push({
+      id: "registered-agent-pull-communication-evidence",
+      label: "registered-agent pull communication evidence",
+      status: registeredAgentPullIssues.length === 0 ? "pass" : "fail",
+      summary: registeredAgentPullIssues.length === 0
+        ? `target=${registeredAgentPullValidation.targetId}, agent=${registeredAgentPullValidation.agentId}, reply=${registeredAgentPullValidation.replyMessageId}`
+        : `incomplete=${registeredAgentPullIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(registeredAgentPullValidation),
+    });
+
+    const assignmentResult = phaseFiveAssignmentResultObject(root);
+    const assignmentResultValidation = validatePhaseFiveAssignmentResult(assignmentResult, targetById);
+    const assignmentResultIssues = phaseFiveControlFragmentRoomIssues(assignmentResultValidation.issues);
+    checks.push({
+      id: "room-assignment-result-evidence",
+      label: "room assignment/result evidence",
+      status: assignmentResultIssues.length === 0 ? "pass" : "fail",
+      summary: assignmentResultIssues.length === 0
+        ? `target=${assignmentResultValidation.targetId}, subtask=${assignmentResultValidation.subtaskId}, result=completed`
+        : `incomplete=${assignmentResultIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(assignmentResultValidation),
+    });
+
+    const conflictResolution = phaseFiveConflictResolutionObject(root);
+    const conflictResolutionValidation = validatePhaseFiveConflictResolution(conflictResolution, targetById);
+    const conflictResolutionIssues = phaseFiveControlFragmentRoomIssues(conflictResolutionValidation.issues);
+    checks.push({
+      id: "room-conflict-resolution-evidence",
+      label: "room conflict resolution evidence",
+      status: conflictResolutionIssues.length === 0 ? "pass" : "fail",
+      summary: conflictResolutionIssues.length === 0
+        ? `resultKey=${conflictResolutionValidation.resultKey}, winner=${conflictResolutionValidation.winningAgentId}, status=resolved`
+        : `incomplete=${conflictResolutionIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(conflictResolutionValidation),
+    });
+
+    const resultSync = phaseFiveResultSyncObject(root);
+    const resultSyncValidation = validatePhaseFiveResultSync(resultSync, targetById, roomId);
+    const resultSyncIssues = phaseFiveControlFragmentRoomIssues(resultSyncValidation.issues);
+    checks.push({
+      id: "room-result-sync-evidence",
+      label: "room result sync evidence",
+      status: resultSyncIssues.length === 0 ? "pass" : "fail",
+      summary: resultSyncIssues.length === 0
+        ? `target=${resultSyncValidation.targetId}, artifact=${resultSyncValidation.artifactId}, message=${resultSyncValidation.artifactMessageId}`
+        : `incomplete=${resultSyncIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(resultSyncValidation),
+    });
+
+    const handoff = phaseFiveHandoffObject(root);
+    const handoffValidation = validatePhaseFiveHandoff(handoff, targetById);
+    const handoffIssues = phaseFiveControlFragmentRoomIssues(handoffValidation.issues);
+    checks.push({
+      id: "room-handoff-evidence",
+      label: "room handoff evidence",
+      status: handoffIssues.length === 0 ? "pass" : "fail",
+      summary: handoffIssues.length === 0
+        ? `handoff=${handoffValidation.handoffId}, source=${handoffValidation.sourceTargetId}, target=${handoffValidation.targetTargetId}, result=completed`
+        : `incomplete=${handoffIssues.join(",")}`,
+      metadata: phaseFiveControlFragmentRoomMetadata(handoffValidation),
+    });
+    return;
+  }
+
+  const revokedInvite = phaseFiveRevokedInviteObject(root);
+  const revokedInviteValidation = validatePhaseFiveRevokedInvite(revokedInvite);
+  const revokedInviteIssues = phaseFiveControlFragmentRoomIssues(revokedInviteValidation.issues);
+  checks.push({
+    id: "revoked-invite-join-blocked",
+    label: "revoked invite join blocked",
+    status: revokedInviteIssues.length === 0 ? "pass" : "fail",
+    summary: revokedInviteIssues.length === 0
+      ? `target=${revokedInviteValidation.targetId}, joinBlocked=true`
+      : `incomplete=${revokedInviteIssues.join(",")}`,
+    metadata: phaseFiveControlFragmentRoomMetadata(revokedInviteValidation),
+  });
+
+  const revokedAgent = phaseFiveRevokedAgentObject(root);
+  const revokedAgentValidation = validatePhaseFiveRevokedAgent(revokedAgent, targetById);
+  const revokedAgentIssues = phaseFiveControlFragmentRoomIssues(revokedAgentValidation.issues);
+  checks.push({
+    id: "revoked-agent-signed-ops-blocked",
+    label: "revoked agent signed operations blocked",
+    status: revokedAgentIssues.length === 0 ? "pass" : "fail",
+    summary: revokedAgentIssues.length === 0
+      ? `target=${revokedAgentValidation.targetId}, trust=revoked, signedOps=blocked`
+      : `incomplete=${revokedAgentIssues.join(",")}`,
+    metadata: phaseFiveControlFragmentRoomMetadata(revokedAgentValidation),
+  });
+
+  const keyRotation = phaseFiveKeyRotationObject(root);
+  const keyRotationValidation = validatePhaseFiveKeyRotation(keyRotation, targetById);
+  const keyRotationIssues = phaseFiveControlFragmentRoomIssues(keyRotationValidation.issues);
+  checks.push({
+    id: "room-key-rotation-evidence",
+    label: "room key rotation evidence",
+    status: keyRotationIssues.length === 0 ? "pass" : "fail",
+    summary: keyRotationIssues.length === 0
+      ? `target=${keyRotationValidation.targetId}, ${keyRotationValidation.previousFingerprint}->${keyRotationValidation.rotatedFingerprint}, signedOps=rotated`
+      : `incomplete=${keyRotationIssues.join(",")}`,
+    metadata: phaseFiveControlFragmentRoomMetadata(keyRotationValidation),
+  });
+
+  const suspendedAgent = phaseFiveSuspendedAgentObject(root);
+  const suspendedAgentValidation = validatePhaseFiveSuspendedAgent(suspendedAgent, targetById);
+  const suspendedAgentIssues = phaseFiveControlFragmentRoomIssues(suspendedAgentValidation.issues);
+  checks.push({
+    id: "suspended-agent-blocked",
+    label: "suspended agent blocked",
+    status: suspendedAgentIssues.length === 0 ? "pass" : "fail",
+    summary: suspendedAgentIssues.length === 0
+      ? `target=${suspendedAgentValidation.targetId}, inbox=0, sayBlocked=true`
+      : `incomplete=${suspendedAgentIssues.join(",")}`,
+    metadata: phaseFiveControlFragmentRoomMetadata(suspendedAgentValidation),
+  });
+}
+
+function phaseFiveControlFragmentRoomMetadata(validation: { issues: string[] } & Record<string, unknown>): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {
+    ...validation,
+    issues: phaseFiveControlFragmentRoomIssues(validation.issues),
+  };
+  delete metadata.targetId;
+  return metadata;
+}
+
+function phaseFiveControlFragmentRoomIssues(issues: string[]): string[] {
+  return issues.filter((issue) => !phaseFiveControlFragmentIgnoredRoomIssue(issue));
+}
+
+function phaseFiveControlFragmentIgnoredRoomIssue(issue: string): boolean {
+  return issue === "remoteAgentIds" ||
+    issue === "targetAgentId" ||
+    issue === "agentTargetMismatch" ||
+    issue.endsWith("TargetAgentId") ||
+    issue.endsWith("AgentTargetMismatch");
+}
+
+function validatePhaseFiveControlPlaneTargetEventStream(
+  target: Record<string, unknown> | undefined,
+): {
+  targetId: "control-plane-host";
+  issues: string[];
+  eventStreamConnected?: boolean;
+  controlActionTypes: string[];
+  eventStreamAgentIds: string[];
+  roomMessageEventTypes: string[];
+  roomMessageIds: string[];
+  deliveryAckEventTypes: string[];
+  ackMessageIds: string[];
+  deliveryStatusAckMessageIds: string[];
+  missingEventStreamAckMessageIds: string[];
+} {
+  const issues: string[] = [];
+  const evidence = phaseFiveEvidenceObject(target) ?? {};
+
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "eventStream")) {
+    issues.push("eventStream");
+  }
+
+  const eventStreamConnected = evidence.eventStreamConnected === true;
+  const controlActionTypes = stringArrayEvidenceField(evidence.eventStreamControlActionTypes);
+  const eventStreamAgentIds = stringArrayEvidenceField(evidence.eventStreamAgentIds);
+  const roomMessageEventTypes = stringArrayEvidenceField(evidence.eventStreamRoomMessageEventTypes);
+  const roomMessageIds = stringArrayEvidenceField(evidence.eventStreamRoomMessageIds);
+  const deliveryAckEventTypes = stringArrayEvidenceField(evidence.eventStreamDeliveryAckEventTypes);
+  const ackMessageIds = stringArrayEvidenceField(evidence.eventStreamAckMessageIds);
+  const deliveryStatusAckMessageIds = stringArrayEvidenceField(evidence.deliveryStatusAckMessageIds);
+
+  if (!eventStreamConnected) {
+    issues.push("eventStreamConnected");
+  }
+  if (!controlActionTypes.includes("control_plane.action")) {
+    issues.push("controlActionTypes");
+  }
+  if (eventStreamAgentIds.length === 0) {
+    issues.push("eventStreamAgentIds");
+  }
+  if (!roomMessageEventTypes.includes("room.message.sent")) {
+    issues.push("roomMessageEventTypes");
+  }
+  if (roomMessageIds.length === 0) {
+    issues.push("roomMessageIds");
+  }
+  if (!deliveryAckEventTypes.includes("room.delivery.acknowledged")) {
+    issues.push("deliveryAckEventTypes");
+  }
+  if (ackMessageIds.length === 0) {
+    issues.push("ackMessageIds");
+  }
+  const missingEventStreamAckMessageIds = deliveryStatusAckMessageIds.filter((id) => !ackMessageIds.includes(id));
+  if (missingEventStreamAckMessageIds.length > 0) {
+    issues.push(`missingEventStreamAckMessageIds:${missingEventStreamAckMessageIds.join(",")}`);
+  }
+
+  return {
+    targetId: "control-plane-host",
+    issues,
+    eventStreamConnected,
+    controlActionTypes,
+    eventStreamAgentIds,
+    roomMessageEventTypes,
+    roomMessageIds,
+    deliveryAckEventTypes,
+    ackMessageIds,
+    deliveryStatusAckMessageIds,
+    missingEventStreamAckMessageIds,
+  };
+}
+
+function validatePhaseFiveControlPlaneTargetVisibility(
+  target: Record<string, unknown> | undefined,
+): {
+  targetId: "control-plane-host";
+  issues: string[];
+  transcriptMessageCount: number;
+  stateRoomMessageCount: number;
+  healthAgentIds: string[];
+  roomHealthAgentIds: string[];
+  responsiveAgentIds: string[];
+  deliveryStatusAgentIds: string[];
+  deliveryStatusPendingCounts: Record<string, number>;
+  deliveryStatusAckMessageIds: string[];
+} {
+  const issues: string[] = [];
+  const evidence = phaseFiveEvidenceObject(target) ?? {};
+
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "transcriptVisible")) {
+    issues.push("transcriptVisible");
+  }
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "stateRoomVisible")) {
+    issues.push("stateRoomVisible");
+  }
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "agentHealthVisible")) {
+    issues.push("agentHealthVisible");
+  }
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "deliveryStatusVisible")) {
+    issues.push("deliveryStatusVisible");
+  }
+
+  const transcriptMessageCount = Number(evidence.transcriptMessageCount ?? 0);
+  const stateRoomMessageCount = Number(evidence.stateRoomMessageCount ?? 0);
+  if (!Number.isFinite(transcriptMessageCount) || transcriptMessageCount < 2) {
+    issues.push("transcriptMessageCount");
+  }
+  if (evidence.stateRoomVisible !== true) {
+    issues.push("stateRoomEvidenceVisible");
+  }
+  if (!Number.isFinite(stateRoomMessageCount) || stateRoomMessageCount < 1) {
+    issues.push("stateRoomMessageCount");
+  }
+  if (evidence.agentHealthVisible !== true) {
+    issues.push("agentHealthEvidenceVisible");
+  }
+  if (evidence.deliveryStatusVisible !== true) {
+    issues.push("deliveryStatusEvidenceVisible");
+  }
+
+  const healthAgentIds = stringArrayEvidenceField(evidence.healthAgentIds);
+  const roomHealthAgentIds = stringArrayEvidenceField(evidence.roomHealthAgentIds);
+  const responsiveAgentIds = stringArrayEvidenceField(evidence.responsiveAgentIds);
+  const deliveryStatusAgentIds = stringArrayEvidenceField(evidence.deliveryStatusAgentIds);
+  const deliveryStatusPendingCounts = numericRecordEvidenceField(evidence.deliveryStatusPendingCounts);
+  const deliveryStatusAckMessageIds = stringArrayEvidenceField(evidence.deliveryStatusAckMessageIds);
+  const pendingDeliveryStatusAgentIds = Object.entries(deliveryStatusPendingCounts)
+    .filter(([, count]) => count !== 0)
+    .map(([agentId]) => agentId);
+
+  if (healthAgentIds.length === 0) {
+    issues.push("healthAgentIds");
+  }
+  if (roomHealthAgentIds.length === 0) {
+    issues.push("roomHealthAgentIds");
+  }
+  if (responsiveAgentIds.length === 0) {
+    issues.push("responsiveAgentIds");
+  }
+  if (deliveryStatusAgentIds.length === 0) {
+    issues.push("deliveryStatusAgentIds");
+  }
+  if (Object.keys(deliveryStatusPendingCounts).length === 0) {
+    issues.push("deliveryStatusPendingCounts");
+  }
+  if (pendingDeliveryStatusAgentIds.length > 0) {
+    issues.push(`pendingDeliveryStatusAgentIds:${pendingDeliveryStatusAgentIds.join(",")}`);
+  }
+  if (deliveryStatusAckMessageIds.length === 0) {
+    issues.push("deliveryStatusAckMessageIds");
+  }
+
+  return {
+    targetId: "control-plane-host",
+    issues,
+    transcriptMessageCount,
+    stateRoomMessageCount,
+    healthAgentIds,
+    roomHealthAgentIds,
+    responsiveAgentIds,
+    deliveryStatusAgentIds,
+    deliveryStatusPendingCounts,
+    deliveryStatusAckMessageIds,
+  };
+}
+
+function validatePhaseFiveOneFileBootstrapEvidence(target: Record<string, unknown> | undefined): string[] {
+  const evidence = phaseFiveEvidenceObject(target);
+  const issues: string[] = [];
+
+  if (!target || !phaseFiveEvidenceFieldPassed(target, "bootstrap")) {
+    issues.push("bootstrap");
+  }
+  if (evidence?.inviteBundleKind !== "soloclaw.room_invite") {
+    issues.push("inviteBundleKind");
+  }
+  if (evidence?.inviteSignatureStatus !== "valid") {
+    issues.push("inviteSignatureStatus");
+  }
+  if (evidence?.joinedFromInviteBundle !== true) {
+    issues.push("joinedFromInviteBundle");
+  }
+  if (evidence?.ranFromInviteBundle !== true) {
+    issues.push("ranFromInviteBundle");
+  }
+
+  return issues;
+}
+
+function validatePhaseFiveRunnerStatusEvidence(target: Record<string, unknown> | undefined): string[] {
+  const evidence = phaseFiveEvidenceObject(target);
+  const issues: string[] = [];
+  const messagesProcessed = typeof evidence?.messagesProcessed === "number" ? evidence.messagesProcessed : undefined;
+  const runnerMetricTickCount = typeof evidence?.runnerMetricTickCount === "number" ? evidence.runnerMetricTickCount : undefined;
+  const runnerMetricMessagesProcessed = typeof evidence?.runnerMetricMessagesProcessed === "number" ? evidence.runnerMetricMessagesProcessed : undefined;
+
+  if (!optionalNonEmptyString(evidence?.runnerStatusFile)) {
+    issues.push("runnerStatusFile");
+  }
+  if (evidence?.runnerStatusKind !== "soloclaw.remote_room_runner_status") {
+    issues.push("runnerStatusKind");
+  }
+  if (evidence?.runnerStatus !== "stopped") {
+    issues.push("runnerStatus");
+  }
+  if (evidence?.runnerStopReason !== "idle") {
+    issues.push("runnerStopReason");
+  }
+  if (evidence?.runnerLastHeartbeatStatus !== "idle") {
+    issues.push("runnerLastHeartbeatStatus");
+  }
+  if (!optionalNonEmptyString(evidence?.runnerLastHeartbeatAt)) {
+    issues.push("runnerLastHeartbeatAt");
+  }
+  if (!optionalNonEmptyString(evidence?.runnerHeartbeatExpiresAt)) {
+    issues.push("runnerHeartbeatExpiresAt");
+  }
+  if (evidence?.runnerLifecyclePhase !== "stopped") {
+    issues.push("runnerLifecyclePhase");
+  }
+  if (typeof runnerMetricTickCount !== "number" || !Number.isFinite(runnerMetricTickCount) || runnerMetricTickCount < 1) {
+    issues.push("runnerMetricTickCount");
+  }
+  if (typeof runnerMetricMessagesProcessed !== "number" || !Number.isFinite(runnerMetricMessagesProcessed) || runnerMetricMessagesProcessed < 0) {
+    issues.push("runnerMetricMessagesProcessed");
+  } else if (typeof messagesProcessed === "number" && Number.isFinite(messagesProcessed) && runnerMetricMessagesProcessed < messagesProcessed) {
+    issues.push("runnerMetricMessagesProcessed");
+  }
+
+  return issues;
+}
+
+function phaseFivePeerExchangeObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.peerExchange) ? room.peerExchange : undefined;
+}
+
+function phaseFiveAssignmentResultObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.assignmentResult) ? room.assignmentResult : undefined;
+}
+
+function phaseFiveConflictResolutionObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.conflictResolution) ? room.conflictResolution : undefined;
+}
+
+function phaseFiveResultSyncObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.resultSync) ? room.resultSync : undefined;
+}
+
+function phaseFiveHandoffObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.handoff) ? room.handoff : undefined;
+}
+
+function phaseFiveRegisteredAgentPullObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.registeredAgentPull) ? room.registeredAgentPull : undefined;
+}
+
+function phaseFiveRevokedInviteObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.revokedInvite) ? room.revokedInvite : undefined;
+}
+
+function phaseFiveRevokedAgentObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.revokedAgent) ? room.revokedAgent : undefined;
+}
+
+function phaseFiveKeyRotationObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.keyRotation) ? room.keyRotation : undefined;
+}
+
+function phaseFiveSuspendedAgentObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.suspendedAgent) ? room.suspendedAgent : undefined;
+}
+
+function phaseFiveNoBroadcastFallbackObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.noBroadcastFallback) ? room.noBroadcastFallback : undefined;
+}
+
+function phaseFiveStaleAgentObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.staleAgent) ? room.staleAgent : undefined;
+}
+
+function phaseFiveStaleRecoveryObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.staleRecovery) ? room.staleRecovery : undefined;
+}
+
+function validatePhaseFiveRevokedInvite(
+  revokedInvite: Record<string, unknown> | undefined,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  joinBlocked?: boolean;
+  rejection?: string;
+} {
+  if (!revokedInvite) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(revokedInvite.targetId);
+  const agentId = optionalNonEmptyString(revokedInvite.agentId);
+  const joinBlocked = revokedInvite.joinBlocked === true;
+  const rejection = optionalNonEmptyString(revokedInvite.rejection);
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (!joinBlocked) {
+    issues.push("joinBlocked");
+  }
+  if (!rejection || !/revoked/i.test(rejection)) {
+    issues.push("rejection");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    joinBlocked,
+    rejection,
+  };
+}
+
+function validatePhaseFiveRevokedAgent(
+  revokedAgent: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  trustStatus?: string;
+  trustUpdated?: boolean;
+  signedSayBlocked?: boolean;
+  signedAckBlocked?: boolean;
+  signedHeartbeatBlocked?: boolean;
+  rejection?: string;
+} {
+  if (!revokedAgent) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(revokedAgent.targetId);
+  const agentId = optionalNonEmptyString(revokedAgent.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const trustStatus = typeof revokedAgent.trustStatus === "string" ? revokedAgent.trustStatus : undefined;
+  const trustUpdated = revokedAgent.trustUpdated === true;
+  const signedSayBlocked = revokedAgent.signedSayBlocked === true;
+  const signedAckBlocked = revokedAgent.signedAckBlocked === true;
+  const signedHeartbeatBlocked = revokedAgent.signedHeartbeatBlocked === true;
+  const rejection = optionalNonEmptyString(revokedAgent.rejection);
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (trustStatus !== "revoked") {
+    issues.push("trustStatus");
+  }
+  if (!trustUpdated) {
+    issues.push("trustUpdated");
+  }
+  if (!signedSayBlocked) {
+    issues.push("signedSayBlocked");
+  }
+  if (!signedAckBlocked) {
+    issues.push("signedAckBlocked");
+  }
+  if (!signedHeartbeatBlocked) {
+    issues.push("signedHeartbeatBlocked");
+  }
+  if (!rejection || !/Agent trust status revoked|revoked/i.test(rejection)) {
+    issues.push("rejection");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    trustStatus,
+    trustUpdated,
+    signedSayBlocked,
+    signedAckBlocked,
+    signedHeartbeatBlocked,
+    rejection,
+  };
+}
+
+function validatePhaseFiveKeyRotation(
+  keyRotation: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  previousFingerprint?: string;
+  rotatedFingerprint?: string;
+  trustStatusAfter?: string;
+  rotationRecorded?: boolean;
+  oldSignedSayBlocked?: boolean;
+  newSignedSayAccepted?: boolean;
+  auditEventVisible?: boolean;
+  transcriptMessageId?: string;
+  transcriptMessageVisible?: boolean;
+  rejection?: string;
+  transcriptEventKinds: string[];
+} {
+  if (!keyRotation) {
+    return { issues: ["missing"], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const targetId = optionalNonEmptyString(keyRotation.targetId);
+  const agentId = optionalNonEmptyString(keyRotation.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const previousFingerprint = optionalNonEmptyString(keyRotation.previousFingerprint);
+  const rotatedFingerprint = optionalNonEmptyString(keyRotation.rotatedFingerprint);
+  const trustStatusAfter = optionalNonEmptyString(keyRotation.trustStatusAfter);
+  const transcriptMessageId = optionalNonEmptyString(keyRotation.transcriptMessageId);
+  const rejection = optionalNonEmptyString(keyRotation.rejection);
+  const transcriptEventKinds = stringArrayEvidenceField(keyRotation.transcriptEventKinds);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (!previousFingerprint || !/^SHA256:/i.test(previousFingerprint)) {
+    issues.push("previousFingerprint");
+  }
+  if (!rotatedFingerprint || !/^SHA256:/i.test(rotatedFingerprint)) {
+    issues.push("rotatedFingerprint");
+  }
+  if (previousFingerprint && rotatedFingerprint && normalizePhaseFiveFingerprint(previousFingerprint) === normalizePhaseFiveFingerprint(rotatedFingerprint)) {
+    issues.push("fingerprintChanged");
+  }
+  if (trustStatusAfter !== "trusted") {
+    issues.push("trustStatusAfter");
+  }
+  if (keyRotation.rotationRecorded !== true) {
+    issues.push("rotationRecorded");
+  }
+  if (keyRotation.oldSignedSayBlocked !== true) {
+    issues.push("oldSignedSayBlocked");
+  }
+  if (keyRotation.newSignedSayAccepted !== true) {
+    issues.push("newSignedSayAccepted");
+  }
+  if (keyRotation.auditEventVisible !== true) {
+    issues.push("auditEventVisible");
+  }
+  if (!transcriptMessageId) {
+    issues.push("transcriptMessageId");
+  }
+  if (keyRotation.transcriptMessageVisible !== true) {
+    issues.push("transcriptMessageVisible");
+  }
+  if (!rejection || !/Invalid room message intent envelope signature|invalid signature|old key|signature/i.test(rejection)) {
+    issues.push("rejection");
+  }
+  if (!transcriptEventKinds.includes("chat")) {
+    issues.push("transcriptEventKind");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    previousFingerprint,
+    rotatedFingerprint,
+    trustStatusAfter,
+    rotationRecorded: keyRotation.rotationRecorded === true,
+    oldSignedSayBlocked: keyRotation.oldSignedSayBlocked === true,
+    newSignedSayAccepted: keyRotation.newSignedSayAccepted === true,
+    auditEventVisible: keyRotation.auditEventVisible === true,
+    transcriptMessageId,
+    transcriptMessageVisible: keyRotation.transcriptMessageVisible === true,
+    rejection,
+    transcriptEventKinds,
+  };
+}
+
+function validatePhaseFiveStaleAgent(
+  staleAgent: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+  roomId: string | undefined,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  heartbeatStatus?: string;
+  healthState?: string;
+  heartbeatExpired?: boolean;
+  responsive?: boolean;
+  lastRoomId?: string;
+} {
+  if (!staleAgent) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(staleAgent.targetId);
+  const agentId = optionalNonEmptyString(staleAgent.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const heartbeatStatus = typeof staleAgent.heartbeatStatus === "string" ? staleAgent.heartbeatStatus : undefined;
+  const healthState = typeof staleAgent.healthState === "string" ? staleAgent.healthState : undefined;
+  const heartbeatExpired = staleAgent.heartbeatExpired === true;
+  const responsive = staleAgent.responsive === true;
+  const lastRoomId = optionalNonEmptyString(staleAgent.lastRoomId);
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (!heartbeatStatus || !["online", "idle", "running", "error"].includes(heartbeatStatus)) {
+    issues.push("heartbeatStatus");
+  }
+  if (healthState !== "stale") {
+    issues.push("healthState");
+  }
+  if (!heartbeatExpired) {
+    issues.push("heartbeatExpired");
+  }
+  if (responsive) {
+    issues.push("responsive");
+  }
+  if (!lastRoomId) {
+    issues.push("lastRoomId");
+  }
+  if (roomId && lastRoomId && lastRoomId !== roomId) {
+    issues.push("lastRoomMismatch");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    heartbeatStatus,
+    healthState,
+    heartbeatExpired,
+    responsive,
+    lastRoomId,
+  };
+}
+
+function validatePhaseFiveStaleRecovery(
+  staleRecovery: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+  staleAgentValidation: { targetId?: string; agentId?: string; issues: string[] },
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  recoveryKind?: string;
+  recovered?: boolean;
+  memberStatusAfter?: string;
+  heartbeatStatusAfter?: string;
+  healthStateAfter?: string;
+} {
+  if (!staleRecovery) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(staleRecovery.targetId);
+  const agentId = optionalNonEmptyString(staleRecovery.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const recoveryKind = optionalNonEmptyString(staleRecovery.recoveryKind);
+  const recovered = staleRecovery.recovered === true;
+  const memberStatusAfter = optionalNonEmptyString(staleRecovery.memberStatusAfter);
+  const heartbeatStatusAfter = optionalNonEmptyString(staleRecovery.heartbeatStatusAfter);
+  const healthStateAfter = optionalNonEmptyString(staleRecovery.healthStateAfter);
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (staleAgentValidation.targetId && targetId && staleAgentValidation.targetId !== targetId) {
+    issues.push("staleTargetMismatch");
+  }
+  if (staleAgentValidation.agentId && agentId && staleAgentValidation.agentId !== agentId) {
+    issues.push("staleAgentMismatch");
+  }
+  if (recoveryKind !== "soloclaw.agent_stale_recovery") {
+    issues.push("recoveryKind");
+  }
+  if (!recovered) {
+    issues.push("recovered");
+  }
+  if (memberStatusAfter !== "suspended") {
+    issues.push("memberStatusAfter");
+  }
+  if (heartbeatStatusAfter !== "offline") {
+    issues.push("heartbeatStatusAfter");
+  }
+  if (healthStateAfter !== "offline") {
+    issues.push("healthStateAfter");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    recoveryKind,
+    recovered,
+    memberStatusAfter,
+    heartbeatStatusAfter,
+    healthStateAfter,
+  };
+}
+
+function validatePhaseFiveSuspendedAgent(
+  suspendedAgent: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  status?: string;
+  routedMessageId?: string;
+  inboxMessageCount?: number;
+  remoteSayBlocked?: boolean;
+  rejection?: string;
+} {
+  if (!suspendedAgent) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(suspendedAgent.targetId);
+  const agentId = optionalNonEmptyString(suspendedAgent.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const status = typeof suspendedAgent.status === "string" ? suspendedAgent.status : undefined;
+  const routedMessageId = optionalNonEmptyString(suspendedAgent.routedMessageId);
+  const parsedInboxMessageCount = Number(suspendedAgent.inboxMessageCount);
+  const inboxMessageCount = Number.isFinite(parsedInboxMessageCount) ? parsedInboxMessageCount : undefined;
+  const remoteSayBlocked = suspendedAgent.remoteSayBlocked === true;
+  const rejection = optionalNonEmptyString(suspendedAgent.rejection);
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (status !== "suspended") {
+    issues.push("status");
+  }
+  if (!routedMessageId) {
+    issues.push("routedMessageId");
+  }
+  if (inboxMessageCount !== 0) {
+    issues.push("inboxMessageCount");
+  }
+  if (!remoteSayBlocked) {
+    issues.push("remoteSayBlocked");
+  }
+  if (!rejection || !/room\.message\.send|suspended|capability/i.test(rejection)) {
+    issues.push("rejection");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    status,
+    routedMessageId,
+    inboxMessageCount,
+    remoteSayBlocked,
+    rejection,
+  };
+}
+
+function validatePhaseFiveNoBroadcastFallback(
+  noBroadcastFallback: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  messageId?: string;
+  messageVisible?: boolean;
+  agentIds: string[];
+  missingAgentIds: string[];
+  inboxCounts: Record<string, number>;
+  runMessagesProcessed: Record<string, number>;
+  deliveryStatusPendingCounts: Record<string, number>;
+  transcriptEventKinds: string[];
+  eventStreamRoomMessageIds: string[];
+  eventStreamRoomMessageIdObserved: boolean;
+} {
+  if (!noBroadcastFallback) {
+    return {
+      issues: ["missing"],
+      agentIds: [],
+      missingAgentIds: [],
+      inboxCounts: {},
+      runMessagesProcessed: {},
+      deliveryStatusPendingCounts: {},
+      transcriptEventKinds: [],
+      eventStreamRoomMessageIds: [],
+      eventStreamRoomMessageIdObserved: false,
+    };
+  }
+  const issues: string[] = [];
+  const messageId = optionalNonEmptyString(noBroadcastFallback.messageId);
+  const messageVisible = noBroadcastFallback.messageVisible === true;
+  const agentIds = stringArrayEvidenceField(noBroadcastFallback.agentIds);
+  const inboxCounts = numericRecordEvidenceField(noBroadcastFallback.inboxCounts);
+  const runMessagesProcessed = numericRecordEvidenceField(noBroadcastFallback.runMessagesProcessed);
+  const deliveryStatusPendingCounts = numericRecordEvidenceField(noBroadcastFallback.deliveryStatusPendingCounts);
+  const transcriptEventKinds = stringArrayEvidenceField(noBroadcastFallback.transcriptEventKinds);
+  const controlEvidence = phaseFiveEvidenceObject(targetById.get("control-plane-host")) ?? {};
+  const eventStreamRoomMessageIds = stringArrayEvidenceField(controlEvidence.eventStreamRoomMessageIds);
+  const eventStreamRoomMessageIdObserved = messageId ? eventStreamRoomMessageIds.includes(messageId) : false;
+  const remoteAgentIds = PHASE_FIVE_REMOTE_TARGET_IDS
+    .map((id) => optionalNonEmptyString(targetById.get(id)?.agentId))
+    .filter((id): id is string => Boolean(id));
+  const missingAgentIds = remoteAgentIds.filter((agentId) => !agentIds.includes(agentId));
+  const missingInboxCountAgentIds = remoteAgentIds.filter((agentId) => inboxCounts[agentId] !== 0);
+  const nonZeroRunAgentIds = remoteAgentIds.filter((agentId) => runMessagesProcessed[agentId] !== 0);
+  const pendingDeliveryAgentIds = remoteAgentIds.filter((agentId) => deliveryStatusPendingCounts[agentId] !== 0);
+
+  if (!messageId) {
+    issues.push("messageId");
+  }
+  if (messageId && !eventStreamRoomMessageIdObserved) {
+    issues.push("eventStreamRoomMessageId");
+  }
+  if (!messageVisible) {
+    issues.push("messageVisible");
+  }
+  if (remoteAgentIds.length !== PHASE_FIVE_REMOTE_TARGET_IDS.length) {
+    issues.push("remoteAgentIds");
+  }
+  if (missingAgentIds.length > 0) {
+    issues.push("agentIds");
+  }
+  if (missingInboxCountAgentIds.length > 0) {
+    issues.push("inboxCounts");
+  }
+  if (nonZeroRunAgentIds.length > 0) {
+    issues.push("runMessagesProcessed");
+  }
+  if (pendingDeliveryAgentIds.length > 0) {
+    issues.push("deliveryStatusPendingCounts");
+  }
+  if (!transcriptEventKinds.includes("chat")) {
+    issues.push("transcriptEventKind");
+  }
+
+  return {
+    issues,
+    messageId,
+    messageVisible,
+    agentIds,
+    missingAgentIds,
+    inboxCounts,
+    runMessagesProcessed,
+    deliveryStatusPendingCounts,
+    transcriptEventKinds,
+    eventStreamRoomMessageIds,
+    eventStreamRoomMessageIdObserved,
+  };
+}
+
+function phaseFiveStopFileShutdownObject(root: Record<string, unknown>): Record<string, unknown> | undefined {
+  const room = isRecord(root.room) ? root.room : undefined;
+  return room && isRecord(room.stopFileShutdown) ? room.stopFileShutdown : undefined;
+}
+
+function validatePhaseFiveStopFileShutdown(
+  stopFileShutdown: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  stopFile?: string;
+  runnerStatusFile?: string;
+  runnerStatusKind?: string;
+  runnerStatus?: string;
+  runnerStopReason?: string;
+} {
+  if (!stopFileShutdown) {
+    return { issues: ["missing"] };
+  }
+  const issues: string[] = [];
+  const targetId = optionalNonEmptyString(stopFileShutdown.targetId);
+  const agentId = optionalNonEmptyString(stopFileShutdown.agentId);
+  const stopFile = optionalNonEmptyString(stopFileShutdown.stopFile);
+  const runnerStatusFile = optionalNonEmptyString(stopFileShutdown.runnerStatusFile);
+  const runnerStatusKind = typeof stopFileShutdown.runnerStatusKind === "string" ? stopFileShutdown.runnerStatusKind : undefined;
+  const runnerStatus = typeof stopFileShutdown.runnerStatus === "string" ? stopFileShutdown.runnerStatus : undefined;
+  const runnerStopReason = typeof stopFileShutdown.runnerStopReason === "string" ? stopFileShutdown.runnerStopReason : undefined;
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (!stopFile) {
+    issues.push("stopFile");
+  }
+  if (!runnerStatusFile) {
+    issues.push("runnerStatusFile");
+  }
+  if (runnerStatusKind !== "soloclaw.remote_room_runner_status") {
+    issues.push("runnerStatusKind");
+  }
+  if (runnerStatus !== "stopped") {
+    issues.push("runnerStatus");
+  }
+  if (runnerStopReason !== "shutdown_requested") {
+    issues.push("runnerStopReason");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    stopFile,
+    runnerStatusFile,
+    runnerStatusKind,
+    runnerStatus,
+    runnerStopReason,
+  };
+}
+
+function validatePhaseFivePeerExchange(
+  peerExchange: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): string[] {
+  if (!peerExchange) {
+    return ["missing"];
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const senderTargetId = optionalNonEmptyString(peerExchange.senderTargetId);
+  const receiverTargetId = optionalNonEmptyString(peerExchange.receiverTargetId);
+  const senderAgentId = optionalNonEmptyString(peerExchange.senderAgentId);
+  const receiverAgentId = optionalNonEmptyString(peerExchange.receiverAgentId);
+  const messageId = optionalNonEmptyString(peerExchange.messageId);
+  const replyMessageId = optionalNonEmptyString(peerExchange.replyMessageId);
+
+  if (!senderTargetId || !remoteTargetIds.has(senderTargetId)) {
+    issues.push("senderTargetId");
+  }
+  if (!receiverTargetId || !remoteTargetIds.has(receiverTargetId)) {
+    issues.push("receiverTargetId");
+  }
+  if (senderTargetId && receiverTargetId && senderTargetId === receiverTargetId) {
+    issues.push("distinctTargets");
+  }
+  if (!senderAgentId) {
+    issues.push("senderAgentId");
+  }
+  if (!receiverAgentId) {
+    issues.push("receiverAgentId");
+  }
+  if (senderAgentId && receiverAgentId && senderAgentId === receiverAgentId) {
+    issues.push("distinctAgents");
+  }
+  const senderTargetAgentId = senderTargetId ? optionalNonEmptyString(targetById.get(senderTargetId)?.agentId) : undefined;
+  const receiverTargetAgentId = receiverTargetId ? optionalNonEmptyString(targetById.get(receiverTargetId)?.agentId) : undefined;
+  if (senderTargetId && !senderTargetAgentId) {
+    issues.push("senderTargetAgentId");
+  }
+  if (receiverTargetId && !receiverTargetAgentId) {
+    issues.push("receiverTargetAgentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(senderAgentId, senderTargetAgentId)) {
+    issues.push("senderAgentTargetMismatch");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(receiverAgentId, receiverTargetAgentId)) {
+    issues.push("receiverAgentTargetMismatch");
+  }
+  if (!messageId) {
+    issues.push("messageId");
+  }
+  if (!replyMessageId) {
+    issues.push("replyMessageId");
+  }
+  if (peerExchange.receiverHandled !== true) {
+    issues.push("receiverHandled");
+  }
+  if (peerExchange.senderHandledReply !== true) {
+    issues.push("senderHandledReply");
+  }
+  if (peerExchange.messageSignatureStatus !== "valid") {
+    issues.push("messageSignatureStatus");
+  }
+  if (peerExchange.replySignatureStatus !== "valid") {
+    issues.push("replySignatureStatus");
+  }
+  return issues;
+}
+
+function validatePhaseFiveAssignmentResult(
+  assignmentResult: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  subtaskId?: string;
+  childSessionId?: string;
+  assignmentMessageId?: string;
+  resultMessageId?: string;
+  resultStatus?: string;
+  transcriptEventKinds: string[];
+} {
+  if (!assignmentResult) {
+    return { issues: ["missing"], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const targetId = optionalNonEmptyString(assignmentResult.targetId);
+  const agentId = optionalNonEmptyString(assignmentResult.agentId);
+  const subtaskId = optionalNonEmptyString(assignmentResult.subtaskId);
+  const childSessionId = optionalNonEmptyString(assignmentResult.childSessionId);
+  const assignmentMessageId = optionalNonEmptyString(assignmentResult.assignmentMessageId);
+  const resultMessageId = optionalNonEmptyString(assignmentResult.resultMessageId);
+  const resultStatus = optionalNonEmptyString(assignmentResult.resultStatus);
+  const transcriptEventKinds = stringArrayEvidenceField(assignmentResult.transcriptEventKinds);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (!subtaskId) {
+    issues.push("subtaskId");
+  }
+  if (!childSessionId) {
+    issues.push("childSessionId");
+  }
+  if (!assignmentMessageId) {
+    issues.push("assignmentMessageId");
+  }
+  if (!resultMessageId) {
+    issues.push("resultMessageId");
+  }
+  if (assignmentMessageId && resultMessageId && assignmentMessageId === resultMessageId) {
+    issues.push("distinctMessageIds");
+  }
+  if (assignmentResult.assignmentMessageVisible !== true) {
+    issues.push("assignmentMessageVisible");
+  }
+  if (assignmentResult.resultMessageVisible !== true) {
+    issues.push("resultMessageVisible");
+  }
+  if (resultStatus !== "completed") {
+    issues.push("resultStatus");
+  }
+  if (!transcriptEventKinds.includes("task")) {
+    issues.push("assignmentTranscriptKind");
+  }
+  if (!transcriptEventKinds.includes("decision")) {
+    issues.push("resultTranscriptKind");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    subtaskId,
+    childSessionId,
+    assignmentMessageId,
+    resultMessageId,
+    resultStatus,
+    transcriptEventKinds,
+  };
+}
+
+function validatePhaseFiveConflictResolution(
+  conflictResolution: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  resultKey?: string;
+  primaryTargetId?: string;
+  primaryAgentId?: string;
+  primaryMessageId?: string;
+  conflictingTargetId?: string;
+  conflictingAgentId?: string;
+  conflictingMessageId?: string;
+  resolutionMessageId?: string;
+  resolvedByAgentId?: string;
+  winningAgentId?: string;
+  resolutionStatus?: string;
+  transcriptEventKinds: string[];
+} {
+  if (!conflictResolution) {
+    return { issues: ["missing"], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const resultKey = optionalNonEmptyString(conflictResolution.resultKey);
+  const primaryTargetId = optionalNonEmptyString(conflictResolution.primaryTargetId);
+  const conflictingTargetId = optionalNonEmptyString(conflictResolution.conflictingTargetId);
+  const primaryAgentId = optionalNonEmptyString(conflictResolution.primaryAgentId);
+  const conflictingAgentId = optionalNonEmptyString(conflictResolution.conflictingAgentId);
+  const primaryMessageId = optionalNonEmptyString(conflictResolution.primaryMessageId);
+  const conflictingMessageId = optionalNonEmptyString(conflictResolution.conflictingMessageId);
+  const resolutionMessageId = optionalNonEmptyString(conflictResolution.resolutionMessageId);
+  const resolvedByAgentId = optionalNonEmptyString(conflictResolution.resolvedByAgentId);
+  const winningAgentId = optionalNonEmptyString(conflictResolution.winningAgentId);
+  const resolutionStatus = optionalNonEmptyString(conflictResolution.resolutionStatus);
+  const transcriptEventKinds = stringArrayEvidenceField(conflictResolution.transcriptEventKinds);
+
+  if (!resultKey) {
+    issues.push("resultKey");
+  }
+  if (!primaryTargetId || !remoteTargetIds.has(primaryTargetId)) {
+    issues.push("primaryTargetId");
+  }
+  if (!conflictingTargetId || !remoteTargetIds.has(conflictingTargetId)) {
+    issues.push("conflictingTargetId");
+  }
+  if (primaryTargetId && conflictingTargetId && primaryTargetId === conflictingTargetId) {
+    issues.push("distinctTargets");
+  }
+  if (!primaryAgentId) {
+    issues.push("primaryAgentId");
+  }
+  if (!conflictingAgentId) {
+    issues.push("conflictingAgentId");
+  }
+  if (primaryAgentId && conflictingAgentId && primaryAgentId === conflictingAgentId) {
+    issues.push("distinctAgents");
+  }
+
+  const primaryTargetAgentId = primaryTargetId ? optionalNonEmptyString(targetById.get(primaryTargetId)?.agentId) : undefined;
+  const conflictingTargetAgentId = conflictingTargetId ? optionalNonEmptyString(targetById.get(conflictingTargetId)?.agentId) : undefined;
+  if (primaryTargetId && !primaryTargetAgentId) {
+    issues.push("primaryTargetAgentId");
+  }
+  if (conflictingTargetId && !conflictingTargetAgentId) {
+    issues.push("conflictingTargetAgentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(primaryAgentId, primaryTargetAgentId)) {
+    issues.push("primaryAgentTargetMismatch");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(conflictingAgentId, conflictingTargetAgentId)) {
+    issues.push("conflictingAgentTargetMismatch");
+  }
+  if (!primaryMessageId) {
+    issues.push("primaryMessageId");
+  }
+  if (!conflictingMessageId) {
+    issues.push("conflictingMessageId");
+  }
+  if (!resolutionMessageId) {
+    issues.push("resolutionMessageId");
+  }
+  const messageIds = [primaryMessageId, conflictingMessageId, resolutionMessageId].filter((id): id is string => Boolean(id));
+  if (new Set(messageIds).size !== messageIds.length) {
+    issues.push("distinctMessageIds");
+  }
+  if (!resolvedByAgentId) {
+    issues.push("resolvedByAgentId");
+  }
+  if (!winningAgentId) {
+    issues.push("winningAgentId");
+  }
+  if (winningAgentId && primaryAgentId && conflictingAgentId && winningAgentId !== primaryAgentId && winningAgentId !== conflictingAgentId) {
+    issues.push("winningAgentId");
+  }
+  if (conflictResolution.conflictDetected !== true) {
+    issues.push("conflictDetected");
+  }
+  if (conflictResolution.resolutionRecorded !== true) {
+    issues.push("resolutionRecorded");
+  }
+  if (resolutionStatus !== "resolved") {
+    issues.push("resolutionStatus");
+  }
+  if (!transcriptEventKinds.includes("artifact")) {
+    issues.push("conflictTranscriptKind");
+  }
+  if (!transcriptEventKinds.includes("decision")) {
+    issues.push("resolutionTranscriptKind");
+  }
+
+  return {
+    issues,
+    resultKey,
+    primaryTargetId,
+    primaryAgentId,
+    primaryMessageId,
+    conflictingTargetId,
+    conflictingAgentId,
+    conflictingMessageId,
+    resolutionMessageId,
+    resolvedByAgentId,
+    winningAgentId,
+    resolutionStatus,
+    transcriptEventKinds,
+  };
+}
+
+function validatePhaseFiveResultSync(
+  resultSync: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+  roomId: string | undefined,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  artifactId?: string;
+  artifactKind?: string;
+  artifactName?: string;
+  artifactRoomId?: string;
+  artifactStatus?: string;
+  artifactSha256?: string;
+  artifactSizeBytes?: number;
+  artifactMessageId?: string;
+  transcriptEventKinds: string[];
+} {
+  if (!resultSync) {
+    return { issues: ["missing"], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const targetId = optionalNonEmptyString(resultSync.targetId);
+  const agentId = optionalNonEmptyString(resultSync.agentId);
+  const artifactId = optionalNonEmptyString(resultSync.artifactId);
+  const artifactKind = optionalNonEmptyString(resultSync.artifactKind);
+  const artifactName = optionalNonEmptyString(resultSync.artifactName);
+  const artifactRoomId = optionalNonEmptyString(resultSync.artifactRoomId);
+  const artifactStatus = optionalNonEmptyString(resultSync.artifactStatus);
+  const artifactSha256 = optionalNonEmptyString(resultSync.artifactSha256);
+  const artifactSizeBytes = typeof resultSync.artifactSizeBytes === "number" ? resultSync.artifactSizeBytes : undefined;
+  const artifactMessageId = optionalNonEmptyString(resultSync.artifactMessageId);
+  const transcriptEventKinds = stringArrayEvidenceField(resultSync.transcriptEventKinds);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (!artifactId) {
+    issues.push("artifactId");
+  }
+  if (artifactKind !== "report") {
+    issues.push("artifactKind");
+  }
+  if (!artifactName) {
+    issues.push("artifactName");
+  }
+  if (!artifactRoomId) {
+    issues.push("artifactRoomId");
+  }
+  if (roomId && artifactRoomId && artifactRoomId !== roomId) {
+    issues.push("artifactRoomMismatch");
+  }
+  if (artifactStatus !== "active") {
+    issues.push("artifactStatus");
+  }
+  if (!artifactSha256 || !/^[a-f0-9]{64}$/i.test(artifactSha256)) {
+    issues.push("artifactSha256");
+  }
+  if (typeof artifactSizeBytes !== "number" || !Number.isFinite(artifactSizeBytes) || artifactSizeBytes <= 0) {
+    issues.push("artifactSizeBytes");
+  }
+  if (resultSync.artifactRegistered !== true) {
+    issues.push("artifactRegistered");
+  }
+  if (!artifactMessageId) {
+    issues.push("artifactMessageId");
+  }
+  if (resultSync.artifactMessageVisible !== true) {
+    issues.push("artifactMessageVisible");
+  }
+  if (!transcriptEventKinds.includes("artifact")) {
+    issues.push("artifactTranscriptKind");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    artifactId,
+    artifactKind,
+    artifactName,
+    artifactRoomId,
+    artifactStatus,
+    artifactSha256,
+    artifactSizeBytes,
+    artifactMessageId,
+    transcriptEventKinds,
+  };
+}
+
+function validatePhaseFiveRegisteredAgentPull(
+  registeredAgentPull: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  targetId?: string;
+  agentId?: string;
+  targetAgentId?: string;
+  role?: string;
+  aliases: string[];
+  taskMessageId?: string;
+  replyMessageId?: string;
+  handledMessages: string[];
+  messagesProcessed?: number;
+  replySignatureStatus?: string;
+  heartbeatStatus?: string;
+  runStopReason?: string;
+  deliveryStatusPendingCount?: number;
+  transcriptEventKinds: string[];
+} {
+  if (!registeredAgentPull) {
+    return { issues: ["missing"], aliases: [], handledMessages: [], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const targetId = optionalNonEmptyString(registeredAgentPull.targetId);
+  const agentId = optionalNonEmptyString(registeredAgentPull.agentId);
+  const targetAgentId = targetId ? optionalNonEmptyString(targetById.get(targetId)?.agentId) : undefined;
+  const role = optionalNonEmptyString(registeredAgentPull.role);
+  const aliases = stringArrayEvidenceField(registeredAgentPull.aliases);
+  const taskMessageId = optionalNonEmptyString(registeredAgentPull.taskMessageId);
+  const replyMessageId = optionalNonEmptyString(registeredAgentPull.replyMessageId);
+  const handledMessages = stringArrayEvidenceField(registeredAgentPull.handledMessages);
+  const messagesProcessed = typeof registeredAgentPull.messagesProcessed === "number" ? registeredAgentPull.messagesProcessed : undefined;
+  const replySignatureStatus = optionalNonEmptyString(registeredAgentPull.replySignatureStatus);
+  const heartbeatStatus = optionalNonEmptyString(registeredAgentPull.heartbeatStatus);
+  const runStopReason = optionalNonEmptyString(registeredAgentPull.runStopReason);
+  const deliveryStatusPendingCount = typeof registeredAgentPull.deliveryStatusPendingCount === "number" ? registeredAgentPull.deliveryStatusPendingCount : undefined;
+  const transcriptEventKinds = stringArrayEvidenceField(registeredAgentPull.transcriptEventKinds);
+
+  if (!targetId || !remoteTargetIds.has(targetId)) {
+    issues.push("targetId");
+  }
+  if (targetId && PHASE_FIVE_REMOTE_TARGET_IDS.some((id) => targetById.has(id)) && !targetById.has(targetId)) {
+    issues.push("targetCollected");
+  }
+  if (targetId && targetById.has(targetId) && !targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (!agentId) {
+    issues.push("agentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(agentId, targetAgentId)) {
+    issues.push("agentTargetMismatch");
+  }
+  if (registeredAgentPull.registered !== true) {
+    issues.push("registered");
+  }
+  if (registeredAgentPull.invitationListed !== true) {
+    issues.push("invitationListed");
+  }
+  if (registeredAgentPull.accepted !== true) {
+    issues.push("accepted");
+  }
+  if (!role || role === "unknown") {
+    issues.push("role");
+  }
+  if (aliases.length === 0) {
+    issues.push("aliases");
+  }
+  if (!taskMessageId) {
+    issues.push("taskMessageId");
+  }
+  if (!replyMessageId) {
+    issues.push("replyMessageId");
+  }
+  if (taskMessageId && !handledMessages.includes(taskMessageId)) {
+    issues.push("handledMessages");
+  }
+  if (typeof messagesProcessed !== "number" || !Number.isFinite(messagesProcessed) || messagesProcessed < 1) {
+    issues.push("messagesProcessed");
+  }
+  if (registeredAgentPull.ackSigned !== true) {
+    issues.push("ackSigned");
+  }
+  if (replySignatureStatus !== "valid") {
+    issues.push("replySignatureStatus");
+  }
+  if (heartbeatStatus !== "idle") {
+    issues.push("heartbeatStatus");
+  }
+  if (runStopReason !== "idle") {
+    issues.push("runStopReason");
+  }
+  if (deliveryStatusPendingCount !== 0) {
+    issues.push("deliveryStatusPendingCount");
+  }
+  if (!transcriptEventKinds.includes("task")) {
+    issues.push("taskTranscriptKind");
+  }
+  if (!transcriptEventKinds.some((kind) => kind === "chat" || kind === "decision")) {
+    issues.push("replyTranscriptKind");
+  }
+
+  return {
+    issues,
+    targetId,
+    agentId,
+    targetAgentId,
+    role,
+    aliases,
+    taskMessageId,
+    replyMessageId,
+    handledMessages,
+    messagesProcessed,
+    replySignatureStatus,
+    heartbeatStatus,
+    runStopReason,
+    deliveryStatusPendingCount,
+    transcriptEventKinds,
+  };
+}
+
+function phaseFiveEvidencePlaceholder(value: string): boolean {
+  return /^<[^<>]+>$/.test(value.trim());
+}
+
+function phaseFiveEvidenceAgentIdsMismatch(agentId: string | undefined, targetAgentId: string | undefined): boolean {
+  return Boolean(
+    agentId &&
+    targetAgentId &&
+    !phaseFiveEvidencePlaceholder(agentId) &&
+    !phaseFiveEvidencePlaceholder(targetAgentId) &&
+    agentId !== targetAgentId,
+  );
+}
+
+function validatePhaseFiveHandoff(
+  handoff: Record<string, unknown> | undefined,
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  handoffId?: string;
+  sourceTargetId?: string;
+  sourceAgentId?: string;
+  targetTargetId?: string;
+  targetAgentId?: string;
+  handoffMessageId?: string;
+  acceptanceMessageId?: string;
+  resultMessageId?: string;
+  resultStatus?: string;
+  transcriptEventKinds: string[];
+} {
+  if (!handoff) {
+    return { issues: ["missing"], transcriptEventKinds: [] };
+  }
+  const issues: string[] = [];
+  const remoteTargetIds = new Set<string>(PHASE_FIVE_REMOTE_TARGET_IDS);
+  const handoffId = optionalNonEmptyString(handoff.handoffId);
+  const sourceTargetId = optionalNonEmptyString(handoff.sourceTargetId);
+  const targetTargetId = optionalNonEmptyString(handoff.targetTargetId);
+  const sourceAgentId = optionalNonEmptyString(handoff.sourceAgentId);
+  const targetAgentId = optionalNonEmptyString(handoff.targetAgentId);
+  const handoffMessageId = optionalNonEmptyString(handoff.handoffMessageId);
+  const acceptanceMessageId = optionalNonEmptyString(handoff.acceptanceMessageId);
+  const resultMessageId = optionalNonEmptyString(handoff.resultMessageId);
+  const resultStatus = optionalNonEmptyString(handoff.resultStatus);
+  const transcriptEventKinds = stringArrayEvidenceField(handoff.transcriptEventKinds);
+
+  if (!handoffId) {
+    issues.push("handoffId");
+  }
+  if (!sourceTargetId || !remoteTargetIds.has(sourceTargetId)) {
+    issues.push("sourceTargetId");
+  }
+  if (!targetTargetId || !remoteTargetIds.has(targetTargetId)) {
+    issues.push("targetTargetId");
+  }
+  if (sourceTargetId && targetTargetId && sourceTargetId === targetTargetId) {
+    issues.push("distinctTargets");
+  }
+  if (!sourceAgentId) {
+    issues.push("sourceAgentId");
+  }
+  if (!targetAgentId) {
+    issues.push("targetAgentId");
+  }
+  if (sourceAgentId && targetAgentId && sourceAgentId === targetAgentId) {
+    issues.push("distinctAgents");
+  }
+
+  const sourceTargetAgentId = sourceTargetId ? optionalNonEmptyString(targetById.get(sourceTargetId)?.agentId) : undefined;
+  const targetTargetAgentId = targetTargetId ? optionalNonEmptyString(targetById.get(targetTargetId)?.agentId) : undefined;
+  if (sourceTargetId && !sourceTargetAgentId) {
+    issues.push("sourceTargetAgentId");
+  }
+  if (targetTargetId && !targetTargetAgentId) {
+    issues.push("targetTargetAgentId");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(sourceAgentId, sourceTargetAgentId)) {
+    issues.push("sourceAgentTargetMismatch");
+  }
+  if (phaseFiveEvidenceAgentIdsMismatch(targetAgentId, targetTargetAgentId)) {
+    issues.push("targetAgentTargetMismatch");
+  }
+  if (!handoffMessageId) {
+    issues.push("handoffMessageId");
+  }
+  if (!acceptanceMessageId) {
+    issues.push("acceptanceMessageId");
+  }
+  if (!resultMessageId) {
+    issues.push("resultMessageId");
+  }
+  const messageIds = [handoffMessageId, acceptanceMessageId, resultMessageId].filter((id): id is string => Boolean(id));
+  if (new Set(messageIds).size !== messageIds.length) {
+    issues.push("distinctMessageIds");
+  }
+  if (handoff.handoffMessageVisible !== true) {
+    issues.push("handoffMessageVisible");
+  }
+  if (handoff.acceptanceMessageVisible !== true) {
+    issues.push("acceptanceMessageVisible");
+  }
+  if (handoff.resultMessageVisible !== true) {
+    issues.push("resultMessageVisible");
+  }
+  if (handoff.handoffAccepted !== true) {
+    issues.push("handoffAccepted");
+  }
+  if (handoff.handoffCompleted !== true) {
+    issues.push("handoffCompleted");
+  }
+  if (resultStatus !== "completed") {
+    issues.push("resultStatus");
+  }
+  if (!transcriptEventKinds.includes("task")) {
+    issues.push("handoffTranscriptKind");
+  }
+  if (!transcriptEventKinds.includes("decision")) {
+    issues.push("handoffDecisionKind");
+  }
+
+  return {
+    issues,
+    handoffId,
+    sourceTargetId,
+    sourceAgentId,
+    targetTargetId,
+    targetAgentId,
+    handoffMessageId,
+    acceptanceMessageId,
+    resultMessageId,
+    resultStatus,
+    transcriptEventKinds,
+  };
+}
+
+function validatePhaseFiveControlPlaneEventStream(
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  remoteAgentIds: string[];
+  eventStreamConnected?: boolean;
+  controlActionTypes: string[];
+  eventStreamAgentIds: string[];
+  roomMessageEventTypes: string[];
+  roomMessageIds: string[];
+  deliveryAckEventTypes: string[];
+  ackMessageIds: string[];
+  deliveryStatusAckMessageIds: string[];
+  missingEventStreamAckMessageIds: string[];
+} {
+  const issues: string[] = [];
+  const control = targetById.get("control-plane-host");
+  const evidence = phaseFiveEvidenceObject(control) ?? {};
+  const remoteAgentIds = PHASE_FIVE_REMOTE_TARGET_IDS
+    .map((id) => optionalNonEmptyString(targetById.get(id)?.agentId))
+    .filter((id): id is string => Boolean(id));
+
+  if (!control) {
+    issues.push("controlPlaneHost");
+  }
+  if (!control || !phaseFiveEvidenceFieldPassed(control, "eventStream")) {
+    issues.push("eventStream");
+  }
+
+  const eventStreamConnected = evidence.eventStreamConnected === true;
+  const controlActionTypes = stringArrayEvidenceField(evidence.eventStreamControlActionTypes);
+  const eventStreamAgentIds = stringArrayEvidenceField(evidence.eventStreamAgentIds);
+  const roomMessageEventTypes = stringArrayEvidenceField(evidence.eventStreamRoomMessageEventTypes);
+  const roomMessageIds = stringArrayEvidenceField(evidence.eventStreamRoomMessageIds);
+  const deliveryAckEventTypes = stringArrayEvidenceField(evidence.eventStreamDeliveryAckEventTypes);
+  const ackMessageIds = stringArrayEvidenceField(evidence.eventStreamAckMessageIds);
+  const deliveryStatusAckMessageIds = stringArrayEvidenceField(evidence.deliveryStatusAckMessageIds);
+  if (!eventStreamConnected) {
+    issues.push("eventStreamConnected");
+  }
+  if (!controlActionTypes.includes("control_plane.action")) {
+    issues.push("controlActionTypes");
+  }
+  if (!roomMessageEventTypes.includes("room.message.sent")) {
+    issues.push("roomMessageEventTypes");
+  }
+  if (roomMessageIds.length === 0) {
+    issues.push("roomMessageIds");
+  }
+  if (!deliveryAckEventTypes.includes("room.delivery.acknowledged")) {
+    issues.push("deliveryAckEventTypes");
+  }
+  if (ackMessageIds.length === 0) {
+    issues.push("ackMessageIds");
+  }
+  if (remoteAgentIds.length !== PHASE_FIVE_REMOTE_TARGET_IDS.length) {
+    issues.push("remoteAgentIds");
+  }
+  const missingEventStreamAgentIds = remoteAgentIds.filter((id) => !eventStreamAgentIds.includes(id));
+  if (missingEventStreamAgentIds.length > 0) {
+    issues.push(`missingEventStreamAgentIds:${missingEventStreamAgentIds.join(",")}`);
+  }
+  const missingEventStreamAckMessageIds = deliveryStatusAckMessageIds.filter((id) => !ackMessageIds.includes(id));
+  if (missingEventStreamAckMessageIds.length > 0) {
+    issues.push(`missingEventStreamAckMessageIds:${missingEventStreamAckMessageIds.join(",")}`);
+  }
+
+  return {
+    issues,
+    remoteAgentIds,
+    eventStreamConnected,
+    controlActionTypes,
+    eventStreamAgentIds,
+    roomMessageEventTypes,
+    roomMessageIds,
+    deliveryAckEventTypes,
+    ackMessageIds,
+    deliveryStatusAckMessageIds,
+    missingEventStreamAckMessageIds,
+  };
+}
+
+function validatePhaseFiveOperatorVisibility(
+  targetById: Map<string, Record<string, unknown>>,
+): {
+  issues: string[];
+  remoteAgentIds: string[];
+  transcriptMessageCount: number;
+  stateRoomMessageCount: number;
+  healthAgentIds: string[];
+  roomHealthAgentIds: string[];
+  responsiveAgentIds: string[];
+  deliveryStatusAgentIds: string[];
+  deliveryStatusPendingCounts: Record<string, number>;
+  deliveryStatusAckMessageIds: string[];
+} {
+  const issues: string[] = [];
+  const control = targetById.get("control-plane-host");
+  const evidence = phaseFiveEvidenceObject(control) ?? {};
+  const remoteAgentIds = PHASE_FIVE_REMOTE_TARGET_IDS
+    .map((id) => optionalNonEmptyString(targetById.get(id)?.agentId))
+    .filter((id): id is string => Boolean(id));
+
+  if (!control) {
+    issues.push("controlPlaneHost");
+  }
+  if (!control || !phaseFiveEvidenceFieldPassed(control, "transcriptVisible")) {
+    issues.push("transcriptVisible");
+  }
+  if (!control || !phaseFiveEvidenceFieldPassed(control, "stateRoomVisible")) {
+    issues.push("stateRoomVisible");
+  }
+  if (!control || !phaseFiveEvidenceFieldPassed(control, "agentHealthVisible")) {
+    issues.push("agentHealthVisible");
+  }
+  if (!control || !phaseFiveEvidenceFieldPassed(control, "deliveryStatusVisible")) {
+    issues.push("deliveryStatusVisible");
+  }
+
+  const transcriptMessageCount = Number(evidence.transcriptMessageCount ?? 0);
+  const stateRoomMessageCount = Number(evidence.stateRoomMessageCount ?? 0);
+  if (!Number.isFinite(transcriptMessageCount) || transcriptMessageCount < 2) {
+    issues.push("transcriptMessageCount");
+  }
+  if (evidence.stateRoomVisible !== true) {
+    issues.push("stateRoomEvidenceVisible");
+  }
+  if (!Number.isFinite(stateRoomMessageCount) || stateRoomMessageCount < 1) {
+    issues.push("stateRoomMessageCount");
+  }
+  if (evidence.agentHealthVisible !== true) {
+    issues.push("agentHealthEvidenceVisible");
+  }
+  if (evidence.deliveryStatusVisible !== true) {
+    issues.push("deliveryStatusEvidenceVisible");
+  }
+
+  const healthAgentIds = stringArrayEvidenceField(evidence.healthAgentIds);
+  const roomHealthAgentIds = stringArrayEvidenceField(evidence.roomHealthAgentIds);
+  const responsiveAgentIds = stringArrayEvidenceField(evidence.responsiveAgentIds);
+  const deliveryStatusAgentIds = stringArrayEvidenceField(evidence.deliveryStatusAgentIds);
+  const deliveryStatusPendingCounts = numericRecordEvidenceField(evidence.deliveryStatusPendingCounts);
+  const deliveryStatusAckMessageIds = stringArrayEvidenceField(evidence.deliveryStatusAckMessageIds);
+  const missingHealthAgentIds = remoteAgentIds.filter((id) => !healthAgentIds.includes(id));
+  const missingRoomHealthAgentIds = remoteAgentIds.filter((id) => !roomHealthAgentIds.includes(id));
+  const missingResponsiveAgentIds = remoteAgentIds.filter((id) => !responsiveAgentIds.includes(id));
+  const missingDeliveryStatusAgentIds = remoteAgentIds.filter((id) => !deliveryStatusAgentIds.includes(id));
+  const pendingDeliveryStatusAgentIds = remoteAgentIds.filter((id) => deliveryStatusPendingCounts[id] !== 0);
+  if (remoteAgentIds.length !== PHASE_FIVE_REMOTE_TARGET_IDS.length) {
+    issues.push("remoteAgentIds");
+  }
+  if (missingHealthAgentIds.length > 0) {
+    issues.push(`missingHealthAgentIds:${missingHealthAgentIds.join(",")}`);
+  }
+  if (missingRoomHealthAgentIds.length > 0) {
+    issues.push(`missingRoomHealthAgentIds:${missingRoomHealthAgentIds.join(",")}`);
+  }
+  if (missingResponsiveAgentIds.length > 0) {
+    issues.push(`missingResponsiveAgentIds:${missingResponsiveAgentIds.join(",")}`);
+  }
+  if (deliveryStatusAgentIds.length === 0) {
+    issues.push("deliveryStatusAgentIds");
+  }
+  if (missingDeliveryStatusAgentIds.length > 0) {
+    issues.push(`missingDeliveryStatusAgentIds:${missingDeliveryStatusAgentIds.join(",")}`);
+  }
+  if (Object.keys(deliveryStatusPendingCounts).length === 0) {
+    issues.push("deliveryStatusPendingCounts");
+  }
+  if (pendingDeliveryStatusAgentIds.length > 0) {
+    issues.push(`pendingDeliveryStatusAgentIds:${pendingDeliveryStatusAgentIds.join(",")}`);
+  }
+  if (deliveryStatusAckMessageIds.length < remoteAgentIds.length) {
+    issues.push("deliveryStatusAckMessageIds");
+  }
+
+  return {
+    issues,
+    remoteAgentIds,
+    transcriptMessageCount,
+    stateRoomMessageCount,
+    healthAgentIds,
+    roomHealthAgentIds,
+    responsiveAgentIds,
+    deliveryStatusAgentIds,
+    deliveryStatusPendingCounts,
+    deliveryStatusAckMessageIds,
+  };
+}
+
+function numericRecordEvidenceField(value: unknown): Record<string, number> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .map(([key, item]) => [key, Number(item)] as const)
+      .filter(([, item]) => Number.isFinite(item)),
+  );
+}
+
+function stringArrayEvidenceField(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
+function optionalNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function normalizePhaseFiveFingerprint(value: string): string {
+  return value.trim().toUpperCase();
+}
+
+function countPhaseFiveEvidenceSecretShapes(value: unknown): number {
+  const text = JSON.stringify(value);
+  return countSecretShapes(value) + (
+    text.match(/\brinv_[A-Za-z0-9_-]{8,}\b|phase5-control-token|BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY|x-agent-control-token|Authorization:\s*Bearer\s+\S+/gi)?.length ?? 0
+  );
+}
+
+async function controlPlaneGetJson<T>(controlUrl: string, requestPath: string, token: string): Promise<T> {
+  const url = new URL(requestPath, controlUrl.endsWith("/") ? controlUrl : `${controlUrl}/`);
+  const response = await fetch(url, {
+    headers: {
+      "x-agent-control-token": token,
+    },
+  });
+  const payload = (await response.json().catch(() => ({}))) as { error?: string };
+  if (!response.ok) {
+    throw new Error(`Control plane ${response.status}: ${payload.error ?? response.statusText}`);
+  }
+  return payload as T;
+}
+
+function buildPhaseFiveMatrixTemplate() {
+  const remoteSmoke = (shell: "windows-powershell" | "windows-cmd" | "posix" | "termux") => {
+    const enterWorkspace = shell === "windows-powershell"
+      ? "Set-Location <agent-workspace>"
+      : shell === "windows-cmd"
+        ? "cd /d <agent-workspace>"
+        : "cd <agent-workspace>";
+    const joinCommand = shell === "windows-powershell" || shell === "windows-cmd"
+      ? "node dist\\cli\\index.js room join --invite-bundle <invite-bundle-file> --json"
+      : "node dist/cli/index.js room join --invite-bundle <invite-bundle-file> --json";
+    const revokedJoinCommand = joinCommand.replace("<invite-bundle-file>", "<revoked-invite-bundle-file>");
+    const statusFile = ".agent/tmp/phase5-remote-room-status.json";
+    const stopFile = ".agent/tmp/phase5-remote-room.stop";
+    const stopStatusFile = ".agent/tmp/phase5-remote-room-stop-status.json";
+    const registeredPullStatusFile = ".agent/tmp/phase5-registered-pull-status.json";
+    const registeredPullStopFile = ".agent/tmp/phase5-registered-pull.stop";
+    const resultSyncFile = ".agent/tmp/phase5-result-sync.json";
+    const statusCommandFor = (filePath: string) => shell === "windows-powershell"
+      ? `Get-Content ${filePath}`
+      : shell === "windows-cmd"
+        ? `type ${filePath.replaceAll("/", "\\")}`
+        : `cat ${filePath}`;
+    const statusCommand = statusCommandFor(statusFile);
+    const stopStatusCommand = statusCommandFor(stopStatusFile);
+    const cleanupStopFileCommand = shell === "windows-powershell"
+      ? `Remove-Item ${stopFile} -ErrorAction SilentlyContinue`
+      : shell === "windows-cmd"
+        ? `if exist ${stopFile.replaceAll("/", "\\")} del /f ${stopFile.replaceAll("/", "\\")}`
+        : `rm -f ${stopFile}`;
+    const createStopFileCommand = shell === "windows-powershell"
+      ? `New-Item -ItemType File -Path ${stopFile} -Force | Out-Null`
+      : shell === "windows-cmd"
+        ? `type nul > ${stopFile.replaceAll("/", "\\")}`
+        : `touch ${stopFile}`;
+    const runCommand = shell === "windows-cmd"
+      ? `node dist\\cli\\index.js room join --invite-bundle <invite-bundle-file> --run --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${statusFile} --stop-file ${stopFile} --reply-template "@agent:<reply-target-agent-id> <agent-label> handled {messageId}" --json`
+      : shell === "windows-powershell"
+        ? `node dist\\cli\\index.js room join --invite-bundle <invite-bundle-file> --run --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${statusFile} --stop-file ${stopFile} --reply-template '@agent:<reply-target-agent-id> <agent-label> handled {messageId}' --json`
+        : `node dist/cli/index.js room join --invite-bundle <invite-bundle-file> --run --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${statusFile} --stop-file ${stopFile} --reply-template '@agent:<reply-target-agent-id> <agent-label> handled {messageId}' --json`;
+    const stopRunCommand = shell === "windows-powershell" || shell === "windows-cmd"
+      ? `node dist\\cli\\index.js room join --invite-bundle <invite-bundle-file> --run --cycles 100 --limit 1 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --heartbeat-ttl 60 --status-file ${stopStatusFile} --stop-file ${stopFile} --json`
+      : `node dist/cli/index.js room join --invite-bundle <invite-bundle-file> --run --cycles 100 --limit 1 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --heartbeat-ttl 60 --status-file ${stopStatusFile} --stop-file ${stopFile} --json`;
+    const cli = shell === "windows-powershell" || shell === "windows-cmd" ? "node dist\\cli\\index.js" : "node dist/cli/index.js";
+    const noBroadcastFallbackInboxCommand = `${cli} remote inbox --control-url <control-url> --control-token <control-token> --room <room-id> --limit 5 --json`;
+    const noBroadcastFallbackRunCommand = `${cli} remote run --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 1 --limit 1 --idle-limit 1 --interval-ms 0 --loop-interval-ms 0 --stop-when-idle --idle-cycles 1 --heartbeat-ttl 60 --json`;
+    const servicePlanCommand = `${cli} remote service --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${statusFile} --stop-file ${stopFile} --json`;
+    const registeredPullRegisterCommand = `${cli} remote register --control-url <control-url> --control-token <control-token> --display-name <agent-label>-registered-pull --json`;
+    const registeredPullInvitationsCommand = `${cli} remote invitations --control-url <control-url> --control-token <control-token> --json`;
+    const registeredPullAcceptCommand = `${cli} remote accept-room --control-url <control-url> --control-token <control-token> --room <room-id> --json`;
+    const registeredPullRunCommand = shell === "windows-cmd"
+      ? `${cli} remote run --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${registeredPullStatusFile} --stop-file ${registeredPullStopFile} --reply-template "@agent:<owner-agent-id> registered-pull handled {messageId}" --json`
+      : `${cli} remote run --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 20 --limit 5 --idle-limit 1 --interval-ms 1000 --loop-interval-ms 1000 --stop-when-idle --idle-cycles 2 --heartbeat-ttl 60 --status-file ${registeredPullStatusFile} --stop-file ${registeredPullStopFile} --reply-template '@agent:<owner-agent-id> registered-pull handled {messageId}' --json`;
+    const registeredPullStatusCommand = statusCommandFor(registeredPullStatusFile);
+    const peerSayCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind task "@agent:<peer-agent-id> <agent-label> peer exchange to <peer-label>" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind task '@agent:<peer-agent-id> <agent-label> peer exchange to <peer-label>' --json`;
+    const conflictSayCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind artifact "phase5 conflict result <conflict-result-key> from <agent-label>; expected to conflict with the paired result" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind artifact 'phase5 conflict result <conflict-result-key> from <agent-label>; expected to conflict with the paired result' --json`;
+    const resultSyncWriteCommand = shell === "windows-powershell"
+      ? `New-Item -ItemType Directory -Path .agent/tmp -Force | Out-Null; Set-Content -Path ${resultSyncFile} -Value '{"kind":"phase5.result_sync","status":"completed","agentId":"<result-sync-target-agent-id>","roomId":"<room-id>"}'`
+      : shell === "windows-cmd"
+        ? `if not exist .agent\\tmp mkdir .agent\\tmp && echo {"kind":"phase5.result_sync","status":"completed","agentId":"<result-sync-target-agent-id>","roomId":"<room-id>"} > ${resultSyncFile.replaceAll("/", "\\")}`
+        : `mkdir -p .agent/tmp && printf '%s\\n' '{"kind":"phase5.result_sync","status":"completed","agentId":"<result-sync-target-agent-id>","roomId":"<room-id>"}' > ${resultSyncFile}`;
+    const handoffRequestCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind task "@agent:<handoff-target-agent-id> phase5 handoff <handoff-id> from <handoff-source-agent-id>: accept and complete this cross-machine handoff" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind task '@agent:<handoff-target-agent-id> phase5 handoff <handoff-id> from <handoff-source-agent-id>: accept and complete this cross-machine handoff' --json`;
+    const handoffAcceptanceCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind decision "@agent:<handoff-source-agent-id> phase5 handoff <handoff-id> accepted by <handoff-target-agent-id>" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind decision '@agent:<handoff-source-agent-id> phase5 handoff <handoff-id> accepted by <handoff-target-agent-id>' --json`;
+    const handoffResultCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind decision "@agent:<handoff-source-agent-id> phase5 handoff <handoff-id> completed by <handoff-target-agent-id>" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind decision '@agent:<handoff-source-agent-id> phase5 handoff <handoff-id> completed by <handoff-target-agent-id>' --json`;
+    const keyRotationOldSayCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat "@agent:<owner-agent-id> phase5 key rotation old-key probe from <key-rotation-agent-id>; expected to fail after rotate-key" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat '@agent:<owner-agent-id> phase5 key rotation old-key probe from <key-rotation-agent-id>; expected to fail after rotate-key' --json`;
+    const keyRotationNewSayCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat "@agent:<owner-agent-id> phase5 key rotation new-key probe from <key-rotation-agent-id>" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat '@agent:<owner-agent-id> phase5 key rotation new-key probe from <key-rotation-agent-id>' --json`;
+    const revokedSayCommand = shell === "windows-cmd"
+      ? `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat "@agent:<owner-agent-id> revoked agent signed say probe; expected to fail after agents trust <revoked-agent-id> revoked" --json`
+      : `${cli} remote say --control-url <control-url> --control-token <control-token> --room <room-id> --kind chat '@agent:<owner-agent-id> revoked agent signed say probe; expected to fail after agents trust <revoked-agent-id> revoked' --json`;
+    const revokedHeartbeatCommand = `${cli} remote heartbeat --control-url <control-url> --control-token <control-token> --room <room-id> --status online --ttl 60 --json # expected to fail after agents trust <revoked-agent-id> revoked`;
+    const revokedAckRunCommand = shell === "windows-powershell" || shell === "windows-cmd"
+      ? `node dist\\cli\\index.js remote run --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 1 --limit 1 --idle-limit 0 --interval-ms 1000 --heartbeat-ttl 60 --json # expected to fail when acking the revoked ack probe`
+      : `node dist/cli/index.js remote run --control-url <control-url> --control-token <control-token> --room <room-id> --cycles 1 --limit 1 --idle-limit 0 --interval-ms 1000 --heartbeat-ttl 60 --json # expected to fail when acking the revoked ack probe`;
+    const install = shell === "termux"
+      ? ["pkg install -y nodejs git ripgrep", "git clone <soloclaw-repo-url> <agent-workspace>", enterWorkspace, "npm install", "npm run build"]
+      : ["git clone <soloclaw-repo-url> <agent-workspace>", enterWorkspace, "npm install", "npm run build"];
+    return [
+      ...install,
+      `${cli} setup --mock --json`,
+      "Copy <invite-bundle-file> from the control-plane host into <agent-workspace>.",
+      joinCommand,
+      `Copy <revoked-invite-bundle-file> from the control-plane host into <agent-workspace>; after revocation, this command is expected to fail: ${revokedJoinCommand}`,
+      `${cli} remote inbox --control-url <control-url> --control-token <control-token> --room <room-id> --limit 5 --json`,
+      `${cli} remote heartbeat --control-url <control-url> --control-token <control-token> --room <room-id> --status online --ttl 60 --json`,
+      `${cli} remote heartbeat --control-url <control-url> --control-token <control-token> --room <room-id> --status online --ttl 1 --json`,
+      servicePlanCommand,
+      `If this target is <registered-pull-target-id>, publish a registered identity and record <registered-pull-agent-id>: ${registeredPullRegisterCommand}`,
+      `If this target is <registered-pull-target-id>, after the control host runs room pull-agent, confirm the invitation is listed: ${registeredPullInvitationsCommand}`,
+      `If this target is <registered-pull-target-id>, accept the pulled room invitation before the control host sends <registered-pull-message-id>: ${registeredPullAcceptCommand}`,
+      `If this target is <registered-pull-target-id>, after the control host sends <registered-pull-message-id>, run the pulled agent and record messagesProcessed, ackSigned, replyMessageId, heartbeatStatus, and runStopReason under room.registeredAgentPull: ${registeredPullRunCommand}`,
+      `If this target is <registered-pull-target-id>, inspect the registered-pull runner status file: ${registeredPullStatusCommand}`,
+      peerSayCommand,
+      `If this target is <conflict-primary-agent-id> or <conflict-secondary-agent-id>, run this artifact conflict probe and record the message id: ${conflictSayCommand}`,
+      `If this target is <result-sync-target-agent-id>, run this result-file probe, then copy ${resultSyncFile} to the control workspace as <result-sync-artifact-file>: ${resultSyncWriteCommand}`,
+      `If this target is <handoff-source-agent-id>, run this handoff request and record <handoff-message-id>: ${handoffRequestCommand}`,
+      `If this target is <handoff-target-agent-id>, run this handoff acceptance and record <handoff-acceptance-message-id>: ${handoffAcceptanceCommand}`,
+      `If this target is <handoff-target-agent-id>, run this handoff completion and record <handoff-result-message-id>: ${handoffResultCommand}`,
+      "If this target is <key-rotation-agent-id>, record its current fingerprint as <key-rotation-previous-fingerprint>, prepare replacement key material for the same agent id, copy only the replacement public key to the control host as <key-rotation-public-key-file>, and record <key-rotation-rotated-fingerprint>.",
+      `If this target is <key-rotation-agent-id>, after the control host runs agents rotate-key and before switching this workspace to the replacement private key, run this old-key rejection probe: ${keyRotationOldSayCommand}`,
+      `If this target is <key-rotation-agent-id>, after switching this workspace to the replacement private key/public identity, run this new-key probe and record <key-rotation-new-message-id>: ${keyRotationNewSayCommand}`,
+      `If this target is <revoked-agent-id>, run these after the control host executes agents trust revoked: ${revokedSayCommand}`,
+      `If this target is <revoked-agent-id>, run this signed heartbeat rejection probe: ${revokedHeartbeatCommand}`,
+      `If this target is <revoked-agent-id>, run this signed ack rejection probe after the control host sends the revoked ack probe: ${revokedAckRunCommand}`,
+      cleanupStopFileCommand,
+      runCommand,
+      "Record run JSON bootstrapEvidence.inviteBundleKind, bootstrapEvidence.inviteSignatureStatus, bootstrapEvidence.joinedFromInviteBundle, and bootstrapEvidence.ranFromInviteBundle into the target evidence.",
+      statusCommand,
+      `After the control host sends <no-broadcast-fallback-message-id>, run this noBroadcastFallback inbox probe and record messages.length=0 under room.noBroadcastFallback.inboxCounts[<agent-id>]: ${noBroadcastFallbackInboxCommand}`,
+      `After the control host sends <no-broadcast-fallback-message-id>, run this noBroadcastFallback idle-run probe and record messagesProcessed=0 under room.noBroadcastFallback.runMessagesProcessed[<agent-id>]: ${noBroadcastFallbackRunCommand}`,
+      cleanupStopFileCommand,
+      `Start a stop-file shutdown smoke in terminal A: ${stopRunCommand}`,
+      `From terminal B after terminal A reports the runner is online: ${createStopFileCommand}`,
+      stopStatusCommand,
+      cleanupStopFileCommand,
+    ];
+  };
+
+  return {
+    generatedAt: new Date().toISOString(),
+    phase: "phase5",
+    placeholders: [
+      "<control-url>",
+      "<control-token>",
+      "<room-id>",
+      "<invite-bundle-file>",
+      "<revoked-invite-bundle-file>",
+      "<revoked-invite-id-from-bundle>",
+      "<revoked-agent-id>",
+      "<suspended-agent-id>",
+      "<stale-agent-id>",
+      "<stale-health-check-now-iso>",
+      "<key-rotation-agent-id>",
+      "<key-rotation-public-key-file>",
+      "<key-rotation-previous-fingerprint>",
+      "<key-rotation-rotated-fingerprint>",
+      "<key-rotation-new-message-id>",
+      "<owner-agent-id>",
+      "<remote-agent-id>",
+      "<peer-agent-id>",
+      "<peer-label>",
+      "<reply-target-agent-id>",
+      "<registered-pull-agent-id>",
+      "<registered-pull-target-id>",
+      "<registered-pull-message-id>",
+      "<registered-pull-reply-message-id>",
+      "<assignment-target-agent-id>",
+      "<subtask-id>",
+      "<child-session-id>",
+      "<room-assignment-message-id>",
+      "<room-result-message-id>",
+      "<conflict-result-key>",
+      "<conflict-primary-agent-id>",
+      "<conflict-secondary-agent-id>",
+      "<conflict-winning-agent-id>",
+      "<conflict-primary-message-id>",
+      "<conflict-secondary-message-id>",
+      "<conflict-resolution-message-id>",
+      "<result-sync-target-agent-id>",
+      "<result-sync-artifact-file>",
+      "<result-sync-artifact-id>",
+      "<result-sync-artifact-message-id>",
+      "<result-sync-artifact-sha256>",
+      "<result-sync-artifact-size-bytes>",
+      "<handoff-id>",
+      "<handoff-source-agent-id>",
+      "<handoff-target-agent-id>",
+      "<handoff-message-id>",
+      "<handoff-acceptance-message-id>",
+      "<handoff-result-message-id>",
+      "<no-broadcast-fallback-message-id>",
+      "<control-workspace>",
+      "<agent-workspace>",
+      "<agent-label>",
+      "<soloclaw-repo-url>",
+    ],
+    targets: [
+      {
+        id: "control-plane-host",
+        label: "Control plane host",
+        role: "control-plane",
+        notes: [
+          "Run the web command in a long-lived terminal after creating the room and invite.",
+          "Run rooms say, agents health, and rooms show from a second terminal in the same control workspace.",
+          "Use the room id, invite token, owner agent id, and remote agent ids printed by the preceding commands to fill placeholders.",
+          "Run the suspended-agent status/probe commands only after the selected <suspended-agent-id> has joined the room.",
+          "Run the stale health command after the selected <stale-agent-id> has sent the TTL=1 heartbeat; set <stale-health-check-now-iso> later than that heartbeat expiry.",
+          "Use one joined remote agent id for <key-rotation-agent-id>; rotate it after the remote has prepared a replacement public key, then record the old-key rejection, new-key message, and rotation audit under room.keyRotation.",
+          "Use one real remote machine for <registered-pull-target-id>; after that machine runs remote register, pull <registered-pull-agent-id> into the room and record invitation, acceptance, signed ack, and signed reply evidence under room.registeredAgentPull.",
+          "Use a joined remote agent id for <assignment-target-agent-id>; record the delegate output and the task/decision message ids from rooms show under room.assignmentResult.",
+          "Use two joined remote agent ids for <conflict-primary-agent-id> and <conflict-secondary-agent-id>; after both artifact probes are visible, record the resolution decision under room.conflictResolution.",
+          "Use one joined remote agent id for <result-sync-target-agent-id>; after copying its result file into the control workspace, register it with artifacts add --room and announce it with a room artifact message under room.resultSync.",
+          "Use two distinct joined remote agent ids for <handoff-source-agent-id> and <handoff-target-agent-id>; record the request, acceptance, and completion message ids from rooms show under room.handoff.",
+          "After routed runs complete, send the no-broadcast fallback probe as ordinary unmentioned chat; each remote target should record inbox and idle-run counts of zero under room.noBroadcastFallback.",
+        ],
+        commands: [
+          "git clone <soloclaw-repo-url> <control-workspace>",
+          "cd <control-workspace>",
+          "npm install",
+          "npm run build",
+          "node dist/cli/index.js setup --mock --json",
+          "node dist/cli/index.js rooms create --local-agent --join-policy invite_token --require-signed-invites --agent-response mentions_only --wide-mention-policy members \"phase5 cross-machine smoke\"",
+          "node dist/cli/index.js room invite-agent <room-id> --control-url <control-url> --control-token <control-token> --alias <agent-label> --display-name <agent-label> --ttl-hours 12 --max-uses 1 --json > <invite-bundle-file>",
+          "node dist/cli/index.js room invite-agent <room-id> --control-url <control-url> --control-token <control-token> --alias revoked-probe --display-name revoked-probe --ttl-hours 1 --max-uses 1 --json > <revoked-invite-bundle-file>",
+          "node dist/cli/index.js rooms revoke-invite <room-id> <revoked-invite-id-from-bundle> --local-agent --json",
+          "node dist/cli/index.js web --host 0.0.0.0 --port 4317 --token <control-token>",
+          "curl -N -H \"x-agent-control-token: <control-token>\" \"<control-url>/api/events?room=<room-id>\" # expect room-scoped control_plane.action events after remote heartbeat/run/recover-stale",
+          "curl -N -H \"x-agent-control-token: <control-token>\" \"<control-url>/api/events?room=<room-id>&type=room.message.sent\" # record only message ids/kinds/body lengths from safe room message events, not raw message bodies",
+          "curl -N -H \"x-agent-control-token: <control-token>\" \"<control-url>/api/events?room=<room-id>&type=room.delivery.acknowledged\" # record only acknowledged message ids and agent ids under eventStreamAckMessageIds; include every deliveryStatusAckMessageIds value, not signed ack envelopes",
+          "curl -H \"x-agent-control-token: <control-token>\" \"<control-url>/api/rooms/<room-id>/delivery-status\" # record deliveryStatusAgentIds, deliveryStatusPendingCounts, and deliveryStatusAckMessageIds only",
+          "node dist/cli/index.js agents trust <revoked-agent-id> revoked --reason \"phase5 revoked agent smoke\" --local-agent --json # then verify old signed say/ack/heartbeat attempts from that agent are rejected",
+          "node dist/cli/index.js rooms say <room-id> \"@agent:<revoked-agent-id> phase5 revoked ack probe: old signed ack should fail\"",
+          "node dist/cli/index.js agents rotate-key <key-rotation-agent-id> --public-key-file <key-rotation-public-key-file> --reason \"phase5 key rotation smoke\" --local-agent --json # record previousFingerprint and agent.fingerprint under room.keyRotation",
+          "node dist/cli/index.js audit list --type control_plane.action --room <room-id> # expect Rotated agent identity key from control plane",
+          "node dist/cli/index.js room pull-agent <room-id> <registered-pull-agent-id> --alias registered-pull --role executor --local-agent --json # after <registered-pull-target-id> runs remote register; record role/aliases under room.registeredAgentPull",
+          "node dist/cli/index.js rooms status <room-id> <suspended-agent-id> suspended --local-agent --json",
+          "node dist/cli/index.js rooms say <room-id> \"@agent:<suspended-agent-id> phase5 suspended probe: should not wake\"",
+          "node dist/cli/index.js agents health --now <stale-health-check-now-iso> --json # expect <stale-agent-id> healthState=stale",
+          "node dist/cli/index.js agents recover-stale --now <stale-health-check-now-iso> --local-agent --json # expect <stale-agent-id> recovered, member=suspended, heartbeat=offline",
+          "node dist/cli/index.js rooms say <room-id> \"@agent:<remote-agent-id> phase5 cross-machine smoke: reply when ready\"",
+          "node dist/cli/index.js rooms say <room-id> \"@agent:<registered-pull-agent-id> phase5 registered-agent pull smoke: reply when accepted\" # record <registered-pull-message-id>",
+          "node dist/cli/index.js rooms say <room-id> --kind chat \"phase5 no-broadcast fallback probe: ordinary transcript-only message without agent mention\" # record <no-broadcast-fallback-message-id> under room.noBroadcastFallback.messageId and control-plane-host.evidence.eventStreamRoomMessageIds",
+          "curl -H \"x-agent-control-token: <control-token>\" \"<control-url>/api/rooms/<room-id>/delivery-status\" # after <no-broadcast-fallback-message-id>, record noBroadcastFallback.deliveryStatusPendingCounts for every remote agent id; all values should be 0",
+          "node dist/cli/index.js delegate --room <room-id> --assigned-agent <assignment-target-agent-id> \"phase5 room assignment/result evidence smoke\" # record subtaskId and childSessionId",
+          "node dist/cli/index.js rooms say <room-id> --kind decision \"phase5 conflict resolution for <conflict-result-key>: choose <conflict-winning-agent-id> after reviewing <conflict-primary-message-id> and <conflict-secondary-message-id>\" # record <conflict-resolution-message-id>",
+          "Copy <result-sync-artifact-file> from the selected remote workspace into <control-workspace>, then compute and record sha256=<result-sync-artifact-sha256> and size=<result-sync-artifact-size-bytes>.",
+          "node dist/cli/index.js artifacts add <result-sync-artifact-file> --kind report --name phase5-result-sync.json --room <room-id> # record <result-sync-artifact-id> and active status under room.resultSync",
+          "node dist/cli/index.js rooms say <room-id> --kind artifact \"phase5 result sync artifact <result-sync-artifact-id> from <result-sync-target-agent-id> sha256 <result-sync-artifact-sha256>\" # record <result-sync-artifact-message-id>",
+          "node dist/cli/index.js agents health --json",
+          "node dist/cli/index.js rooms show <room-id> # record task/result, conflict artifact, conflict resolution, result-sync artifact, and handoff message ids",
+        ],
+      },
+      {
+        id: "windows-powershell-agent",
+        label: "Windows PowerShell remote agent",
+        role: "remote-agent",
+        notes: [
+          "For owner-routed smoke, set <reply-target-agent-id> to <owner-agent-id>.",
+          "Create .agent/tmp/phase5-remote-room.stop from another terminal to request a graceful shutdown; remove it before collecting normal idle-stop evidence.",
+          "For peer exchange, run remote say from the chosen sender with <peer-agent-id> set to the receiver, then run remote run on the receiver with <reply-target-agent-id> set to the sender.",
+        ],
+        commands: remoteSmoke("windows-powershell"),
+      },
+      {
+        id: "windows-cmd-agent",
+        label: "Windows CMD remote agent",
+        role: "remote-agent",
+        notes: [
+          "For owner-routed smoke, set <reply-target-agent-id> to <owner-agent-id>.",
+          "Create .agent/tmp/phase5-remote-room.stop from another terminal to request a graceful shutdown; remove it before collecting normal idle-stop evidence.",
+          "For peer exchange, run remote say from the chosen sender with <peer-agent-id> set to the receiver, then run remote run on the receiver with <reply-target-agent-id> set to the sender.",
+        ],
+        commands: remoteSmoke("windows-cmd"),
+      },
+      {
+        id: "linux-shell-agent",
+        label: "Linux shell remote agent",
+        role: "remote-agent",
+        notes: [
+          "For owner-routed smoke, set <reply-target-agent-id> to <owner-agent-id>.",
+          "Create .agent/tmp/phase5-remote-room.stop from another terminal to request a graceful shutdown; remove it before collecting normal idle-stop evidence.",
+          "For peer exchange, run remote say from the chosen sender with <peer-agent-id> set to the receiver, then run remote run on the receiver with <reply-target-agent-id> set to the sender.",
+        ],
+        commands: remoteSmoke("posix"),
+      },
+      {
+        id: "macos-shell-agent",
+        label: "macOS shell remote agent",
+        role: "remote-agent",
+        notes: [
+          "For owner-routed smoke, set <reply-target-agent-id> to <owner-agent-id>.",
+          "Create .agent/tmp/phase5-remote-room.stop from another terminal to request a graceful shutdown; remove it before collecting normal idle-stop evidence.",
+          "For peer exchange, run remote say from the chosen sender with <peer-agent-id> set to the receiver, then run remote run on the receiver with <reply-target-agent-id> set to the sender.",
+        ],
+        commands: remoteSmoke("posix"),
+      },
+      {
+        id: "android-termux-agent",
+        label: "Android Termux remote agent",
+        role: "remote-agent",
+        notes: [
+          "For owner-routed smoke, set <reply-target-agent-id> to <owner-agent-id>.",
+          "Create .agent/tmp/phase5-remote-room.stop from another terminal to request a graceful shutdown; remove it before collecting normal idle-stop evidence.",
+          "For peer exchange, run remote say from the chosen sender with <peer-agent-id> set to the receiver, then run remote run on the receiver with <reply-target-agent-id> set to the sender.",
+        ],
+        commands: remoteSmoke("termux"),
+      },
+    ],
+  };
+}
+
+function parsePhaseFiveMatrixTargetOption(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--target") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --target.");
+      }
+      return value;
+    }
+    if (arg.startsWith("--target=")) {
+      const value = arg.slice("--target=".length);
+      if (!value) {
+        throw new Error("Missing value for --target.");
+      }
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function parsePhaseFiveRegisteredPullTargetOption(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--registered-pull-target") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("Missing value for --registered-pull-target.");
+      }
+      return value;
+    }
+    if (arg.startsWith("--registered-pull-target=")) {
+      const value = arg.slice("--registered-pull-target=".length);
+      if (!value) {
+        throw new Error("Missing value for --registered-pull-target.");
+      }
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function resolvePhaseFiveRegisteredPullTargetId(targetId: string | undefined, plan: PhaseFiveEvidencePlan): string | undefined {
+  if (!targetId) {
+    return undefined;
+  }
+  const target = plan.targets.find((entry) => entry.id === targetId);
+  if (!target) {
+    throw new Error(`Unknown Phase 5 registered-agent pull target: ${targetId}. Expected one of: ${plan.targets.filter((entry) => entry.role === "remote-agent").map((entry) => entry.id).join(", ")}`);
+  }
+  if (target.role !== "remote-agent") {
+    throw new Error(`Phase 5 registered-agent pull target must be a remote-agent target, got ${targetId}.`);
+  }
+  return target.id;
+}
+
+function filterPhaseFiveMatrixTemplate(matrix: ReturnType<typeof buildPhaseFiveMatrixTemplate>, targetId: string | undefined): ReturnType<typeof buildPhaseFiveMatrixTemplate> {
+  if (!targetId) {
+    return matrix;
+  }
+  const targets = matrix.targets.filter((target) => target.id === targetId);
+  if (targets.length === 0) {
+    throw new Error(`Unknown Phase 5 matrix target: ${targetId}. Expected one of: ${matrix.targets.map((target) => target.id).join(", ")}`);
+  }
+  return {
+    ...matrix,
+    targets,
+  };
+}
+
+function formatPhaseFiveMatrixTemplate(matrix: ReturnType<typeof buildPhaseFiveMatrixTemplate>): string {
+  const lines = [
+    "Phase 5 cross-machine room smoke matrix",
+    "",
+    `Placeholders: ${matrix.placeholders.join(", ")}`,
+  ];
+  for (const target of matrix.targets) {
+    lines.push("", `[${target.id}] ${target.label}`, `Role: ${target.role}`, "Commands:");
+    if (target.notes) {
+      lines.push(...target.notes.map((note) => `Note: ${note}`));
+    }
+    lines.push(...target.commands.map((command) => `- ${command}`));
+  }
+  return lines.join("\n");
+}
+
+function parseWorkspaceRuntimeFromArgs(args: string[], fallback: WorkspaceRuntimeMode): WorkspaceRuntimeMode {
+  const index = args.indexOf("--workspace-runtime");
+  if (index >= 0 && args[index + 1]) {
+    return parseWorkspaceRuntimeMode(args[index + 1], fallback);
+  }
+  const equals = args.find((arg) => arg.startsWith("--workspace-runtime="));
+  if (equals) {
+    return parseWorkspaceRuntimeMode(equals.slice("--workspace-runtime=".length), fallback);
+  }
+  return parseWorkspaceRuntimeMode(process.env.SOLOCLAW_WORKSPACE_RUNTIME, fallback);
+}
+
 type PhaseThreeGateCheck = {
   id: "C4" | "C5" | "C6" | "secret-hygiene";
   label: string;
@@ -7507,6 +18916,71 @@ type PhaseThreeGateResult = {
   secretMatches: number;
 };
 
+type PhaseThreeLongTaskGateCheckId = "L1" | "L2" | "L3" | "L4" | "L5" | "L6" | "L7";
+
+type PhaseThreeLongTaskGateCheck = {
+  id: PhaseThreeLongTaskGateCheckId;
+  label: string;
+  status: "pass" | "fail";
+  summary: string;
+  sessionId?: string;
+  targetMode?: string;
+  toolTurns?: number;
+  modelCalls?: number;
+  runtimeStops?: number;
+  stopKind?: string;
+  continuations?: number;
+  guardrail?: string;
+  workerAssignmentStatus?: string;
+  visibleRows?: number;
+};
+
+type PhaseThreeLongTaskGateResult = {
+  phase: "phase3";
+  gate: "long-task";
+  status: "pass" | "fail";
+  workspace: string;
+  generatedAt: string;
+  checks: PhaseThreeLongTaskGateCheck[];
+  secretMatches: number;
+};
+
+type PhaseThreeRealProviderCheckId = "R0" | "R1" | "R2" | "R3" | "R4";
+
+type PhaseThreeRealProviderCheck = {
+  id: PhaseThreeRealProviderCheckId;
+  label: string;
+  status: "pass" | "fail" | "blocked";
+  summary: string;
+  sessionId?: string;
+  targetMode?: string;
+  eventCount?: number;
+  toolEventCount?: number;
+  verificationStatus?: "pass" | "fail";
+  finalAnswerChars?: number;
+  changedPaths?: string[];
+  runtimeStops?: number;
+  continuations?: number;
+  cleanup?: {
+    path?: string;
+    removed?: boolean;
+    markerPresentAfterCleanup?: boolean;
+  };
+};
+
+type PhaseThreeRealProviderResult = {
+  phase: "phase3";
+  gate: "long-task-real-provider";
+  status: "pass" | "fail" | "blocked";
+  workspace: string;
+  generatedAt: string;
+  provider: string;
+  model: string;
+  readinessStatus: string;
+  checks: PhaseThreeRealProviderCheck[];
+  secretMatches: number;
+};
+
 type PhaseThreeArgs = {
   workspace: string;
   json: boolean;
@@ -7516,6 +18990,42 @@ async function handlePhaseThreeCommand(args: string[], cwd: string): Promise<voi
   const subcommand = args[0] ?? "checklist";
   if (subcommand === "checklist") {
     console.log(formatPhaseThreeChecklist());
+    return;
+  }
+  if (subcommand === "long-task-gate") {
+    try {
+      const options = parsePhaseThreeArgs(args.slice(1), cwd);
+      const result = await runPhaseThreeLongTaskGate(options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseThreeLongTaskGate(result));
+      }
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "long-task-real-provider") {
+    try {
+      const options = parsePhaseThreeArgs(args.slice(1), cwd);
+      const result = await runPhaseThreeRealProviderLongTask(options);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(formatPhaseThreeRealProviderLongTask(result));
+      }
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
     return;
   }
   if (subcommand === "smoke" || subcommand === "gate") {
@@ -7536,7 +19046,7 @@ async function handlePhaseThreeCommand(args: string[], cwd: string): Promise<voi
     }
     return;
   }
-  console.error("Usage: soloclaw phase3 checklist|smoke|gate [--workspace path] [--json]");
+  console.error("Usage: soloclaw phase3 checklist|smoke|gate|long-task-gate|long-task-real-provider [--workspace path] [--json]");
   process.exitCode = 1;
 }
 
@@ -7544,12 +19054,14 @@ function formatPhaseThreeChecklist(): string {
   return [
     "Phase 3 runtime reliability checklist",
     "",
-    "C4 real project build: complete a small Build-mode project change with file-change and verification evidence.",
+    "C4 real project build: complete a small Build-mode project change against a workspace readable file (index.html preferred) with file-change and verification evidence.",
     "C5 stop/resume: prove a Goal-mode step-budget stop records resume guidance and resumes the same session.",
     "C6 recovery: prove a failed command or tool result is followed by successful verification.",
     "",
     "Commands:",
     "  soloclaw phase3 gate --workspace E:\\code\\tafang --json",
+    "  soloclaw phase3 long-task-gate --workspace E:\\code\\agent --json",
+    "  soloclaw phase3 long-task-real-provider --workspace E:\\code\\tafang --json",
     "  soloclaw phase3 smoke --workspace E:\\code\\tafang",
     "  agent session report <session-id> --json",
     "  agent session verify <session-id> --require-model-call",
@@ -7580,9 +19092,10 @@ function parsePhaseThreeArgs(args: string[], cwd: string): PhaseThreeArgs {
 
 async function runPhaseThreeGate(options: PhaseThreeArgs): Promise<PhaseThreeGateResult> {
   const secretMatches = 0;
-  const c4 = await runPhaseThreeBuildSmoke(options.workspace);
-  const c5 = await runPhaseThreeGoalResumeSmoke(options.workspace);
-  const c6 = await runPhaseThreeRecoverySmoke(options.workspace);
+  const targetPath = await phaseThreeGateTargetFile(options.workspace);
+  const c4 = await runPhaseThreeBuildSmoke(options.workspace, targetPath);
+  const c5 = await runPhaseThreeGoalResumeSmoke(options.workspace, targetPath);
+  const c6 = await runPhaseThreeRecoverySmoke(options.workspace, targetPath);
   const checks: PhaseThreeGateCheck[] = [
     c4,
     c5,
@@ -7604,10 +19117,905 @@ async function runPhaseThreeGate(options: PhaseThreeArgs): Promise<PhaseThreeGat
   };
 }
 
+async function runPhaseThreeLongTaskGate(options: PhaseThreeArgs): Promise<PhaseThreeLongTaskGateResult> {
+  const checks: PhaseThreeLongTaskGateCheck[] = [
+    await runPhaseThreeLongTaskManyStepSmoke({
+      workspace: options.workspace,
+      id: "L1",
+      label: "Build no low default step cap",
+      targetMode: "build",
+      toolTurns: 35,
+      final: "L1 build completed after more than thirty tool turns.",
+    }),
+    await runPhaseThreeLongTaskManyStepSmoke({
+      workspace: options.workspace,
+      id: "L2",
+      label: "Goal no low default step cap",
+      targetMode: "goal",
+      toolTurns: 85,
+      final: "L2 goal completed after more than eighty tool turns.",
+    }),
+    await runPhaseThreeLongTaskSupervisorSmoke(),
+    await runPhaseThreeLongTaskDoomLoopSmoke(options.workspace),
+    await runPhaseThreeLongTaskWorkerSmoke(),
+    runPhaseThreeLongTaskTuiSmoke(options.workspace),
+  ];
+  const secretMatches = countSecretShapes({ phase: "phase3", gate: "long-task", checks });
+  checks.push({
+    id: "L7",
+    label: "secret-shape scan",
+    status: secretMatches === 0 ? "pass" : "fail",
+    summary: `secretMatches=${secretMatches}`,
+  });
+  return {
+    phase: "phase3",
+    gate: "long-task",
+    status: checks.every((check) => check.status === "pass") ? "pass" : "fail",
+    workspace: options.workspace,
+    generatedAt: new Date().toISOString(),
+    checks,
+    secretMatches,
+  };
+}
+
+async function runPhaseThreeLongTaskManyStepSmoke(input: {
+  workspace: string;
+  id: "L1" | "L2";
+  label: string;
+  targetMode: "build" | "goal";
+  toolTurns: number;
+  final: string;
+}): Promise<PhaseThreeLongTaskGateCheck> {
+  const platform = await createLocalPlatform(input.workspace, { provider: "mock" });
+  const actor = localUserActor();
+  const model = new PhaseThreeManyStepModel(input.toolTurns, input.final);
+  try {
+    const agent = new AgentLoop({
+      model,
+      tools: [phaseThreeLongTaskProgressTool()],
+      systemPrompt: `Soloclaw Phase 3 ${input.id} long-task smoke.`,
+      modelAudit: {
+        provider: "mock",
+        model: `phase3-${input.id.toLowerCase()}-long-task-smoke`,
+        fallbackProviders: [],
+      },
+      store: platform.store,
+      actor,
+      targetMode: input.targetMode,
+    });
+    const result = await agent.runWithSession(`Phase 3 ${input.id}: complete a deterministic long ${input.targetMode} run.`);
+    const sessionId = result.session?.id;
+    const goal = sessionId && input.targetMode === "goal" ? await platform.store.getGoalRunBySession(sessionId) : undefined;
+    const report = sessionId ? await buildSessionReportView(platform.store, sessionId) : undefined;
+    const passed =
+      Boolean(sessionId) &&
+      result.finalAnswer.includes(input.final) &&
+      model.calls === input.toolTurns + 1 &&
+      report?.summary.runtimeStops === 0 &&
+      (input.targetMode !== "goal" || goal?.status === "complete");
+    return {
+      id: input.id,
+      label: input.label,
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${sessionId ?? "-"}, toolTurns=${input.toolTurns}, modelCalls=${model.calls}, ` +
+        `runtimeStops=${report?.summary.runtimeStops ?? 0}, goal=${goal?.status ?? "-"}`,
+      sessionId,
+      targetMode: input.targetMode,
+      toolTurns: input.toolTurns,
+      modelCalls: model.calls,
+      runtimeStops: report?.summary.runtimeStops ?? 0,
+    };
+  } catch (error) {
+    return {
+      id: input.id,
+      label: input.label,
+      status: "fail",
+      summary: error instanceof Error ? error.message : String(error),
+      targetMode: input.targetMode,
+      toolTurns: input.toolTurns,
+      modelCalls: model.calls,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runPhaseThreeLongTaskSupervisorSmoke(): Promise<PhaseThreeLongTaskGateCheck> {
+  const store = new MemoryAgentStore();
+  const actor = { type: "user" as const, id: "phase3-long-task-supervisor", displayName: "Phase 3 Long Task Supervisor" };
+  const model = new PhaseThreeManyStepModel(6, "L3 goal complete after supervised continuations.");
+  const createAgent = () =>
+    new AgentLoop({
+      model,
+      tools: [phaseThreeLongTaskProgressTool()],
+      systemPrompt: "Soloclaw Phase 3 L3 supervised continuation smoke.",
+      modelAudit: {
+        provider: "mock",
+        model: "phase3-l3-supervisor-smoke",
+        fallbackProviders: [],
+      },
+      store,
+      actor,
+      targetMode: "goal",
+      maxSteps: 3,
+    });
+  const supervisor = new AgentRunSupervisor({ store, createAgent });
+  try {
+    const result = await supervisor.run({
+      objective: "Phase 3 L3: continue across explicit step-budget chunks.",
+      autoContinue: true,
+      maxContinuations: 5,
+    });
+    const report = result.sessionId ? await buildSessionReportView(store, result.sessionId) : undefined;
+    const passed =
+      result.status === "complete" &&
+      result.continuations === 2 &&
+      model.calls === 7 &&
+      (report?.summary.runtimeStops ?? 0) >= 2;
+    return {
+      id: "L3",
+      label: "supervisor auto-continuation",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${result.sessionId ?? "-"}, status=${result.status}, continuations=${result.continuations}, ` +
+        `runtimeStops=${report?.summary.runtimeStops ?? 0}, modelCalls=${model.calls}`,
+      sessionId: result.sessionId,
+      targetMode: "goal",
+      continuations: result.continuations,
+      runtimeStops: report?.summary.runtimeStops ?? 0,
+      modelCalls: model.calls,
+    };
+  } catch (error) {
+    return {
+      id: "L3",
+      label: "supervisor auto-continuation",
+      status: "fail",
+      summary: error instanceof Error ? error.message : String(error),
+      targetMode: "goal",
+      modelCalls: model.calls,
+    };
+  }
+}
+
+async function runPhaseThreeLongTaskDoomLoopSmoke(workspace: string): Promise<PhaseThreeLongTaskGateCheck> {
+  const platform = await createLocalPlatform(workspace, { provider: "mock" });
+  const actor = localUserActor();
+  const events: AgentLoopProgressEvent[] = [];
+  const model = new PhaseThreeRepeatingToolModel(5);
+  try {
+    const agent = new AgentLoop({
+      model,
+      tools: [phaseThreeLongTaskProgressTool()],
+      systemPrompt: "Soloclaw Phase 3 L4 doom-loop guardrail smoke.",
+      modelAudit: {
+        provider: "mock",
+        model: "phase3-l4-doom-loop-smoke",
+        fallbackProviders: [],
+      },
+      store: platform.store,
+      actor,
+      targetMode: "build",
+      onProgress: (event) => {
+        events.push(event);
+      },
+    });
+    const result = await agent.runWithSession("Phase 3 L4: prove repeated identical tool calls are stopped.");
+    const sessionId = result.session?.id;
+    const report = sessionId ? await buildSessionReportView(platform.store, sessionId) : undefined;
+    const guardrail = events.find((event) => event.type === "guardrail_tripped");
+    const passed =
+      Boolean(sessionId) &&
+      Boolean(guardrail) &&
+      result.finalAnswer.toLowerCase().includes("repeated identical tool call") &&
+      model.calls === 3 &&
+      report?.summary.lastRuntimeStopKind === "doom_loop";
+    return {
+      id: "L4",
+      label: "doom-loop guardrail",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${sessionId ?? "-"}, guardrail=${guardrail?.type ?? "-"}, stopKind=${report?.summary.lastRuntimeStopKind ?? "-"}, ` +
+        `modelCalls=${model.calls}`,
+      sessionId,
+      targetMode: "build",
+      guardrail: guardrail?.type,
+      stopKind: report?.summary.lastRuntimeStopKind,
+      runtimeStops: report?.summary.runtimeStops ?? 0,
+      modelCalls: model.calls,
+    };
+  } catch (error) {
+    return {
+      id: "L4",
+      label: "doom-loop guardrail",
+      status: "fail",
+      summary: error instanceof Error ? error.message : String(error),
+      targetMode: "build",
+      modelCalls: model.calls,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runPhaseThreeLongTaskWorkerSmoke(): Promise<PhaseThreeLongTaskGateCheck> {
+  const store = new MemoryAgentStore();
+  const workers = new WorkerRegistryService(store);
+  const assignments = new TaskAssignmentService(store);
+  const actor = { type: "agent" as const, id: "phase3-long-task-worker", displayName: "Phase 3 Long Task Worker" };
+  try {
+    const session = await store.createSession({
+      objective: "Phase 3 L5: keep resumable goal work assigned.",
+      status: "created",
+      targetMode: "goal",
+      risk: "medium",
+      projectId: "project-local",
+      createdBy: actor,
+    });
+    const worker = await workers.register({
+      actor,
+      agentId: actor.id,
+      machineId: "machine-local",
+      allowedProjects: ["project-local"],
+      ttlSeconds: 60,
+    });
+    const assigned = await assignments.assign({ actor, workerId: worker.id, sessionId: session.id, leaseTtlSeconds: 60 });
+    const runner = new LocalWorkerRunner({
+      store,
+      workers,
+      assignments,
+      createAgent: () =>
+        ({
+          resume: async (sessionId: string) => {
+            await store.updateSessionStatus(sessionId, "failed");
+            await store.recordAuditEvent({
+              id: makeId<"ArtifactId">("audit"),
+              type: "agent.event",
+              actor,
+              sessionId,
+              summary: "agent.event.runtime_stopped",
+              metadata: {
+                eventType: "runtime_stopped",
+                stopKind: "step_budget",
+                targetMode: "goal",
+                reason: "The run reached the configured step budget.",
+                resumeCommand: `agent resume ${sessionId}`,
+              },
+              artifactRefs: [],
+              createdAt: new Date().toISOString(),
+            });
+            return `Stopped after 3 steps without a final answer.\nsession: ${sessionId}\nresume: agent resume ${sessionId}`;
+          },
+        }) as unknown as AgentLoop,
+    });
+    const result = await runner.runOnce({ workerId: worker.id, leaseTtlSeconds: 60, actor });
+    const assignment = await assignments.get(assigned.id);
+    const workerAfter = await store.getWorkerRegistration(worker.id);
+    const passed = result.ran && !result.completed && assignment?.status === "running" && workerAfter?.currentLoad === 1;
+    return {
+      id: "L5",
+      label: "worker continuation preserves resumable goal",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${session.id}, ran=${result.ran}, completed=${result.ran ? result.completed : "-"}, ` +
+        `assignment=${assignment?.status ?? "-"}, workerLoad=${workerAfter?.currentLoad ?? "-"}`,
+      sessionId: session.id,
+      targetMode: "goal",
+      workerAssignmentStatus: assignment?.status,
+    };
+  } catch (error) {
+    return {
+      id: "L5",
+      label: "worker continuation preserves resumable goal",
+      status: "fail",
+      summary: error instanceof Error ? error.message : String(error),
+      targetMode: "goal",
+    };
+  }
+}
+
+function runPhaseThreeLongTaskTuiSmoke(workspace: string): PhaseThreeLongTaskGateCheck {
+  const state: RichTuiState = {
+    workspace,
+    provider: "mock",
+    model: "mock",
+    readiness: "pass",
+    mode: "Goal",
+    input: "",
+    messages: [{ role: "user", text: "Finish this long task" }],
+    events: [],
+    runHealth: "Working",
+    activeSessionId: "sess_phase3_l6",
+    goal: {
+      id: "goal_phase3_l6",
+      status: "active",
+      objective: "Finish this long task",
+      summary: "working",
+      checkpoints: 2,
+      repeatedBlockers: 0,
+      modelCalls: 4,
+      tokenUsed: 1200,
+    },
+    runBudget: {
+      steps: 12,
+      modelCalls: 4,
+      elapsedMs: 1250,
+      maxModelCalls: 20,
+    },
+    todos: [
+      { content: "Inspect long-task state", status: "completed", priority: "high" },
+      { content: "Continue supervised goal", status: "in_progress", priority: "high" },
+      { content: "Run verification gate", status: "pending", priority: "medium" },
+    ],
+  };
+  const screen = renderConversationScreen(state, { columns: 140, rows: 32 });
+  const requiredRows = [
+    /Goal: active/,
+    /Progress: 2 checkpoints/,
+    /Budget: 4 model calls/,
+    /Todos: 1 active, 1 pending, 1 done/,
+    /TODO\s+active Continue supervised goal/,
+    /Next: \/pause \/cancel \/background/,
+  ];
+  const commandsPresent = ["/pause", "/cancel", "/background", "/goal status"].every((command) =>
+    TUI_COMMANDS.some((entry) => entry.command === command),
+  );
+  const visibleRows = requiredRows.filter((pattern) => pattern.test(screen)).length;
+  const passed = commandsPresent && visibleRows === requiredRows.length;
+  return {
+    id: "L6",
+    label: "rich TUI long-task rows",
+    status: passed ? "pass" : "fail",
+    summary: `commandsPresent=${commandsPresent}, visibleRows=${visibleRows}/${requiredRows.length}`,
+    targetMode: "goal",
+    visibleRows,
+  };
+}
+
+class PhaseThreeManyStepModel implements ModelClient {
+  calls = 0;
+
+  constructor(
+    private readonly toolTurns: number,
+    private readonly final: string,
+  ) {}
+
+  async complete() {
+    this.calls += 1;
+    if (this.calls <= this.toolTurns) {
+      return {
+        type: "tool_calls" as const,
+        content: `Long-task progress turn ${this.calls}.`,
+        toolCalls: [
+          {
+            id: `phase3-long-task-${this.calls}`,
+            name: "phase3_long_task_progress",
+            input: { turn: this.calls },
+          },
+        ],
+      };
+    }
+    return { type: "message" as const, content: this.final };
+  }
+}
+
+class PhaseThreeRepeatingToolModel implements ModelClient {
+  calls = 0;
+
+  constructor(private readonly requestedTurns: number) {}
+
+  async complete() {
+    this.calls += 1;
+    if (this.calls <= this.requestedTurns) {
+      return {
+        type: "tool_calls" as const,
+        content: `Repeated tool turn ${this.calls}.`,
+        toolCalls: [
+          {
+            id: `phase3-doom-loop-${this.calls}`,
+            name: "phase3_long_task_progress",
+            input: { repeated: true },
+          },
+        ],
+      };
+    }
+    return { type: "message" as const, content: "This should not be reached when the guardrail works." };
+  }
+}
+
+function phaseThreeLongTaskProgressTool(): RegisteredTool {
+  return {
+    name: "phase3_long_task_progress",
+    description: "Records deterministic Phase 3 long-task progress.",
+    inputSchema: { type: "object", additionalProperties: true },
+    handler: async (input) => ({
+      callId: String(input.__toolCallId ?? "phase3_long_task_progress"),
+      ok: true,
+      output: `progress=${String(input.turn ?? input.repeated ?? "ok")}`,
+    }),
+  };
+}
+
+function countSecretShapes(value: unknown): number {
+  const text = JSON.stringify(value);
+  return (
+    text.match(/\bsk-[A-Za-z0-9_-]{12,}\b|Authorization:\s*Bearer\s+\S+|AGENT_SECRETS_PASSPHRASE\s*=/gi)?.length ?? 0
+  );
+}
+
+async function runPhaseThreeRealProviderLongTask(options: PhaseThreeArgs): Promise<PhaseThreeRealProviderResult> {
+  const readiness = await buildPhaseTwoRealProviderReadiness(options.workspace);
+  const checks: PhaseThreeRealProviderCheck[] = [
+    {
+      id: "R0",
+      label: "real-provider readiness",
+      status: readiness.status === "ready_for_manual_run" ? "pass" : "blocked",
+      summary: `status=${readiness.status}, provider=${readiness.activeProvider}, model=${readiness.model}`,
+    },
+  ];
+  if (readiness.status !== "ready_for_manual_run") {
+    const secretMatches = await countSecretShapesInAgentTextFiles(options.workspace);
+    checks.push({
+      id: "R4",
+      label: "agent secret scan",
+      status: secretMatches === 0 ? "pass" : "fail",
+      summary: `secretMatches=${secretMatches}`,
+    });
+    return {
+      phase: "phase3",
+      gate: "long-task-real-provider",
+      status: "blocked",
+      workspace: options.workspace,
+      generatedAt: new Date().toISOString(),
+      provider: readiness.activeProvider,
+      model: readiness.model,
+      readinessStatus: readiness.status,
+      checks,
+      secretMatches,
+    };
+  }
+
+  checks.push(await runPhaseThreeRealProviderReadOnlyGoal(options.workspace, readiness));
+  checks.push(await runPhaseThreeRealProviderBuildCleanup(options.workspace, readiness));
+  checks.push(await runPhaseThreeRealProviderSupervisedGoal(options.workspace, readiness));
+  const secretMatches = await countSecretShapesInAgentTextFiles(options.workspace);
+  checks.push({
+    id: "R4",
+    label: "agent secret scan",
+    status: secretMatches === 0 ? "pass" : "fail",
+    summary: `secretMatches=${secretMatches}`,
+  });
+  return {
+    phase: "phase3",
+    gate: "long-task-real-provider",
+    status: checks.some((check) => check.status === "blocked")
+      ? "blocked"
+      : checks.every((check) => check.status === "pass")
+        ? "pass"
+        : "fail",
+    workspace: options.workspace,
+    generatedAt: new Date().toISOString(),
+    provider: readiness.activeProvider,
+    model: readiness.model,
+    readinessStatus: readiness.status,
+    checks,
+    secretMatches,
+  };
+}
+
+async function runPhaseThreeRealProviderReadOnlyGoal(
+  workspace: string,
+  readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>,
+): Promise<PhaseThreeRealProviderCheck> {
+  const files = await phaseThreeExistingReadableFiles(workspace, 4);
+  const counter = createPhaseThreeRealProviderEventCounter();
+  const platform = await createLocalPlatform(workspace, {
+    ...phaseThreeRealProviderOptions(readiness),
+    targetMode: "goal",
+    modelMaxCalls: 40,
+    onAgentProgress: counter.onEvent,
+  });
+  try {
+    const result = await platform.agent.runWithSession(formatPhaseThreeReadOnlyGoalPrompt(workspace, files));
+    const evidence = await phaseThreeRealProviderSessionEvidence(platform.store, result.session?.id, {
+      requireModelCall: true,
+      requireCommand: false,
+    });
+    const passed =
+      evidence.verificationStatus === "pass" &&
+      counter.toolEventCount >= 8 &&
+      (evidence.changedPaths?.length ?? 0) === 0 &&
+      (evidence.finalAnswerChars ?? 0) > 0;
+    return {
+      id: "R1",
+      label: "read-only Goal with tool progress",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${evidence.sessionId ?? "-"}, verification=${evidence.verificationStatus ?? "-"}, ` +
+        `toolEvents=${counter.toolEventCount}, changedPaths=${evidence.changedPaths?.length ?? 0}`,
+      sessionId: evidence.sessionId,
+      targetMode: "goal",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+      verificationStatus: evidence.verificationStatus,
+      finalAnswerChars: evidence.finalAnswerChars,
+      changedPaths: evidence.changedPaths,
+    };
+  } catch (error) {
+    return {
+      id: "R1",
+      label: "read-only Goal with tool progress",
+      status: "fail",
+      summary: error instanceof Error ? sanitizePhaseThreeRealProviderError(error) : String(error),
+      targetMode: "goal",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runPhaseThreeRealProviderBuildCleanup(
+  workspace: string,
+  readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>,
+): Promise<PhaseThreeRealProviderCheck> {
+  const markerPath = ".agent/tmp/phase3-real-provider-build-marker.txt";
+  const marker = `phase3-real-provider-build-marker-${Date.now()}`;
+  const absoluteMarkerPath = path.join(workspace, markerPath);
+  await fs.rm(absoluteMarkerPath, { force: true });
+  const counter = createPhaseThreeRealProviderEventCounter();
+  const platform = await createLocalPlatform(workspace, {
+    ...phaseThreeRealProviderOptions(readiness),
+    targetMode: "build",
+    modelMaxCalls: 30,
+    onAgentProgress: counter.onEvent,
+  });
+  try {
+    const result = await platform.agent.runWithSession([
+      "Phase 3 real-provider reversible Build validation.",
+      `Create exactly this temporary file: ${markerPath}`,
+      `The file content must include exactly this marker: ${marker}`,
+      "Then run a verification command that exits 0 only if the marker file exists and contains the marker.",
+      "Do not modify any other file. Give a short final answer after the verification command passes.",
+    ].join(" "));
+    const evidence = await phaseThreeRealProviderSessionEvidence(platform.store, result.session?.id, {
+      requireChange: true,
+      requireModelCall: true,
+    });
+    await fs.rm(absoluteMarkerPath, { force: true });
+    const markerPresentAfterCleanup = await fileContains(absoluteMarkerPath, marker);
+    const removed = !markerPresentAfterCleanup;
+    const passed =
+      evidence.verificationStatus === "pass" &&
+      (evidence.changedPaths ?? []).includes(markerPath) &&
+      (evidence.finalAnswerChars ?? 0) > 0 &&
+      removed;
+    return {
+      id: "R2",
+      label: "reversible Build cleanup",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${evidence.sessionId ?? "-"}, verification=${evidence.verificationStatus ?? "-"}, ` +
+        `changedPaths=${evidence.changedPaths?.length ?? 0}, cleanupRemoved=${removed}`,
+      sessionId: evidence.sessionId,
+      targetMode: "build",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+      verificationStatus: evidence.verificationStatus,
+      finalAnswerChars: evidence.finalAnswerChars,
+      changedPaths: evidence.changedPaths,
+      cleanup: { path: markerPath, removed, markerPresentAfterCleanup },
+    };
+  } catch (error) {
+    await fs.rm(absoluteMarkerPath, { force: true });
+    return {
+      id: "R2",
+      label: "reversible Build cleanup",
+      status: "fail",
+      summary: error instanceof Error ? sanitizePhaseThreeRealProviderError(error) : String(error),
+      targetMode: "build",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+      cleanup: { path: markerPath, removed: !(await fileContains(absoluteMarkerPath, marker)), markerPresentAfterCleanup: await fileContains(absoluteMarkerPath, marker) },
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function runPhaseThreeRealProviderSupervisedGoal(
+  workspace: string,
+  readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>,
+): Promise<PhaseThreeRealProviderCheck> {
+  const [sampleFile] = await phaseThreeExistingReadableFiles(workspace, 1);
+  const counter = createPhaseThreeRealProviderEventCounter();
+  const platform = await createLocalPlatform(workspace, {
+    ...phaseThreeRealProviderOptions(readiness),
+    targetMode: "goal",
+    maxSteps: 1,
+    modelMaxCalls: 30,
+    onAgentProgress: counter.onEvent,
+  });
+  try {
+    const result = await platform.goalSupervisor.run({
+      objective: [
+        "Phase 3 real-provider supervised Goal validation.",
+        "This is an automated tool-use gate. A plain text plan, checklist, or summary before tool results is a failure.",
+        "Your first assistant response must contain exactly one read_file tool call and no prose.",
+        `Use exactly one read_file tool call to inspect this existing file: ${sampleFile}.`,
+        "Do not provide the final answer in the same chunk as the tool call.",
+        "When resumed after the step-budget stop, do not call tools again; return a concise final answer immediately.",
+        "Do not modify files.",
+      ].join(" "),
+      autoContinue: true,
+      maxContinuations: 8,
+      maxDurationMs: 300_000,
+    });
+    const evidence = await phaseThreeRealProviderSessionEvidence(platform.store, result.sessionId, {
+      requireModelCall: true,
+      requireCommand: false,
+    });
+    const passed =
+      result.status === "complete" &&
+      result.continuations >= 1 &&
+      (evidence.runtimeStops ?? 0) >= 1 &&
+      evidence.verificationStatus === "pass" &&
+      counter.toolEventCount >= 2;
+    return {
+      id: "R3",
+      label: "supervised Goal continuation",
+      status: passed ? "pass" : "fail",
+      summary:
+        `session=${result.sessionId ?? "-"}, supervisor=${result.status}, continuations=${result.continuations}, ` +
+        `runtimeStops=${evidence.runtimeStops ?? 0}, verification=${evidence.verificationStatus ?? "-"}`,
+      sessionId: result.sessionId,
+      targetMode: "goal",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+      verificationStatus: evidence.verificationStatus,
+      finalAnswerChars: evidence.finalAnswerChars,
+      runtimeStops: evidence.runtimeStops,
+      continuations: result.continuations,
+      changedPaths: evidence.changedPaths,
+    };
+  } catch (error) {
+    return {
+      id: "R3",
+      label: "supervised Goal continuation",
+      status: "fail",
+      summary: error instanceof Error ? sanitizePhaseThreeRealProviderError(error) : String(error),
+      targetMode: "goal",
+      eventCount: counter.eventCount,
+      toolEventCount: counter.toolEventCount,
+    };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function phaseThreeExistingReadableFiles(workspace: string, limit: number): Promise<string[]> {
+  const preferred = [
+    "index.html",
+    "package.json",
+    "src/main.js",
+    "src/game.js",
+    "src/content.js",
+    "js/main.js",
+    "js/config.js",
+    "js/entities/Tower.js",
+    "js/entities/Enemy.js",
+    "js/scenes/MainScene.js",
+    "README.md",
+  ];
+  const found: string[] = [];
+  for (const candidate of preferred) {
+    if (found.length >= limit) {
+      break;
+    }
+    if (await isReadableFile(path.join(workspace, candidate))) {
+      found.push(candidate);
+    }
+  }
+  if (found.length < limit) {
+    await collectReadableFiles(workspace, workspace, found, limit);
+  }
+  if (found.length === 0) {
+    throw new Error("No readable project files were found for real-provider validation.");
+  }
+  return found.slice(0, limit);
+}
+
+async function phaseThreeGateTargetFile(workspace: string): Promise<string | undefined> {
+  try {
+    return (await phaseThreeExistingReadableFiles(workspace, 1))[0];
+  } catch (error) {
+    if (error instanceof Error && /No readable project files were found/.test(error.message)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function phaseThreeNoReadableTargetCheck(
+  id: Extract<PhaseThreeGateCheck["id"], "C4" | "C5" | "C6">,
+  label: string,
+  targetMode: "build" | "goal",
+): PhaseThreeGateCheck {
+  return {
+    id,
+    label,
+    status: "fail",
+    summary: `${id} requires a workspace readable file: no readable target file found in workspace.`,
+    targetMode,
+    cleanup: id === "C4" ? { restored: false, markerPresentAfterCleanup: false } : undefined,
+  };
+}
+
+async function collectReadableFiles(root: string, dir: string, found: string[], limit: number): Promise<void> {
+  if (found.length >= limit) {
+    return;
+  }
+  let entries: Dirent<string>[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (found.length >= limit) {
+      return;
+    }
+    if (entry.name === ".agent" || entry.name === ".git" || entry.name === "node_modules") {
+      continue;
+    }
+    const absolute = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      await collectReadableFiles(root, absolute, found, limit);
+      continue;
+    }
+    if (entry.isFile() && /\.(js|ts|json|html|css|md)$/i.test(entry.name)) {
+      const relative = path.relative(root, absolute).replace(/\\/g, "/");
+      if (!found.includes(relative)) {
+        found.push(relative);
+      }
+    }
+  }
+}
+
+async function isReadableFile(filePath: string): Promise<boolean> {
+  try {
+    return (await fs.stat(filePath)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function phaseThreeRealProviderOptions(readiness: Awaited<ReturnType<typeof buildPhaseTwoRealProviderReadiness>>): RunPlatformOptions {
+  const provider = tryParseModelProviderName(readiness.activeProvider);
+  if (!provider) {
+    throw new Error(`Unknown real provider from readiness: ${readiness.activeProvider}`);
+  }
+  return {
+    provider,
+    model: readiness.model === "-" ? undefined : readiness.model,
+    baseUrl: readiness.baseUrl === "-" ? undefined : readiness.baseUrl,
+    executionMode: "trusted",
+    modelMaxRetries: 1,
+  };
+}
+
+function createPhaseThreeRealProviderEventCounter() {
+  const counter = {
+    eventCount: 0,
+    toolEventCount: 0,
+    onEvent(event: AgentLoopProgressEvent): void {
+      counter.eventCount += 1;
+      if (event.type === "tool_started" || event.type === "tool_finished") {
+        counter.toolEventCount += 1;
+      }
+    },
+  };
+  return counter;
+}
+
+async function phaseThreeRealProviderSessionEvidence(
+  store: AgentStore,
+  sessionId: string | undefined,
+  options: SessionVerificationOptions,
+): Promise<{
+  sessionId?: string;
+  verificationStatus?: "pass" | "fail";
+  finalAnswerChars?: number;
+  changedPaths?: string[];
+  runtimeStops?: number;
+}> {
+  if (!sessionId) {
+    return {};
+  }
+  const report = await buildSessionReportView(store, sessionId);
+  const verification = await buildSessionVerificationView(store, sessionId, options);
+  return {
+    sessionId,
+    verificationStatus: verification.status,
+    finalAnswerChars: await phaseThreeFinalAssistantAnswerChars(store, sessionId),
+    changedPaths: report.summary.changedPaths,
+    runtimeStops: report.summary.runtimeStops,
+  };
+}
+
+async function phaseThreeFinalAssistantAnswerChars(store: AgentStore, sessionId: string): Promise<number> {
+  const messages = await store.getMessages(sessionId);
+  const finalAnswer = messages.slice().reverse().find((message) => message.role === "assistant")?.content ?? "";
+  return finalAnswer.trim().length;
+}
+
+async function countSecretShapesInAgentTextFiles(workspace: string): Promise<number> {
+  const root = path.join(workspace, ".agent");
+  let total = 0;
+  await walkTextFiles(root, async (filePath) => {
+    try {
+      const stat = await fs.stat(filePath);
+      if (stat.size > 1_000_000) {
+        return;
+      }
+      total += countSecretShapes(await fs.readFile(filePath, "utf8"));
+    } catch {
+      // Best-effort hygiene scan; unreadable files are ignored rather than echoed.
+    }
+  });
+  return total;
+}
+
+async function walkTextFiles(root: string, visit: (filePath: string) => Promise<void>): Promise<void> {
+  let entries: Dirent<string>[];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const filePath = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "tmp") {
+        continue;
+      }
+      await walkTextFiles(filePath, visit);
+      continue;
+    }
+    if (entry.isFile() && isPhaseThreeSecretScanTextFile(entry.name)) {
+      await visit(filePath);
+    }
+  }
+}
+
+function isPhaseThreeSecretScanTextFile(fileName: string): boolean {
+  return /\.(json|md|txt|log|yaml|yml)$/i.test(fileName);
+}
+
+async function fileContains(filePath: string, needle: string): Promise<boolean> {
+  try {
+    return (await fs.readFile(filePath, "utf8")).includes(needle);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizePhaseThreeRealProviderError(error: Error): string {
+  return redactInlineSecretText(error.message);
+}
+
 const PHASE_THREE_C4_MARKER = "soloclaw-phase3-c4-marker";
 
-async function runPhaseThreeBuildSmoke(workspace: string): Promise<PhaseThreeGateCheck> {
-  const targetPath = "index.html";
+async function runPhaseThreeBuildSmoke(workspace: string, targetPath?: string): Promise<PhaseThreeGateCheck> {
+  if (!targetPath) {
+    return phaseThreeNoReadableTargetCheck("C4", "C4 real project build", "build");
+  }
   const targetAbsolutePath = path.join(workspace, targetPath);
   let originalContent: string;
   try {
@@ -7682,7 +20090,7 @@ async function runPhaseThreeBuildSmoke(workspace: string): Promise<PhaseThreeGat
       },
     });
 
-    const result = await agent.runWithSession("Phase 3 C4: make a reversible index.html marker change and verify it.");
+    const result = await agent.runWithSession("Phase 3 C4: make a reversible workspace-file marker change and verify it.");
     const sessionId = result.session?.id;
     if (!sessionId) {
       throw new Error("C4 smoke did not create a session.");
@@ -7779,8 +20187,9 @@ class PhaseThreeBuildSmokeModel implements ModelClient {
             id: "phase3-c4-verify",
             name: "run_command",
             input: {
-              command:
-                `node -e "const fs=require('fs');process.exit(fs.readFileSync('${this.input.targetPath}','utf8').includes('${this.input.marker}')?0:1)"`,
+              command: nodeEvalCommand(
+                `const fs=require("fs");process.exit(fs.readFileSync(${JSON.stringify(this.input.targetPath)},"utf8").includes(${JSON.stringify(this.input.marker)})?0:1)`,
+              ),
               timeoutMs: 20_000,
             },
           },
@@ -7790,27 +20199,22 @@ class PhaseThreeBuildSmokeModel implements ModelClient {
 
     return {
       type: "message" as const,
-      content: "C4 build smoke completed: index.html was changed and the marker verification command passed.",
+      content: "C4 build smoke completed: the selected workspace file was changed and the marker verification command passed.",
     };
   }
+}
+
+function nodeEvalCommand(script: string): string {
+  return `node -e ${JSON.stringify(script)}`;
 }
 
 function hasToolResult(request: ModelRequest, callId: string): boolean {
   return request.messages.some((message) => message.role === "tool" && message.toolResult.callId === callId);
 }
 
-async function runPhaseThreeGoalResumeSmoke(workspace: string): Promise<PhaseThreeGateCheck> {
-  const targetPath = "index.html";
-  try {
-    await fs.access(path.join(workspace, targetPath));
-  } catch (error) {
-    return {
-      id: "C5",
-      label: "C5 stop/resume",
-      status: "fail",
-      summary: `C5 requires ${targetPath}: ${error instanceof Error ? error.message : String(error)}`,
-      targetMode: "goal",
-    };
+async function runPhaseThreeGoalResumeSmoke(workspace: string, targetPath?: string): Promise<PhaseThreeGateCheck> {
+  if (!targetPath) {
+    return phaseThreeNoReadableTargetCheck("C5", "C5 stop/resume", "goal");
   }
 
   const platform = await createLocalPlatform(workspace, { provider: "mock" });
@@ -7954,18 +20358,9 @@ function hasResumeContinuation(request: ModelRequest): boolean {
   return request.messages.some((message) => message.role === "user" && message.content.includes("Continue this existing Soloclaw session"));
 }
 
-async function runPhaseThreeRecoverySmoke(workspace: string): Promise<PhaseThreeGateCheck> {
-  const targetPath = "index.html";
-  try {
-    await fs.access(path.join(workspace, targetPath));
-  } catch (error) {
-    return {
-      id: "C6",
-      label: "C6 recovery",
-      status: "fail",
-      summary: `C6 requires ${targetPath}: ${error instanceof Error ? error.message : String(error)}`,
-      targetMode: "build",
-    };
+async function runPhaseThreeRecoverySmoke(workspace: string, targetPath?: string): Promise<PhaseThreeGateCheck> {
+  if (!targetPath) {
+    return phaseThreeNoReadableTargetCheck("C6", "C6 recovery", "build");
   }
 
   const platform = await createLocalPlatform(workspace, { provider: "mock" });
@@ -8082,8 +20477,9 @@ class PhaseThreeRecoverySmokeModel implements ModelClient {
             id: "phase3-c6-recovery-command",
             name: "run_command",
             input: {
-              command:
-                `node -e "const fs=require('fs');fs.readFileSync('${this.targetPath}','utf8');process.exit(0)"`,
+              command: nodeEvalCommand(
+                `const fs=require("fs");fs.readFileSync(${JSON.stringify(this.targetPath)},"utf8");process.exit(0)`,
+              ),
               timeoutMs: 20_000,
             },
           },
@@ -8103,6 +20499,29 @@ function formatPhaseThreeGate(result: PhaseThreeGateResult): string {
     "Phase 3 runtime reliability gate",
     `status=${result.status}`,
     `workspace=${result.workspace}`,
+    `secretMatches=${result.secretMatches}`,
+    ...result.checks.map((check) => `[${check.status}] ${check.id} ${check.label}: ${check.summary}`),
+  ].join("\n");
+}
+
+function formatPhaseThreeLongTaskGate(result: PhaseThreeLongTaskGateResult): string {
+  return [
+    "Phase 3 long-task runtime gate",
+    `status=${result.status}`,
+    `workspace=${result.workspace}`,
+    `secretMatches=${result.secretMatches}`,
+    ...result.checks.map((check) => `[${check.status}] ${check.id} ${check.label}: ${check.summary}`),
+  ].join("\n");
+}
+
+function formatPhaseThreeRealProviderLongTask(result: PhaseThreeRealProviderResult): string {
+  return [
+    "Phase 3 real-provider long-task gate",
+    `status=${result.status}`,
+    `workspace=${result.workspace}`,
+    `provider=${result.provider}`,
+    `model=${result.model}`,
+    `readiness=${result.readinessStatus}`,
     `secretMatches=${result.secretMatches}`,
     ...result.checks.map((check) => `[${check.status}] ${check.id} ${check.label}: ${check.summary}`),
   ].join("\n");
@@ -10396,6 +22815,27 @@ function printLocalAgentServicePlan(plan: ReturnType<typeof buildLocalAgentServi
   }
 }
 
+function printRemoteRoomServicePlan(plan: RemoteRoomServicePlan): void {
+  console.log("Remote room service plan:");
+  console.log(`workspace=${plan.workspace}`);
+  console.log(
+    `service=${plan.serviceName}\tmanager=${plan.manager.kind}\tplatform=${plan.platform}\t` +
+    `ready=${plan.ready}\tblocked=${plan.blocked}`,
+  );
+  console.log(`room=${plan.roomId}\tcontrolUrl=${plan.controlUrl}`);
+  console.log(`entrypoint=${plan.entrypoint.foregroundCommand}`);
+  console.log(`tokenSource=${plan.entrypoint.tokenSource}`);
+  console.log(`statusFile=${plan.health.statusFile}\tstopFile=${plan.health.stopFile}`);
+  console.log(`health=${plan.health.healthCommand}`);
+  console.log(`supervision=${plan.supervision.installState}\trestart=${plan.supervision.restartPolicy}`);
+  console.log(plan.supervision.note);
+  console.log("Steps:");
+  for (const step of plan.steps) {
+    console.log(`- [${step.status}] ${step.label}${step.command ? `: ${step.command}` : ""}`);
+    console.log(`  ${step.reason}`);
+  }
+}
+
 function printLocalAgentLogs(logs: Awaited<ReturnType<typeof buildLocalAgentLogs>>): void {
   console.log("Local agent logs:");
   console.log(`workspace=${logs.workspace}`);
@@ -10520,16 +22960,61 @@ async function buildSessionEvidenceBundle(
   };
 }
 
-async function writeJsonOutputInsideWorkspace(cwd: string, outputPath: string, value: unknown): Promise<{ path: string; bytes: number }> {
-  const resolved = path.resolve(cwd, outputPath);
-  const relative = path.relative(cwd, resolved);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("--output must stay inside the current workspace.");
-  }
+async function writeJsonOutputInsideWorkspace(cwd: string, outputPath: string, value: unknown, optionName = "--output"): Promise<{ path: string; bytes: number }> {
+  const resolved = assertPathInsideWorkspace(cwd, outputPath, optionName);
   const content = `${JSON.stringify(value, null, 2)}\n`;
   await fs.mkdir(path.dirname(resolved), { recursive: true });
   await fs.writeFile(resolved, content, "utf8");
   return { path: resolved, bytes: Buffer.byteLength(content, "utf8") };
+}
+
+async function writeJsonFileInsideWorkspace(
+  cwd: string,
+  outputPath: string,
+  value: unknown,
+  options: {
+    force: boolean;
+    optionName: string;
+  },
+): Promise<{ path: string; bytes: number; overwritten: boolean }> {
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  return writeTextFileInsideWorkspace(cwd, outputPath, content, {
+    ...options,
+    description: "Phase 5 evidence init output",
+  });
+}
+
+async function writeTextFileInsideWorkspace(
+  cwd: string,
+  outputPath: string,
+  content: string,
+  options: {
+    force: boolean;
+    optionName: string;
+    description: string;
+  },
+): Promise<{ path: string; bytes: number; overwritten: boolean }> {
+  const resolved = assertPathInsideWorkspace(cwd, outputPath, options.optionName);
+  const overwritten = options.force ? await fileExists(resolved) : false;
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  try {
+    await fs.writeFile(resolved, content, { encoding: "utf8", flag: options.force ? "w" : "wx" });
+  } catch (error) {
+    if (nodeErrorCode(error) === "EEXIST") {
+      throw new Error(`${options.description} already exists: ${resolved}. Use --force to overwrite.`);
+    }
+    throw error;
+  }
+  return { path: resolved, bytes: Buffer.byteLength(content, "utf8"), overwritten };
+}
+
+function assertPathInsideWorkspace(cwd: string, inputPath: string, optionName: string): string {
+  const resolved = path.resolve(cwd, inputPath);
+  const relative = path.relative(cwd, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`${optionName} must stay inside the current workspace.`);
+  }
+  return resolved;
 }
 
 function printSessionEvidenceBundle(bundle: Awaited<ReturnType<typeof buildSessionEvidenceBundle>> & { output?: { path: string; bytes: number } }): void {
@@ -12350,12 +24835,18 @@ type SoloclawStatus = {
   workspace: string;
   activeWorkspace?: string;
   workspaceConfigPath: string;
+  platform: SoloclawPlatformCapabilities["platform"];
+  paths: SoloclawPlatformCapabilities["paths"];
+  capabilities: SoloclawPlatformCapabilities;
+  legacyConfig: boolean;
   workspaceStatus: RichTuiWorkspaceStatus;
   model: {
+    activeProfile: string;
     activeProvider: ModelProviderName;
+    defaultProfile?: string;
     defaultProvider?: ModelProviderName;
     configPath: string;
-    profiles: Awaited<ReturnType<LocalProviderProfileStore["list"]>>;
+    profiles: Awaited<ReturnType<GlobalModelProfileStore["list"]>>;
   };
   readiness: PhaseOneReadinessResult;
 };
@@ -12365,7 +24856,7 @@ type SoloclawQuickstartView = {
   workspace: string;
   workspaceConfigPath: string;
   modelConfigPath: string;
-  defaultProvider?: ModelProviderName;
+  defaultProfile?: string;
   commands: {
     tui: string;
     init: string;
@@ -12395,10 +24886,11 @@ async function runSoloclawSmoke(workspace: string): Promise<string> {
 
 type ModelEnvView = {
   generatedAt: string;
+  profile: string;
   provider: ModelProviderName;
   model: string;
-  protocol: "openai_chat" | "anthropic_messages" | "mock";
-  source: "builtin" | "local";
+  protocol: "openai_chat" | "openai_responses" | "anthropic_messages" | "mock";
+  source: "builtin" | "global";
   configPath: string;
   apiKeyEnvNames: string[];
   commands: {
@@ -12408,11 +24900,13 @@ type ModelEnvView = {
   };
 };
 
-async function buildSoloclawStatus(historyRoot: string, workspace: string, activeProvider?: ModelProviderName): Promise<SoloclawStatus> {
+async function buildSoloclawStatus(historyRoot: string, workspace: string, activeProfileId?: string): Promise<SoloclawStatus> {
   const history = await readWorkspaceHistory(historyRoot);
-  const profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-  const defaultProvider = await profileStore.getDefaultProvider();
+  const profileStore = new GlobalModelProfileStore();
+  const fallbackProfile = await defaultSoloclawModelProfileForWorkspace(workspace, profileStore);
+  const defaultProfile = await profileStore.getDefaultProfile();
   const profiles = await profileStore.list();
+  const activeProfile = await profileStore.resolveProfile(activeProfileId ?? defaultProfile ?? fallbackProfile);
   const [readiness, snapshot] = await Promise.all([
     verifyPhaseOneReadiness(workspace),
     collectWorkspaceSnapshot(workspace),
@@ -12422,10 +24916,16 @@ async function buildSoloclawStatus(historyRoot: string, workspace: string, activ
     workspace,
     activeWorkspace: history.activeWorkspace,
     workspaceConfigPath: workspaceHistoryPath(historyRoot),
+    platform: readiness.platform,
+    paths: readiness.paths,
+    capabilities: readiness.capabilities,
+    legacyConfig: await profileStore.usesLegacyConfig(),
     workspaceStatus: snapshot.git,
     model: {
-      activeProvider: activeProvider ?? defaultProvider ?? "mock",
-      defaultProvider,
+      activeProfile: activeProfile.id,
+      activeProvider: activeProfile.provider,
+      defaultProfile,
+      defaultProvider: defaultProfile ? (profiles.find((profile) => profile.id === defaultProfile)?.provider ?? activeProfile.provider) : undefined,
       configPath: profileStore.filePath,
       profiles,
     },
@@ -12434,14 +24934,15 @@ async function buildSoloclawStatus(historyRoot: string, workspace: string, activ
 }
 
 async function buildSoloclawQuickstart(historyRoot: string, workspace: string): Promise<SoloclawQuickstartView> {
-  const profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-  const defaultProvider = await profileStore.getDefaultProvider();
+  const profileStore = new GlobalModelProfileStore();
+  await defaultSoloclawModelProfileForWorkspace(workspace, profileStore);
+  const defaultProfile = await profileStore.getDefaultProfile();
   return {
     generatedAt: new Date().toISOString(),
     workspace,
     workspaceConfigPath: workspaceHistoryPath(historyRoot),
     modelConfigPath: profileStore.filePath,
-    defaultProvider,
+    defaultProfile,
     commands: {
       tui: "soloclaw",
       init: "soloclaw init",
@@ -12457,21 +24958,19 @@ async function buildSoloclawQuickstart(historyRoot: string, workspace: string): 
   };
 }
 
-async function buildModelEnvView(workspaceRoot: string, args: string[], activeProvider?: ModelProviderName): Promise<{ json: boolean; view: ModelEnvView }> {
+async function buildModelEnvView(workspaceRoot: string, args: string[], activeProfileId?: string): Promise<{ json: boolean; view: ModelEnvView }> {
   const parsed = parseModelProfileArgs(args);
-  const profiles = new LocalProviderProfileStore(path.join(workspaceRoot, ".agent"));
+  const profiles = new GlobalModelProfileStore();
+  const selector = parsed.options.profileId ?? parsed.options.providerInput ?? parsed.positionals[0] ?? activeProfileId ?? await defaultSoloclawModelProfileForWorkspace(workspaceRoot, profiles);
+  const profile = await resolveGlobalModelProfileSelector(profiles, selector);
   const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-  const provider = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : activeProvider ?? await profiles.getDefaultProvider() ?? "mock");
-  const profile = (await profiles.list()).find((entry) => entry.name === provider);
-  if (!profile) {
-    throw new Error(`Unknown model provider: ${provider}`);
-  }
   const apiKeyEnvNames = resolveModelApiKeyEnvNames(parsed.options, providerInput, profile.apiKeyEnvNames);
   return {
     json: Boolean(parsed.options.json),
     view: {
       generatedAt: new Date().toISOString(),
-      provider,
+      profile: profile.id,
+      provider: profile.provider,
       model: parsed.options.model ?? profile.defaultModel,
       protocol: profile.protocol,
       source: profile.source,
@@ -12491,14 +24990,44 @@ function printSoloclawStatus(status: SoloclawStatus): void {
   console.log(`workspace=${status.workspace}`);
   console.log(`activeWorkspace=${status.activeWorkspace ?? "-"}`);
   console.log(`workspaceConfig=${status.workspaceConfigPath}`);
+  console.log(`platform=${status.platform.id}`);
+  console.log(`cache=${status.paths.cacheDir}`);
+  console.log(`logs=${status.paths.logDir}`);
   console.log(`git=${formatSoloclawWorkspaceStatus(status.workspaceStatus)}`);
-  console.log(`model=${status.model.activeProvider}`);
-  console.log(`modelDefault=${status.model.defaultProvider ?? "-"}`);
-  console.log(`modelConfig=${status.model.configPath}`);
+  console.log(`model=${status.model.activeProfile}`);
+  console.log(`modelProvider=${status.model.activeProvider}`);
+  console.log(`modelDefault=${status.model.defaultProfile ?? "-"}`);
+  console.log(`modelConfig=${status.model.configPath}${status.legacyConfig ? " legacy-read-fallback" : ""}`);
   console.log(`readiness=${status.readiness.status}`);
   for (const check of status.readiness.checks) {
     console.log(`[${check.status}] ${check.label}: ${check.summary}`);
   }
+}
+
+function buildPlatformDoctorView(capabilities: SoloclawPlatformCapabilities, legacyConfig = false) {
+  return {
+    generatedAt: new Date().toISOString(),
+    platform: capabilities.platform,
+    paths: capabilities.paths,
+    capabilities,
+    legacyConfig,
+  };
+}
+
+function printPlatformDoctor(capabilities: SoloclawPlatformCapabilities): void {
+  console.log("Soloclaw platform doctor");
+  console.log(`platform=${capabilities.platform.id}\tnodePlatform=${capabilities.platform.nodePlatform}\ttermux=${capabilities.platform.isTermux}`);
+  console.log(`config=${capabilities.paths.configDir}`);
+  console.log(`cache=${capabilities.paths.cacheDir}`);
+  console.log(`logs=${capabilities.paths.logDir}`);
+  console.log(`modelConfig=${capabilities.paths.modelConfigPath}`);
+  console.log(`workspaceHistory=${capabilities.paths.workspaceHistoryPath}`);
+  console.log(`shell=${capabilities.shellHints.primary}`);
+  console.log(
+    `commands=node:${capabilities.commands.node.available}\tnpm:${capabilities.commands.npm.available}\t` +
+    `git:${capabilities.commands.git.available}\trg:${capabilities.commands.rg.available}\tcargo:${capabilities.commands.cargo.available}`,
+  );
+  console.log(`rustRunner=${capabilities.rustRunner.available ? capabilities.rustRunner.path : "-"}\tsource=${capabilities.rustRunner.source}`);
 }
 
 function formatSoloclawWorkspaceStatus(status: RichTuiWorkspaceStatus): string {
@@ -12515,7 +25044,7 @@ function printSoloclawQuickstart(view: SoloclawQuickstartView): void {
   console.log(`workspace=${view.workspace}`);
   console.log(`workspaceConfig=${view.workspaceConfigPath}`);
   console.log(`modelConfig=${view.modelConfigPath}`);
-  console.log(`defaultModel=${view.defaultProvider ?? "-"}`);
+  console.log(`defaultModel=${view.defaultProfile ?? "-"}`);
   console.log("First run:");
   console.log(`1. ${view.commands.init}`);
   console.log(`2. ${view.commands.providers}`);
@@ -12540,17 +25069,40 @@ function printModelProviderProfilesJson(profiles: ModelProviderProfileView[], de
   console.log(JSON.stringify({ providers: profiles, defaultProvider, configPath }, null, 2));
 }
 
+function printGlobalModelProfiles(profiles: GlobalModelProfileView[], defaultProfile: string | undefined): void {
+  for (const profile of profiles) {
+    console.log(formatGlobalModelProfileLine(profile, defaultProfile));
+  }
+}
+
+function printGlobalModelProfilesJson(profiles: GlobalModelProfileView[], defaultProfile: string | undefined, configPath: string): void {
+  console.log(JSON.stringify({ profiles, providers: profiles, defaultProfile, defaultProvider: defaultProfile, configPath }, null, 2));
+}
+
+function formatGlobalModelProfileLine(profile: GlobalModelProfileView, defaultProfile: string | undefined, defaultMode: "marker" | "value" = "marker"): string {
+  const source = profile.source === "global" ? "local" : profile.source;
+  const provider = profile.id !== profile.provider ? `\tprovider=${profile.provider}` : "";
+  const defaultText = defaultMode === "value"
+    ? `\tdefault=${defaultProfile ?? "-"}`
+    : profile.id === defaultProfile
+      ? "\tdefault"
+      : "";
+  return `${profile.id}\t${source}\t${profile.protocol}${provider}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}${defaultText}`;
+}
+
 function printSoloclawInitView(view: SoloclawInitView): void {
   console.log("Soloclaw initialized");
   console.log(`workspace=${view.workspace}`);
   console.log(`workspaceConfig=${view.workspaceConfigPath}`);
   console.log(`modelConfig=${view.modelConfigPath}`);
-  console.log(`defaultModel=${view.defaultProvider ?? "-"}`);
+  console.log(`defaultModel=${view.defaultProfile ?? "-"}`);
+  console.log(`configuredModel=${view.configuredProfile ?? "-"}`);
   console.log("next=soloclaw");
 }
 
 function printModelEnvView(view: ModelEnvView): void {
   console.log("Model env");
+  console.log(`profile=${view.profile}`);
   console.log(`provider=${view.provider}`);
   console.log(`model=${view.model}`);
   console.log(`protocol=${view.protocol}`);
@@ -12574,6 +25126,7 @@ function printModelEnvView(view: ModelEnvView): void {
 
 function printModelCheckView(view: ModelCheckView): void {
   console.log("Model check");
+  console.log(`profile=${view.profile}`);
   console.log(`provider=${view.provider}`);
   console.log(`status=${view.status}`);
   console.log(`model=${view.model}`);
@@ -12621,6 +25174,117 @@ async function selectDefaultModelProvider(
   return { defaultProvider: providerName, profile };
 }
 
+async function selectDefaultModelProfile(
+  profiles: GlobalModelProfileStore,
+  profileInput: string,
+): Promise<{ defaultProfile: string; profile: GlobalModelProfileView }> {
+  const current = await resolveGlobalModelProfileSelector(profiles, profileInput);
+  const localBaseUrl = localModelAliasBaseUrl(profileInput);
+  const profile = localBaseUrl
+    ? await profiles.set({
+        id: current.id,
+        provider: current.provider,
+        displayName: current.displayName,
+        protocol: current.protocol,
+        defaultBaseUrl: localBaseUrl,
+        defaultModel: current.defaultModel,
+        apiKeyEnvNames: [],
+        modelIds: current.modelIds,
+        docsUrl: current.docsUrl,
+        apiKeysUrl: current.apiKeysUrl,
+        pricingUrl: current.pricingUrl,
+      })
+    : current;
+  await profiles.setDefaultProfile(profile.id);
+  return { defaultProfile: profile.id, profile };
+}
+
+async function defaultSoloclawModelProfileForWorkspace(workspace: string, profiles = new GlobalModelProfileStore()): Promise<string> {
+  const defaultProfile = await profiles.getDefaultProfile();
+  if (defaultProfile) {
+    return defaultProfile;
+  }
+  const legacyProfiles = new LocalProviderProfileStore(path.join(workspace, ".agent"));
+  const legacyDefault = await legacyProfiles.getDefaultProvider();
+  if (!legacyDefault) {
+    return "mock";
+  }
+  const legacy = (await legacyProfiles.list()).find((profile) => profile.name === legacyDefault);
+  if (!legacy) {
+    return "mock";
+  }
+  const migrated = await profiles.set({
+    id: legacy.name,
+    provider: legacy.name,
+    displayName: legacy.displayName,
+    protocol: legacy.protocol,
+    defaultBaseUrl: legacy.defaultBaseUrl,
+    defaultModel: legacy.defaultModel,
+    apiKeyEnvNames: legacy.apiKeyEnvNames,
+    apiKeySecretRef: legacy.apiKeySecretRef,
+    modelIds: legacy.modelIds,
+    docsUrl: legacy.docsUrl,
+    apiKeysUrl: legacy.apiKeysUrl,
+    pricingUrl: legacy.pricingUrl,
+  });
+  await profiles.setDefaultProfile(migrated.id);
+  return migrated.id;
+}
+
+async function resolveGlobalModelProfileSelector(profiles: GlobalModelProfileStore, selector: string): Promise<GlobalModelProfileView> {
+  const listed = await profiles.list();
+  const byId = listed.find((profile) => profile.id === selector);
+  if (byId) {
+    return byId;
+  }
+  const providerName = parseModelProviderName(selector);
+  const byProviderId = listed.find((profile) => profile.id === providerName);
+  if (byProviderId) {
+    return byProviderId;
+  }
+  const byProvider = listed.find((profile) => profile.provider === providerName);
+  if (byProvider) {
+    return byProvider;
+  }
+  throw new Error(`Unknown model profile: ${selector}.`);
+}
+
+async function setupGlobalModelProfile(
+  profiles: GlobalModelProfileStore,
+  parsed: { options: ModelProfileCliOptions; positionals: string[] },
+): Promise<GlobalModelProfileView> {
+  const listed = await profiles.list();
+  const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
+  const existing = parsed.options.profileId ? listed.find((profile) => profile.id === parsed.options.profileId) : undefined;
+  const providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : existing?.provider);
+  if (!providerName) {
+    throw new Error("Model setup needs a provider or an existing --profile id.");
+  }
+  const base = existing ?? listed.find((profile) => profile.id === providerName);
+  if (!base) {
+    throw new Error(`Unknown model provider: ${providerName}`);
+  }
+  const profileId = parsed.options.profileId ?? existing?.id ?? providerName;
+  const profile = await profiles.set({
+    id: profileId,
+    provider: providerName,
+    displayName: existing?.displayName ?? base.displayName,
+    protocol: parsed.options.protocol ?? existing?.protocol ?? base.protocol,
+    defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(parsed.options.providerInput ?? providerInput) ?? existing?.defaultBaseUrl ?? base.defaultBaseUrl,
+    defaultModel: parsed.options.model ?? existing?.defaultModel ?? base.defaultModel,
+    apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, parsed.options.providerInput ?? providerInput, existing?.apiKeyEnvNames ?? base.apiKeyEnvNames),
+    apiKeySecretRef: parsed.options.apiKeySecretRef ?? existing?.apiKeySecretRef ?? base.apiKeySecretRef,
+    modelIds: existing?.modelIds ?? base.modelIds,
+    docsUrl: existing?.docsUrl ?? base.docsUrl,
+    apiKeysUrl: existing?.apiKeysUrl ?? base.apiKeysUrl,
+    pricingUrl: existing?.pricingUrl ?? base.pricingUrl,
+  });
+  if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
+    await profiles.setDefaultProfile(profile.id);
+  }
+  return profile;
+}
+
 type WorkspaceHistoryEntry = {
   path: string;
   lastUsedAt: string;
@@ -12637,8 +25301,10 @@ type SoloclawInitView = {
   workspace: string;
   workspaceConfigPath: string;
   modelConfigPath: string;
-  defaultProvider?: ModelProviderName;
-  configuredProvider?: ModelProviderName;
+  defaultProfile?: string;
+  defaultProvider?: string;
+  configuredProfile?: string;
+  configuredProvider?: string;
 };
 
 type ModelCheckStatus = "ready" | "missing_api_key" | "missing_base_url";
@@ -12647,9 +25313,10 @@ type ModelCheckView = {
   generatedAt: string;
   ready: boolean;
   status: ModelCheckStatus;
+  profile: string;
   provider: ModelProviderName;
-  protocol: "openai_chat" | "anthropic_messages" | "mock";
-  source: "builtin" | "local";
+  protocol: "openai_chat" | "openai_responses" | "anthropic_messages" | "mock";
+  source: "builtin" | "global";
   model: string;
   baseUrl?: string;
   configPath: string;
@@ -12660,6 +25327,11 @@ type ModelCheckView = {
 };
 
 function workspaceHistoryPath(historyRoot: string): string {
+  void historyRoot;
+  return resolveSoloclawPaths().workspaceHistoryPath;
+}
+
+function legacyWorkspaceHistoryPath(historyRoot: string): string {
   return path.join(historyRoot, ".agent", "workspaces.json");
 }
 
@@ -13145,6 +25817,16 @@ async function readWorkspaceHistory(historyRoot: string): Promise<WorkspaceHisto
     return { version: 1, activeWorkspace: typeof parsed.activeWorkspace === "string" ? path.resolve(parsed.activeWorkspace) : undefined, entries };
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
+      const legacyPath = legacyWorkspaceHistoryPath(historyRoot);
+      if (legacyPath !== filePath && await pathExists(legacyPath)) {
+        const parsed = JSON.parse(await fs.readFile(legacyPath, "utf8")) as Partial<WorkspaceHistoryFile>;
+        const entries = Array.isArray(parsed.entries)
+          ? parsed.entries
+              .filter((entry): entry is WorkspaceHistoryEntry => typeof entry?.path === "string" && typeof entry?.lastUsedAt === "string")
+              .map((entry) => ({ path: path.resolve(entry.path), lastUsedAt: entry.lastUsedAt }))
+          : [];
+        return { version: 1, activeWorkspace: typeof parsed.activeWorkspace === "string" ? path.resolve(parsed.activeWorkspace) : undefined, entries };
+      }
       return { version: 1, entries: [] };
     }
     throw error;
@@ -13174,29 +25856,17 @@ async function initializeSoloclawWorkspace(historyRoot: string, workspaceRoot: s
     parsed = parseModelProfileArgs(await promptSoloclawSetupWizardArgs({ json: parsed.options.json }));
   }
   const workspace = await recordWorkspaceHistoryEntry(historyRoot, workspaceRoot);
-  const profiles = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-  let configuredProvider: ModelProviderName | undefined;
+  const profiles = new GlobalModelProfileStore();
+  let configuredProfile: string | undefined;
   const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
   const providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
-  if (providerName) {
-    const current = (await profiles.list()).find((profile) => profile.name === providerName);
-    if (!current) {
-      throw new Error(`Unknown model provider: ${providerName}`);
-    }
-    await profiles.set({
-      name: providerName,
-      protocol: parsed.options.protocol ?? current.protocol,
-      defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? current.defaultBaseUrl,
-      defaultModel: parsed.options.model ?? current.defaultModel,
-      apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, providerInput, current.apiKeyEnvNames),
-      apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
-    });
-    await profiles.setDefaultProvider(providerName);
-    configuredProvider = providerName;
+  if (providerName || parsed.options.profileId) {
+    const profile = await setupGlobalModelProfile(profiles, parsed);
+    configuredProfile = profile.id;
   } else {
-    await profiles.setDefaultProvider("mock");
+    await profiles.setDefaultProfile("mock");
   }
-  const defaultProvider = await profiles.getDefaultProvider();
+  const defaultProfile = await profiles.getDefaultProfile();
   return {
     json: Boolean(parsed.options.json),
     view: {
@@ -13204,8 +25874,10 @@ async function initializeSoloclawWorkspace(historyRoot: string, workspaceRoot: s
       workspace,
       workspaceConfigPath: workspaceHistoryPath(historyRoot),
       modelConfigPath: profiles.filePath,
-      defaultProvider,
-      configuredProvider,
+      defaultProfile,
+      defaultProvider: defaultProfile,
+      configuredProfile,
+      configuredProvider: configuredProfile,
     },
   };
 }
@@ -13213,21 +25885,20 @@ async function initializeSoloclawWorkspace(historyRoot: string, workspaceRoot: s
 async function buildModelCheckView(
   workspaceRoot: string,
   args: string[],
-  activeProvider?: ModelProviderName,
+  activeProfileId?: string,
   options: { apiKeySecretRef?: string } = {},
 ): Promise<{ json: boolean; view: ModelCheckView }> {
   const parsed = parseModelProfileArgs(args);
-  const profiles = new LocalProviderProfileStore(path.join(workspaceRoot, ".agent"));
+  const profiles = new GlobalModelProfileStore();
+  const selector = parsed.options.profileId ?? parsed.options.providerInput ?? parsed.positionals[0] ?? activeProfileId ?? await defaultSoloclawModelProfileForWorkspace(workspaceRoot, profiles);
+  const profile = await resolveGlobalModelProfileSelector(profiles, selector);
   const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-  const provider = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : activeProvider ?? await profiles.getDefaultProvider() ?? "mock");
-  const profile = (await profiles.list()).find((entry) => entry.name === provider);
-  if (!profile) {
-    throw new Error(`Unknown model provider: ${provider}`);
-  }
   const apiKeyEnvNames = resolveModelApiKeyEnvNames(parsed.options, providerInput, profile.apiKeyEnvNames);
   const baseUrl = parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? profile.defaultBaseUrl;
   const presentApiKeyEnvNames = apiKeyEnvNames.filter((envName) => Boolean(process.env[envName]));
-  const usesApiKeySecretRef = Boolean(options.apiKeySecretRef ?? parsed.options.apiKeySecretRef ?? profile.apiKeySecretRef);
+  const explicitApiKeySecretRef = options.apiKeySecretRef ?? parsed.options.apiKeySecretRef;
+  const explicitApiKeyEnvNames = (parsed.options.apiKeyEnvNames?.length ?? 0) > 0;
+  const usesApiKeySecretRef = Boolean(explicitApiKeySecretRef ?? (explicitApiKeyEnvNames ? undefined : profile.apiKeySecretRef));
   const missingApiKeyEnvNames = profile.protocol === "mock" || usesApiKeySecretRef || apiKeyEnvNames.length === 0 || presentApiKeyEnvNames.length > 0 ? [] : apiKeyEnvNames;
   const status: ModelCheckStatus =
     profile.protocol !== "mock" && !baseUrl
@@ -13241,7 +25912,8 @@ async function buildModelCheckView(
       generatedAt: new Date().toISOString(),
       ready: status === "ready",
       status,
-      provider,
+      profile: profile.id,
+      provider: profile.provider,
       protocol: profile.protocol,
       source: profile.source,
       model: parsed.options.model ?? profile.defaultModel,
@@ -13307,6 +25979,12 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function closeWorkspaceRuntimeMaybe(runtime: unknown): Promise<void> {
+  if (typeof runtime === "object" && runtime !== null && "close" in runtime && typeof runtime.close === "function") {
+    await (runtime.close as () => Promise<void> | void)();
+  }
+}
+
 function splitCliWords(input: string): string[] {
   const words: string[] = [];
   let current = "";
@@ -13338,10 +26016,10 @@ function splitCliWords(input: string): string[] {
 async function startTui(initialWorkspace: string, historyRoot = initialWorkspace): Promise<void> {
   let workspace = initialWorkspace;
   await recordWorkspaceHistoryEntry(historyRoot, workspace);
-  let profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-  let provider = (await profileStore.getDefaultProvider()) ?? "mock";
-  const status = await buildSoloclawStatus(historyRoot, workspace, provider);
-  const activeProfile = status.model.profiles.find((profile) => profile.name === provider);
+  let profileStore = new GlobalModelProfileStore();
+  let modelProfile = await defaultSoloclawModelProfileForWorkspace(workspace, profileStore);
+  const status = await buildSoloclawStatus(historyRoot, workspace, modelProfile);
+  let activeProfile = status.model.profiles.find((profile) => profile.id === modelProfile) ?? await profileStore.resolveProfile(modelProfile);
   if (shouldUseRichTui({
     stdinIsTTY: stdin.isTTY === true,
     stdoutIsTTY: stdout.isTTY === true,
@@ -13349,22 +26027,27 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   })) {
     await startRichTuiShell({
       workspace,
-      provider,
-      model: activeProfile?.defaultModel ?? provider,
+      provider: modelProfile,
+      model: activeProfile?.defaultModel ?? modelProfile,
       readiness: status.readiness.status,
       version: "0.1.0",
       workspaceStatus: status.workspaceStatus,
       modelProfiles: status.model.profiles,
-      runTask: (input) => runRichTuiAgentTask({ ...input, workspace, provider }),
-      resumeSession: (input) => resumeRichTuiAgentSession({ ...input, workspace, provider }),
+      runTask: (input) => runRichTuiAgentTask({ ...input, workspace, modelProfile }),
+      resumeSession: (input) => resumeRichTuiAgentSession({ ...input, workspace, modelProfile }),
+      pauseSession: (input) => pauseRichTuiAgentSession({ ...input, workspace }),
+      cancelSession: (input) => cancelRichTuiAgentSession({ ...input, workspace }),
+      backgroundSession: (input) => backgroundRichTuiAgentSession({ ...input, workspace }),
       setupModel: async () => {
         const result = await runRichTuiModelSetup(workspace, historyRoot, profileStore);
-        provider = result.provider;
+        modelProfile = result.provider;
+        activeProfile = await profileStore.resolveProfile(modelProfile);
         return result;
       },
       setupModelFromWizard: async (input) => {
         const result = await saveRichTuiModelSetup(workspace, historyRoot, profileStore, input);
-        provider = result.provider;
+        modelProfile = result.provider;
+        activeProfile = await profileStore.resolveProfile(modelProfile);
         return result;
       },
       listSessions: () => buildRichTuiSessions(workspace),
@@ -13374,11 +26057,11 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   const rl = createInterface({ input: stdin, output: stdout });
   console.log("Soloclaw");
   console.log(`Workspace: ${workspace}`);
-  console.log(`Model: ${provider}`);
+  console.log(`Model: ${modelProfile}`);
   console.log(`Model config: ${profileStore.filePath}`);
   console.log(`Readiness: ${status.readiness.status}`);
   console.log("Next: /quickstart, /model check, /smoke");
-  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent service, /agent logs, /operator status, /sessions, /sessions watch, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session report <id>, /session status <id>, /session inspect <id>, /session watch <id>, /session timeline <id>, /session review <id>, /session result <id>, /session next <id>, /session verify <id>, /session bundle <id>, /doctor, /inspect, /config, /model [provider], /workspace recent|<n>|<path>, /help, /exit");
+  console.log("Commands: /run <task>, /smoke, /quickstart, /setup, /init, /status, /agent status, /agent service, /agent logs, /operator status, /sessions, /sessions watch, /approvals [status], /approve <id>, /deny <id>, /session diff <id>, /session report <id>, /session status <id>, /session inspect <id>, /session watch <id>, /session timeline <id>, /session review <id>, /session result <id>, /session next <id>, /session verify <id>, /session bundle <id>, /doctor, /inspect, /config, /model [profile], /workspace recent|<n>|<path>, /help, /exit");
   try {
     const tuiInput = createTuiLineReader(rl);
     stdout.write("soloclaw> ");
@@ -13440,15 +26123,16 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         console.log("  /config              Show model config and provider profiles");
         console.log("  /config path         Print the model config JSON path");
         console.log("  /providers           Show model provider presets");
-        console.log("  /model               List configured model providers");
+        console.log("  /model               List global model profiles");
         console.log("  /model providers     Show model provider presets");
         console.log("  /model env           Print API key environment variable commands");
         console.log("  /model check         Check whether the active model profile is ready");
-        console.log("  /model <provider>    Select and persist a default provider");
+        console.log("  /model <profile>     Select and persist a default profile");
         console.log("  /model use <provider> Select and persist a default provider");
+        console.log("  /model use <profile> Select and persist a default profile");
         console.log("  /model setup local [--model name]");
         console.log("  /model setup          Open menu-style model setup");
-        console.log("  /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
+        console.log("  /model setup <provider> [--profile id] [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
         console.log("  /workspace           List recent workspaces");
         console.log("  /workspace recent    List recent workspaces");
         console.log("  /workspace <n>       Switch to the numbered recent workspace");
@@ -13473,14 +26157,14 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         const parsedArgs = splitCliWords(line.slice(commandPrefix.length).trim());
         const result = await initializeSoloclawWorkspace(historyRoot, workspace, parsedArgs);
         printSoloclawInitView(result.view);
-        profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-        provider = (await profileStore.getDefaultProvider()) ?? provider;
-        console.log(`Model: ${provider}`);
+        profileStore = new GlobalModelProfileStore();
+        modelProfile = (await profileStore.getDefaultProfile()) ?? modelProfile;
+        console.log(`Model: ${modelProfile}`);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/status") {
-        printSoloclawStatus(await buildSoloclawStatus(historyRoot, workspace, provider));
+        printSoloclawStatus(await buildSoloclawStatus(historyRoot, workspace, modelProfile));
         stdout.write("soloclaw> ");
         continue;
       }
@@ -13865,54 +26549,50 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
       }
       if (line === "/config") {
         const profiles = await profileStore.list();
-        const defaultProvider = await profileStore.getDefaultProvider();
+        const defaultProfile = await profileStore.getDefaultProfile();
         console.log(`config=${profileStore.filePath}`);
-        console.log(`active=${provider}`);
-        console.log(`default=${defaultProvider ?? "-"}`);
-        for (const profile of profiles) {
-          console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
-        }
+        console.log(`active=${modelProfile}`);
+        console.log(`default=${defaultProfile ?? "-"}`);
+        printGlobalModelProfiles(profiles, defaultProfile);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/providers" || line === "/model providers" || line === "/model presets") {
         const profiles = await profileStore.list();
-        const defaultProvider = await profileStore.getDefaultProvider();
-        printModelProviderProfiles(profiles, defaultProvider);
+        const defaultProfile = await profileStore.getDefaultProfile();
+        printGlobalModelProfiles(profiles, defaultProfile);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/model env" || line.startsWith("/model env ")) {
         const parsedArgs = splitCliWords(line.slice("/model env".length).trim());
-        const result = await buildModelEnvView(workspace, parsedArgs, provider);
+        const result = await buildModelEnvView(workspace, parsedArgs, modelProfile);
         printModelEnvView(result.view);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/model check" || line.startsWith("/model check ")) {
         const parsedArgs = splitCliWords(line.slice("/model check".length).trim());
-        const result = await buildModelCheckView(workspace, parsedArgs, provider);
+        const result = await buildModelCheckView(workspace, parsedArgs, modelProfile);
         printModelCheckView(result.view);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/model") {
         const profiles = await profileStore.list();
-        const defaultProvider = await profileStore.getDefaultProvider();
-        for (const profile of profiles) {
-          console.log(`${profile.name}${profile.name === defaultProvider ? " *" : ""}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
-        }
+        const defaultProfile = await profileStore.getDefaultProfile();
+        printGlobalModelProfiles(profiles, defaultProfile);
         stdout.write("soloclaw> ");
         continue;
       }
       if (line === "/model setup") {
         try {
           const result = await promptTuiModelSetupMenu(tuiInput, workspace, profileStore);
-          provider = result.provider;
-          const defaultProvider = await profileStore.getDefaultProvider();
-          console.log(`${result.profile.name}\t${result.profile.source}\t${result.profile.protocol}\tmodel=${result.profile.defaultModel}\tbaseUrl=${result.profile.defaultBaseUrl ?? "-"}\tenv=${result.profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${result.profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
+          modelProfile = result.provider;
+          const defaultProfile = await profileStore.getDefaultProfile();
+          console.log(formatGlobalModelProfileLine(result.profile, defaultProfile, "value"));
           console.log(`config=${profileStore.filePath}`);
-          console.log(`Model: ${provider}`);
+          console.log(`Model: ${modelProfile}`);
         } catch (error) {
           console.log(`Error: ${formatTuiModelSetupError(error)}`);
         }
@@ -13922,36 +26602,22 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
       if (line.startsWith("/model setup ")) {
         try {
           const parsed = parseModelProfileArgs(splitCliWords(line.slice("/model setup".length).trim()));
-          const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-          const providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
-          if (!providerName) {
-            console.log("Usage: /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
+          if (!parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0] && !parsed.options.profileId) {
+            console.log("Usage: /model setup <provider> [--profile id] [--protocol openai_chat|openai_responses|anthropic_messages|mock] [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
             stdout.write("soloclaw> ");
             continue;
           }
-          const current = (await profileStore.list()).find((profile) => profile.name === providerName);
-          if (!current) {
-            throw new Error(`Unknown model provider: ${providerName}`);
-          }
-          const profile = await profileStore.set({
-            name: providerName,
-            protocol: parsed.options.protocol ?? current.protocol,
-            defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(providerInput) ?? current.defaultBaseUrl,
-            defaultModel: parsed.options.model ?? current.defaultModel,
-            apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, providerInput, current.apiKeyEnvNames),
-            apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
-          });
+          const profile = await setupGlobalModelProfile(profileStore, parsed);
           if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
-            await profileStore.setDefaultProvider(providerName);
-            provider = providerName;
+            modelProfile = profile.id;
           }
-          const defaultProvider = await profileStore.getDefaultProvider();
-          console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
+          const defaultProfile = await profileStore.getDefaultProfile();
+          console.log(formatGlobalModelProfileLine(profile, defaultProfile, "value"));
           console.log(`config=${profileStore.filePath}`);
-          console.log(`Model: ${provider}`);
+          console.log(`Model: ${modelProfile}`);
         } catch (error) {
           console.log(`Error: ${formatTuiModelSetupError(error)}`);
-          console.log("Usage: /model setup <provider> [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
+          console.log("Usage: /model setup <provider> [--profile id] [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id]");
         }
         stdout.write("soloclaw> ");
         continue;
@@ -13961,9 +26627,9 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         if (modelSelector.startsWith("use ") || modelSelector.startsWith("default ")) {
           modelSelector = modelSelector.replace(/^(use|default)\s+/, "").trim();
         }
-        const selected = await selectDefaultModelProvider(profileStore, modelSelector);
-        provider = selected.defaultProvider;
-        console.log(`Model: ${provider}`);
+        const selected = await selectDefaultModelProfile(profileStore, modelSelector);
+        modelProfile = selected.defaultProfile;
+        console.log(`Model: ${modelProfile}`);
         stdout.write("soloclaw> ");
         continue;
       }
@@ -13987,10 +26653,10 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         const nextWorkspace = await resolveWorkspaceSelector(historyRoot, selector, workspace);
         await recordWorkspaceHistoryEntry(historyRoot, nextWorkspace);
         workspace = nextWorkspace;
-        profileStore = new LocalProviderProfileStore(path.join(workspace, ".agent"));
-        provider = (await profileStore.getDefaultProvider()) ?? provider;
+        profileStore = new GlobalModelProfileStore();
+        modelProfile = await defaultSoloclawModelProfileForWorkspace(workspace, profileStore);
         console.log(`Workspace: ${workspace}`);
-        console.log(`Model: ${provider}`);
+        console.log(`Model: ${modelProfile}`);
         stdout.write("soloclaw> ");
         continue;
       }
@@ -14011,11 +26677,10 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
         continue;
       }
       try {
-        await ensureTuiModelSecretReady(tuiInput, profileStore, provider, workspace);
+        await ensureTuiModelSecretReady(tuiInput, profileStore, modelProfile, workspace);
         const platform = await createLocalPlatform(workspace, {
-          provider,
+          modelProfile,
           knowledgeQuery: task,
-          maxSteps: TUI_RUN_MAX_STEPS,
           onAgentProgress: createTuiRunProgressReporter(),
         });
         try {
@@ -14042,21 +26707,23 @@ async function startTui(initialWorkspace: string, historyRoot = initialWorkspace
   }
 }
 
-async function runRichTuiAgentTask(input: RichTuiTaskRunInput & { workspace: string; provider: ModelProviderName }): Promise<RichTuiTaskRunResult> {
+async function runRichTuiAgentTask(input: RichTuiTaskRunInput & { workspace: string; modelProfile: string }): Promise<RichTuiTaskRunResult> {
   const startedAt = Date.now();
   const platform = await createLocalPlatform(input.workspace, {
-    provider: input.provider,
+    modelProfile: input.modelProfile,
     knowledgeQuery: input.task,
     targetMode: richTuiModeToTargetMode(input.mode),
-    maxSteps: TUI_RUN_MAX_STEPS,
     onAgentProgress: input.onEvent,
   });
   try {
     const result = await platform.agent.runWithSession(input.task);
+    const report = result.session?.id ? await buildSessionReportView(platform.store, result.session.id) : undefined;
     return {
       answer: result.finalAnswer,
       sessionId: result.session?.id,
+      planPath: result.planPath,
       durationMs: Date.now() - startedAt,
+      todos: report?.todos,
     };
   } finally {
     platform.locks.close?.();
@@ -14064,20 +26731,101 @@ async function runRichTuiAgentTask(input: RichTuiTaskRunInput & { workspace: str
   }
 }
 
-async function resumeRichTuiAgentSession(input: RichTuiSessionResumeInput & { workspace: string; provider: ModelProviderName }): Promise<RichTuiTaskRunResult> {
+async function resumeRichTuiAgentSession(input: RichTuiSessionResumeInput & { workspace: string; modelProfile: string }): Promise<RichTuiTaskRunResult> {
   const startedAt = Date.now();
   const platform = await createLocalPlatform(input.workspace, {
-    provider: input.provider,
-    maxSteps: TUI_RUN_MAX_STEPS,
+    modelProfile: input.modelProfile,
     onAgentProgress: input.onEvent,
   });
   try {
+    const session = await platform.store.getSession(input.sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${input.sessionId}`);
+    }
+    const transcript = agentMessagesToRichTuiTranscript(await platform.store.getMessages(input.sessionId));
+    if (session.status === "completed" || session.status === "cancelled") {
+      const report = await buildSessionReportView(platform.store, input.sessionId);
+      return {
+        answer: "",
+        sessionId: input.sessionId,
+        durationMs: Date.now() - startedAt,
+        todos: report.todos,
+        transcript,
+        restoredOnly: true,
+        sessionStatus: session.status,
+      };
+    }
     const answer = await platform.agent.resume(input.sessionId);
+    const report = await buildSessionReportView(platform.store, input.sessionId);
     return {
       answer,
       sessionId: input.sessionId,
       durationMs: Date.now() - startedAt,
+      todos: report.todos,
+      transcript,
     };
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function pauseRichTuiAgentSession(input: RichTuiSessionControlInput & { workspace: string }): Promise<void> {
+  const platform = await createLocalPlatform(input.workspace);
+  try {
+    await platform.tasks.pause({
+      sessionId: input.sessionId,
+      actor: { type: "user", id: "local-user", displayName: "Local User" },
+      reason: input.reason,
+    });
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function cancelRichTuiAgentSession(input: RichTuiSessionControlInput & { workspace: string }): Promise<void> {
+  const platform = await createLocalPlatform(input.workspace);
+  try {
+    await platform.tasks.cancel({
+      sessionId: input.sessionId,
+      actor: { type: "user", id: "local-user", displayName: "Local User" },
+      reason: input.reason,
+    });
+  } finally {
+    platform.locks.close?.();
+    platform.store.close();
+  }
+}
+
+async function backgroundRichTuiAgentSession(input: RichTuiBackgroundSessionInput & { workspace: string }): Promise<void> {
+  const platform = await createLocalPlatform(input.workspace);
+  try {
+    const session = await platform.store.getSession(input.sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${input.sessionId}`);
+    }
+    const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
+    const workers = await platform.workers.list({ limit: 50 });
+    let worker = workers.find((candidate) => candidate.status === "online" && candidate.currentLoad < candidate.maxConcurrentTasks);
+    if (!worker) {
+      const workerActor = { type: "agent" as const, id: platform.localAgent.id, displayName: platform.localAgent.displayName };
+      worker = await platform.workers.register({
+        actor: workerActor,
+        agentId: platform.localAgent.id,
+        machineId: platform.localAgent.machineId,
+        displayName: `${platform.localAgent.displayName} worker`,
+        allowedProjects: session.projectId ? [session.projectId] : [],
+        ttlSeconds: 300,
+      });
+    }
+    await platform.assignments.assign({
+      actor,
+      workerId: worker.id,
+      sessionId: session.id,
+      leaseTtlSeconds: 300,
+      metadata: { source: "rich_tui_background" },
+    });
   } finally {
     platform.locks.close?.();
     platform.store.close();
@@ -14101,6 +26849,7 @@ async function buildRichTuiSessions(workspace: string): Promise<RichTuiSessionsR
         targetMode: entry.session.targetMode,
         status: entry.session.status,
         outcome: entry.summary.outcome,
+        workspace,
         pendingApprovals: entry.summary.pendingApprovals,
         commandsFinished: entry.summary.commandsFinished,
         failedCommands: entry.summary.failedCommands,
@@ -14127,7 +26876,7 @@ function richTuiModeToTargetMode(mode: RichTuiMode): "plan" | "build" | "goal" {
   return "build";
 }
 
-async function runRichTuiModelSetup(workspace: string, historyRoot: string, profileStore: LocalProviderProfileStore): Promise<RichTuiModelSetupResult> {
+async function runRichTuiModelSetup(workspace: string, historyRoot: string, profileStore: GlobalModelProfileStore): Promise<RichTuiModelSetupResult> {
   const rl = createInterface({ input: stdin, output: stdout });
   try {
     const result = await promptTuiModelSetupMenu(createTuiLineReader(rl), workspace, profileStore);
@@ -14146,35 +26895,36 @@ async function runRichTuiModelSetup(workspace: string, historyRoot: string, prof
 async function saveRichTuiModelSetup(
   workspace: string,
   historyRoot: string,
-  profileStore: LocalProviderProfileStore,
+  profileStore: GlobalModelProfileStore,
   input: RichModelSetupRequest,
 ): Promise<RichTuiModelSetupResult> {
   const apiKeySecretRef = input.protocol === "mock"
     ? undefined
-    : await storeModelApiKeyFromRichSetup(workspace, input.provider, input.apiKey);
+    : await storeModelApiKeyFromRichSetup(profileStore, input.provider, input.apiKey);
   const profile = await profileStore.set({
-    name: input.provider,
+    id: input.provider,
+    provider: input.provider,
     protocol: input.protocol,
     defaultBaseUrl: input.baseUrl,
     defaultModel: input.model,
     apiKeyEnvNames: input.protocol === "mock" ? [] : input.apiKeyEnvNames,
     apiKeySecretRef,
   });
-  await profileStore.setDefaultProvider(input.provider);
+  await profileStore.setDefaultProfile(input.provider);
   const status = await buildSoloclawStatus(historyRoot, workspace, input.provider);
   return {
-    provider: input.provider,
+    provider: profile.id,
     model: profile.defaultModel,
     readiness: status.readiness.status,
   };
 }
 
-async function storeModelApiKeyFromRichSetup(workspace: string, provider: ModelProviderName, apiKey: string | undefined): Promise<string> {
+async function storeModelApiKeyFromRichSetup(profileStore: GlobalModelProfileStore, provider: ModelProviderName, apiKey: string | undefined): Promise<string> {
   if (!apiKey?.trim()) {
     throw new Error("API key cannot be empty.");
   }
-  ensureLocalSecretVaultPassphraseFile(workspace);
-  return storeModelApiKeySecret(workspace, provider, apiKey.trim());
+  ensureGlobalSecretVaultPassphraseFile(profileStore.home);
+  return storeModelApiKeySecret(profileStore, provider, apiKey.trim());
 }
 
 async function promptLine(question: string): Promise<string> {
@@ -14252,19 +27002,19 @@ const MODEL_SETUP_PROVIDER_ORDER: ModelProviderName[] = [
 ];
 
 type TuiModelSetupResult = {
-  provider: ModelProviderName;
-  profile: ModelProviderProfileView;
+  provider: string;
+  profile: GlobalModelProfileView;
 };
 
 async function promptTuiModelSetupMenu(
   rl: TuiQuestionReader,
   workspace: string,
-  profileStore: LocalProviderProfileStore,
+  profileStore: GlobalModelProfileStore,
 ): Promise<TuiModelSetupResult> {
   const profiles = await profileStore.list();
   const orderedProfiles = MODEL_SETUP_PROVIDER_ORDER
-    .map((name) => profiles.find((profile) => profile.name === name))
-    .filter((profile): profile is ModelProviderProfileView => Boolean(profile));
+    .map((name) => profiles.find((profile) => profile.id === name))
+    .filter((profile): profile is GlobalModelProfileView => Boolean(profile));
   stdout.write("Model setup\n");
   const providerIndex = await promptTuiChoiceIndex(rl, "Provider", orderedProfiles.map(modelProviderMenuLine), 0);
   const current = orderedProfiles[providerIndex];
@@ -14274,22 +27024,28 @@ async function promptTuiModelSetupMenu(
   const model = await promptTuiModelId(rl, current);
   const keyConfig = await promptTuiModelApiKeyConfig(rl, workspace, current);
   const profile = await profileStore.set({
-    name: providerName,
+    id: providerName,
+    provider: providerName,
+    displayName: current.displayName,
     protocol: current.protocol,
     defaultBaseUrl: baseUrl ?? current.defaultBaseUrl,
     defaultModel: model,
     apiKeyEnvNames: keyConfig.apiKeyEnvNames,
     apiKeySecretRef: keyConfig.apiKeySecretRef,
+    modelIds: current.modelIds,
+    docsUrl: current.docsUrl,
+    apiKeysUrl: current.apiKeysUrl,
+    pricingUrl: current.pricingUrl,
   });
-  await profileStore.setDefaultProvider(providerName);
-  return { provider: providerName, profile };
+  await profileStore.setDefaultProfile(profile.id);
+  return { provider: profile.id, profile };
 }
 
-function modelProviderMenuLine(profile: ModelProviderProfileView): string {
+function modelProviderMenuLine(profile: GlobalModelProfileView): string {
   return `${profile.displayName ?? profile.name} (${profile.defaultBaseUrl ?? "no base URL"})`;
 }
 
-async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string> {
+async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: GlobalModelProfileView): Promise<string> {
   while (true) {
     const value = (await rl.question(`Base URL [${profile.defaultBaseUrl ?? ""}]: `)).trim();
     const baseUrl = value || profile.defaultBaseUrl;
@@ -14312,7 +27068,7 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
-async function promptTuiModelId(rl: TuiQuestionReader, profile: ModelProviderProfileView): Promise<string> {
+async function promptTuiModelId(rl: TuiQuestionReader, profile: GlobalModelProfileView): Promise<string> {
   const modelIds = modelChoicesForProfile(profile);
   const choice = await promptTuiChoiceIndex(rl, "Model ID", [...modelIds, "Custom model ID"], 0);
   if (choice < modelIds.length) {
@@ -14321,26 +27077,27 @@ async function promptTuiModelId(rl: TuiQuestionReader, profile: ModelProviderPro
   return (await rl.question("Custom model ID: ")).trim() || profile.defaultModel;
 }
 
-function modelChoicesForProfile(profile: ModelProviderProfileView): string[] {
+function modelChoicesForProfile(profile: GlobalModelProfileView): string[] {
   return [...new Set([profile.defaultModel, ...(profile.modelIds ?? [])].filter(Boolean))];
 }
 
 async function promptTuiModelApiKeyConfig(
   rl: TuiQuestionReader,
   workspace: string,
-  profile: ModelProviderProfileView,
+  profile: GlobalModelProfileView,
 ): Promise<{ apiKeyEnvNames: string[]; apiKeySecretRef?: string }> {
   if (profile.protocol === "mock") {
     return { apiKeyEnvNames: [] };
   }
-  ensureLocalSecretVaultPassphraseFile(workspace);
+  const profileStore = new GlobalModelProfileStore();
+  ensureGlobalSecretVaultPassphraseFile(profileStore.home);
   const apiKey = await promptRequiredTuiLine(rl, "API key: ", "API key cannot be empty.");
-  const secretRef = await storeModelApiKeySecret(workspace, profile.name, apiKey);
+  const secretRef = await storeModelApiKeySecret(profileStore, profile.provider, apiKey);
   return { apiKeyEnvNames: profile.apiKeyEnvNames, apiKeySecretRef: secretRef };
 }
 
-function requiresCustomBaseUrl(profile: ModelProviderProfileView): boolean {
-  return profile.name === "openai_compatible" || profile.name === "anthropic_compatible";
+function requiresCustomBaseUrl(profile: GlobalModelProfileView): boolean {
+  return profile.provider === "openai_compatible" || profile.provider === "anthropic_compatible";
 }
 
 async function promptRequiredTuiLine(rl: TuiQuestionReader, question: string, emptyMessage: string): Promise<string> {
@@ -14506,9 +27263,9 @@ async function ensureSecretVaultPassphrase(rl: TuiQuestionReader): Promise<void>
   process.env.AGENT_SECRETS_PASSPHRASE = passphrase;
 }
 
-async function ensureTuiModelSecretReady(rl: TuiQuestionReader, profileStore: LocalProviderProfileStore, provider: ModelProviderName, workspace: string): Promise<void> {
-  const profile = (await profileStore.list()).find((entry) => entry.name === provider);
-  if (profile?.apiKeySecretRef && !process.env.AGENT_SECRETS_PASSPHRASE && !(await fileExists(localSecretVaultPassphraseFile(workspace)))) {
+async function ensureTuiModelSecretReady(rl: TuiQuestionReader, profileStore: GlobalModelProfileStore, profileId: string, _workspace: string): Promise<void> {
+  const profile = (await profileStore.list()).find((entry) => entry.id === profileId);
+  if (profile?.apiKeySecretRef && !process.env.AGENT_SECRETS_PASSPHRASE && !(await fileExists(globalSecretVaultPassphraseFile(profileStore.home)))) {
     await ensureSecretVaultPassphrase(rl);
   }
 }
@@ -14522,13 +27279,16 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function storeModelApiKeySecret(workspace: string, provider: ModelProviderName, apiKey: string): Promise<string> {
-  const secrets = new EncryptedFileSecretStore(path.join(workspace, ".agent", "secrets.vault.json"), localSecretVaultStoreOptions(workspace));
+async function storeModelApiKeySecret(profileStore: GlobalModelProfileStore, provider: ModelProviderName, apiKey: string): Promise<string> {
+  const secrets = new EncryptedFileSecretStore(
+    globalSecretVaultPath(profileStore.home),
+    { passphraseFile: globalSecretVaultPassphraseFile(profileStore.home) },
+  );
   const ref = await secrets.putSecret({
     name: `model:${provider}`,
     class: "model_api_key",
-    scopeType: "workspace",
-    scopeId: "local",
+    scopeType: "user",
+    scopeId: "global",
     value: apiKey,
   });
   return ref.id;
@@ -14592,9 +27352,10 @@ async function readStdinText(): Promise<string> {
 type ModelProfileCliOptions = {
   json?: boolean;
   wizard?: boolean;
+  profileId?: string;
   provider?: ModelProviderName;
   providerInput?: string;
-  protocol?: "openai_chat" | "anthropic_messages" | "mock";
+  protocol?: "openai_chat" | "openai_responses" | "anthropic_messages" | "mock";
   baseUrl?: string;
   model?: string;
   apiKeyEnvNames?: string[];
@@ -14648,6 +27409,11 @@ function parseModelProfileArgs(args: string[]): { options: ModelProfileCliOption
       options.wizard = true;
       continue;
     }
+    if ((arg === "--profile" || arg === "--model-profile") && next) {
+      options.profileId = next;
+      index += 1;
+      continue;
+    }
     if (arg === "--provider" && next) {
       options.providerInput = next;
       options.provider = parseModelProviderName(next);
@@ -14661,8 +27427,8 @@ function parseModelProfileArgs(args: string[]): { options: ModelProfileCliOption
       continue;
     }
     if (arg === "--protocol" && next) {
-      if (next !== "openai_chat" && next !== "anthropic_messages" && next !== "mock") {
-        throw new Error("--protocol must be openai_chat, anthropic_messages, or mock.");
+      if (next !== "openai_chat" && next !== "openai_responses" && next !== "anthropic_messages" && next !== "mock") {
+        throw new Error("--protocol must be openai_chat, openai_responses, anthropic_messages, or mock.");
       }
       options.protocol = next;
       index += 1;
@@ -15100,12 +27866,22 @@ function createTuiRunProgressReporter(): (event: AgentLoopProgressEvent) => void
       case "tool_finished":
         console.log(`[step ${event.step}] tool ${event.toolName} ${event.status === "ok" ? "ok" : `failed${event.errorCode ? ` code=${event.errorCode}` : ""}`}`);
         return;
+      case "goal_updated":
+        console.log(`[goal] ${event.status} modelCalls=${event.modelCalls ?? 0}`);
+        return;
+      case "run_budget_checkpoint":
+        console.log(`[budget] steps=${event.steps} modelCalls=${event.modelCalls} elapsedMs=${event.elapsedMs}`);
+        return;
+      case "guardrail_tripped":
+        console.log(`[guardrail] ${event.guardrail} ${event.count !== undefined ? `count=${event.count} ` : ""}${event.toolName ?? ""}`);
+        return;
       case "step_limit_reached":
         console.log(`[step ${event.maxSteps}] step budget reached`);
         return;
       case "assistant_note":
       case "assistant_text":
       case "file_changed":
+      case "runtime_stopped":
       case "run_failed":
         return;
     }
@@ -15157,12 +27933,44 @@ Start here:
 
 Everyday commands:
   soloclaw status [--json]                      Show active workspace, model, and readiness
+  soloclaw platform doctor [--json]             Show OS paths, shell hints, and local capabilities
   soloclaw workspace list|add|use               Manage recent and active workspaces
   soloclaw providers [--json]                   List built-in provider defaults
   soloclaw model list|env|check|use|setup       View and configure model profiles
   soloclaw config path|show [--json]            Locate or inspect editable JSON config
   soloclaw inspect [--json]                     Show the project context the agent sees
   soloclaw run|plan|build|goal "task"           Use advanced local task modes
+  soloclaw phase4 verify [--json]               Verify multi-platform local-agent readiness
+  soloclaw phase5 verify [--json]               Verify local remote-room agent exchange
+  soloclaw phase5 matrix-template [--target id] Print cross-machine room smoke commands
+  soloclaw phase5 evidence-plan [--registered-pull-target id] [--json]
+                                                 Print the per-target evidence collection manifest
+  soloclaw phase5 collection-runbook [--registered-pull-target id] [--output path] [--force] [--json]
+                                                 Print the control-host collection sequence
+  soloclaw phase5 collection-prepare [--registered-pull-target id] [--force]
+                                                 Write the control-host collection workspace
+  soloclaw phase5 registered-pull-operator-next --registered-pull-target id [--output path] [--force]
+                                                 Write only the registered-pull operator-next handoff
+  soloclaw phase5 registered-pull-evidence-patch --registered-pull-target id [--status-file path] [--pull-agent-file path] [--invitations-file path] [--accept-room-file path] [--room-show-file path] [--delivery-status-file path] [--output path] [--control-fragment-file path --patched-control-fragment-output path] [--force]
+                                                 Build a paste-safe room.registeredAgentPull patch
+  soloclaw phase5 collector-guide --target id [--registered-pull-target id] [--include-smoke-commands]
+                                                 Print one target's evidence collection steps
+  soloclaw phase5 collector-pack [--target id] [--registered-pull-target id] [--include-smoke-commands] [--force]
+                                                 Write per-target collector guide files
+  soloclaw phase5 evidence-init [--registered-pull-target id] [--force]
+                                                 Write base and per-target evidence templates
+  soloclaw phase5 evidence-status --file path --target-dir path [--target id] [--registered-pull-target id] [--include-missing-evidence]
+                                                 Summarize collected evidence fragments
+  soloclaw phase5 evidence-template [--target id] [--registered-pull-target id]
+                                                 Print paste-safe room smoke evidence JSON
+  soloclaw phase5 evidence-check --file path --target id
+                                                 Preflight one remote target evidence fragment
+  soloclaw phase5 evidence-merge --file path --target-file path|--target-dir path
+                                                 Merge per-target room smoke evidence fragments
+  soloclaw phase5 evidence-check --file path    Validate full cross-machine room smoke evidence
+  soloclaw room invite-agent <room-id> ...       Create a one-file remote-agent room invite
+  soloclaw room pull-agent <room-id> <agent-id>  Pull a registered remote agent into a room
+  soloclaw room join --invite-bundle path        Join a room from an invite bundle
 
 Model setup examples:
   soloclaw setup --wizard
@@ -15175,11 +27983,68 @@ Config:
   Workspace history: .agent/workspaces.json
   Model profiles:   .agent/model-providers.json
   Secrets:          store environment variable names or secret refs, not raw keys
+  Context compaction:
+    --context-window-tokens n --context-compaction-threshold-percent 80
+    or SOLOCLAW_CONTEXT_WINDOW_TOKENS / SOLOCLAW_CONTEXT_COMPACTION_THRESHOLD_PERCENT
 
 More:
   soloclaw help --all                           Show the full compatibility command reference
   agent help --all                              Same full reference through the compatibility alias
 `);
+}
+
+function printRoomConvenienceHelp() {
+  console.log(`Soloclaw room shortcuts
+
+Invite a remote agent:
+  soloclaw room invite-agent <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--json]
+
+Pull a registered remote agent into a room:
+  soloclaw room pull-agent <room-id> <agent-id> [--alias alias] [--role executor] [--local-agent] [--json]
+
+Accept a room invitation from the remote machine:
+  agent remote invitations --control-url url --control-token token [--json]
+  agent remote accept-room --control-url url --control-token token --room room-id [--run] [--status-file path] [--json]
+
+Join and optionally run from a remote machine:
+  soloclaw room join --invite-bundle room-invite.json [--run] [--status-file .agent/tmp/remote-room-status.json] [--stop-file .agent/tmp/remote-room.stop] [--reply-template text] [--json]
+
+Inspect the metadata-only remote runner service plan:
+  soloclaw room service --control-url url --room room-id [--status-file .agent/tmp/remote-room-status.json] [--stop-file .agent/tmp/remote-room.stop] [--json]
+
+Lower-level equivalents:
+  agent remote register --control-url url --control-token token [--display-name name] [--json]
+  agent rooms pull-agent <room-id> <agent-id> [--alias alias] [--role role] [--json]
+  agent rooms invite-bundle <room-id> --control-url url --control-token token [--json]
+  agent remote join-bundle --invite-bundle room-invite.json [--run] [--status-file path] [--stop-file path] [--json]
+  agent remote service --control-url url --room room-id [--status-file path] [--stop-file path] [--json]
+`);
+}
+
+function normalizeRoomConvenienceCommand(command: string, rest: string[]): { command: string; rest: string[] } {
+  if (command !== "room") {
+    return { command, rest };
+  }
+  const [subcommand, ...args] = rest;
+  if (subcommand === "invite-agent" || subcommand === "invite-bundle") {
+    return { command: "rooms", rest: ["invite-bundle", ...args] };
+  }
+  if (subcommand === "pull-agent") {
+    return { command: "rooms", rest: ["pull-agent", ...args] };
+  }
+  if (subcommand === "join" || subcommand === "join-bundle") {
+    return { command: "remote", rest: ["join-bundle", ...args] };
+  }
+  if (subcommand === "run") {
+    return { command: "remote", rest: ["run", ...args] };
+  }
+  if (subcommand === "service" || subcommand === "daemon") {
+    return { command: "remote", rest: ["service", ...args] };
+  }
+  if (subcommand === "remote-say") {
+    return { command: "remote", rest: ["say", ...args] };
+  }
+  return { command: "rooms", rest };
 }
 
 function printFullHelp() {
@@ -15221,7 +28086,7 @@ Usage:
   soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|gemini|kimi|grok|minimax|deepseek|glm|qwen|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--workspace-runtime typescript|rust|auto] [--agent-runner path] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|gemini|kimi|grok|minimax|deepseek|glm|qwen|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--context-window-tokens n] [--context-compaction-threshold-percent 1-100] [--context-compaction-buffer-tokens n] [--context-output-reserve-tokens n] [--context-compaction-keep-tokens n] [--context-compaction-summary-mode heuristic|model|auto] [--no-context-compaction] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -15243,6 +28108,10 @@ Usage:
   soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]
   soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed
   soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]
+  soloclaw phase3 long-task-gate [--workspace path] [--json]
+  soloclaw phase3 long-task-real-provider [--workspace path] [--json]
+  soloclaw phase4 checklist|verify|matrix-template [--workspace path] [--workspace-runtime typescript|rust|auto] [--json]
+  soloclaw phase5 checklist|verify|matrix-template|evidence-plan|collection-runbook|collection-prepare|registered-pull-operator-next|registered-pull-evidence-patch|collector-guide|collector-pack|evidence-init|evidence-status|evidence-template|evidence-merge|evidence-check [--workspace path] [--file path] [--target target-id] [--registered-pull-target target-id] [--status-file path] [--pull-agent-file path] [--invitations-file path] [--accept-room-file path] [--room-show-file path] [--delivery-status-file path] [--control-fragment-file path] [--patched-control-fragment-output path] [--target-file path] [--target-dir path] [--output path] [--output-dir path] [--include-smoke-commands] [--include-missing-evidence] [--force] [--json]
   agent phase2 checklist
   agent local status [--workspace path] [--json] [--limit n]
   agent local service [--workspace path] [--json] [--limit n]
@@ -15260,20 +28129,33 @@ Usage:
   agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]
   agent session result <session-id> [--json]
   agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
-  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
+  agent resume <session-id> [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--provider provider] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--context-window-tokens n] [--context-compaction-threshold-percent 1-100] [--context-compaction-summary-mode heuristic|model|auto] [--no-context-compaction] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]
   agent pause <session-id> [reason]
   agent cancel <session-id> [reason]
   agent identity show
   agent agents [--limit n]
   agent agents health [--now iso-timestamp] [--limit n] [--json]
+  agent agents recover-stale [--now iso-timestamp] [--limit n] [--local-agent|--actor user:id|agent:id] [--json]
   agent operator status [--kind kind] [--status status] [--severity ok|info|warning|critical] [--id item-or-ref-id] [--details] [--rows] [--public] [--actor user:id|agent:id] [--limit n] [--json]
   agent operator show <item-id-or-ref-id>|--select n [--kind kind] [--status status] [--severity severity] [--public] [--actor user:id|agent:id] [--json]
+  agent room invite-agent <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--json]
+  agent room pull-agent <room-id> <agent-id> [--alias alias] [--role role] [--local-agent|--actor user:id|agent:id] [--json]
+  agent room join --invite-bundle path [--run] [--status-file path] [--stop-file path] [--reply-template text] [--json]
+  agent rooms create [--local-agent] [--join-policy invite_token|manual|fingerprint_allowlist] [--require-signed-invites] <name>
+  agent rooms pull-agent <room-id> <agent-id> [--alias alias] [--role participant|observer|executor|reviewer|approver] [--local-agent|--actor user:id|agent:id] [--json]
+  agent rooms invite-bundle <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--json]
+  agent remote register --control-url url [--control-token token] [--display-name name] [--json]
+  agent remote invitations --control-url url [--control-token token] [--json]
+  agent remote accept-room --control-url url [--control-token token] --room room-id [--alias alias] [--run] [--status-file path] [--stop-file path] [--json]
+  agent remote join-bundle --invite-bundle path [--run] [--status-file path] [--stop-file path] [--reply-template text] [--json]
   agent remote enroll --control-url url [--control-token token] --room room-id --invite-token token [--alias alias] [--display-name name] [--json]
   agent remote inbox --control-url url [--control-token token] --room room-id [--limit n] [--include-delivered] [--json]
+  agent remote say --control-url url [--control-token token] --room room-id [--kind chat|task|decision|tool_request|approval|artifact|system] <message>
   agent remote ack --control-url url [--control-token token] --room room-id [--message-id message-id] [--json]
   agent remote poll --control-url url [--control-token token] --room room-id [--limit n] [--idle-limit n] [--interval-ms n] [--json]
   agent remote heartbeat --control-url url [--control-token token] --room room-id [--status online|idle|running|error|offline] [--ttl seconds] [--last-error text] [--json]
-  agent remote run --control-url url [--control-token token] --room room-id [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--backoff-ms n] [--max-backoff-ms n] [--max-errors n] [--heartbeat-ttl seconds] [--json]
+  agent remote service --control-url url --room room-id [--control-token token] [--status-file path] [--stop-file path] [--json]
+  agent remote run --control-url url [--control-token token] --room room-id [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--backoff-ms n] [--max-backoff-ms n] [--max-errors n] [--heartbeat-ttl seconds] [--reply-template text] [--status-file path] [--stop-file path] [--json]
   agent workers register [--display-name name] [--endpoint url] [--cap capability] [--project project-id] [--max-tasks n] [--ttl seconds]
   agent workers heartbeat <worker-id> [--status online|offline|draining|suspended] [--load n] [--max-tasks n] [--ttl seconds]
   agent workers drain <worker-id> [reason] [--ttl seconds]
@@ -15462,6 +28344,7 @@ Examples:
   agent identity show
   agent agents
   agent agents health --json
+  agent agents recover-stale --now 2026-06-21T12:00:00.000Z --json
   agent operator status --limit 3
   agent operator status --kind spec --status blocked --details
   agent operator status --public --json
@@ -15469,12 +28352,20 @@ Examples:
   agent operator status --rows --json
   agent operator show --kind queue --select 1 --json
   agent operator show queue:local --json
+  agent rooms create --local-agent --join-policy invite_token --require-signed-invites "phase5 room"
+  agent room invite-agent room_xxxxxxxx --control-url http://127.0.0.1:4317 --control-token local-dev-token --alias builder --display-name builder --json > room-invite.json
+  agent room join --invite-bundle room-invite.json --json
+  agent room join --invite-bundle room-invite.json --run --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template "@owner handled {messageId}" --json
+  agent rooms invite-bundle room_xxxxxxxx --control-url http://127.0.0.1:4317 --control-token local-dev-token --alias builder --display-name builder --json > room-invite.json
+  agent remote join-bundle --invite-bundle room-invite.json --json
+  agent remote join-bundle --invite-bundle room-invite.json --run --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template "@owner handled {messageId}" --json
   agent remote enroll --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --invite-token rinv_xxxxxxxx --alias builder
   agent remote inbox --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --json
+  agent remote say --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx "@owner hello from this machine"
   agent remote ack --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx
   agent remote poll --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --limit 5 --idle-limit 1
   agent remote heartbeat --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --status online
-  agent remote run --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --cycles 100 --stop-when-idle --idle-cycles 3 --heartbeat-ttl 60
+  agent remote run --control-url http://127.0.0.1:4317 --control-token local-dev-token --room room_xxxxxxxx --cycles 100 --stop-when-idle --idle-cycles 3 --heartbeat-ttl 60 --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template "@owner handled {messageId}"
   agent workers register --display-name "Local Worker" --cap workspace.exec --project proj_xxxxxxxx
   agent workers run-once worker_xxxxxxxx
   agent workers poll worker_xxxxxxxx --limit 5 --idle-limit 1
@@ -16060,6 +28951,11 @@ function parseRemoteArgs(args: string[]): { options: RemoteCliOptions; positiona
       index += 1;
       continue;
     }
+    if ((arg === "--invite-bundle" || arg === "--bundle") && next) {
+      options.inviteBundlePath = next;
+      index += 1;
+      continue;
+    }
     if (arg === "--room" && next) {
       options.roomId = next;
       index += 1;
@@ -16077,6 +28973,11 @@ function parseRemoteArgs(args: string[]): { options: RemoteCliOptions; positiona
     }
     if (arg === "--message-id" && next) {
       options.messageId = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--kind" && next) {
+      options.kind = parseRoomMessageKind(next);
       index += 1;
       continue;
     }
@@ -16153,6 +29054,25 @@ function parseRemoteArgs(args: string[]): { options: RemoteCliOptions; positiona
       index += 1;
       continue;
     }
+    if (arg === "--reply-template" && next) {
+      options.replyTemplate = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--status-file" && next) {
+      options.statusFilePath = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--stop-file" && next) {
+      options.stopFilePath = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--run") {
+      options.runAfterJoin = true;
+      continue;
+    }
     if (arg === "--include-delivered") {
       options.includeDelivered = true;
       continue;
@@ -16186,6 +29106,442 @@ async function controlPlaneJson<T>(controlUrl: string, path: string, token: stri
     throw new Error(`Control plane ${response.status}: ${payload.error ?? response.statusText}`);
   }
   return payload as T;
+}
+
+function formatRemoteReplyTemplate(
+  template: string,
+  message: { id: string; kind: string; body: string; createdAt: string },
+  context: { roomId: string; agentId: string },
+): string {
+  return template
+    .replaceAll("{messageId}", message.id)
+    .replaceAll("{kind}", message.kind)
+    .replaceAll("{body}", message.body)
+    .replaceAll("{createdAt}", message.createdAt)
+    .replaceAll("{roomId}", context.roomId)
+    .replaceAll("{agentId}", context.agentId);
+}
+
+function buildRemoteInviteBundle(input: {
+  controlUrl: string;
+  controlToken: string;
+  roomId: string;
+  inviteToken: string;
+  inviteId?: string;
+  inviteSignatureStatus: string;
+  role: RoomRole;
+  aliases: string[];
+  displayName?: string;
+  expiresAt?: string;
+  maxUses?: number;
+}): RemoteInviteBundle {
+  return {
+    kind: "soloclaw.room_invite",
+    version: 1,
+    controlUrl: input.controlUrl,
+    controlToken: input.controlToken,
+    roomId: input.roomId,
+    inviteToken: input.inviteToken,
+    inviteId: input.inviteId,
+    inviteSignatureStatus: input.inviteSignatureStatus,
+    role: input.role,
+    aliases: input.aliases,
+    displayName: input.displayName,
+    expiresAt: input.expiresAt,
+    maxUses: input.maxUses,
+    sensitivity: "contains_control_token_and_invite_token_do_not_commit",
+    defaultRun: {
+      cycles: 20,
+      limit: 5,
+      idleLimit: 1,
+      intervalMs: 1000,
+      loopIntervalMs: 1000,
+      stopWhenIdle: true,
+      idleCycles: 2,
+      backoffMs: 1000,
+      maxBackoffMs: 30000,
+      maxErrors: 3,
+      heartbeatTtlSeconds: 60,
+    },
+    commands: {
+      enroll: "agent room join --invite-bundle room-invite.json --json",
+      run: "agent room join --invite-bundle room-invite.json --run --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template \"@owner handled {messageId}\" --json",
+    },
+  };
+}
+
+function formatRemoteInviteBundle(bundle: RemoteInviteBundle): string {
+  return [
+    `room-bundle\t${bundle.roomId}\tsignature=${bundle.inviteSignatureStatus ?? "-"}\texpires=${bundle.expiresAt ?? "-"}`,
+    "Save the JSON form as room-invite.json on the remote machine, then run:",
+    bundle.commands?.enroll ?? "agent room join --invite-bundle room-invite.json --json",
+    bundle.commands?.run ?? "agent room join --invite-bundle room-invite.json --run --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template \"@owner handled {messageId}\" --json",
+    "Read .agent/tmp/remote-room-status.json for runner evidence; create .agent/tmp/remote-room.stop to request graceful shutdown.",
+    "This bundle contains the control token and invite token. Do not commit or paste it into logs.",
+  ].join("\n");
+}
+
+async function readRemoteInviteBundle(filePath: string): Promise<RemoteInviteBundle> {
+  const parsed = JSON.parse(await readUtf8(filePath)) as unknown;
+  if (!isRecord(parsed)) {
+    throw new Error("Invite bundle must be a JSON object.");
+  }
+  if (parsed.kind !== "soloclaw.room_invite" || parsed.version !== 1) {
+    throw new Error("Invite bundle must have kind=soloclaw.room_invite and version=1.");
+  }
+  const controlUrl = requiredBundleString(parsed.controlUrl, "controlUrl");
+  const roomId = requiredBundleString(parsed.roomId, "roomId");
+  const inviteToken = requiredBundleString(parsed.inviteToken, "inviteToken");
+  const aliases = Array.isArray(parsed.aliases)
+    ? parsed.aliases.filter((alias): alias is string => typeof alias === "string" && alias.trim().length > 0)
+    : [];
+  const defaultRun = isRecord(parsed.defaultRun)
+    ? {
+        cycles: optionalBundleNumber(parsed.defaultRun.cycles),
+        limit: optionalBundleNumber(parsed.defaultRun.limit),
+        idleLimit: optionalBundleNumber(parsed.defaultRun.idleLimit),
+        intervalMs: optionalBundleNumber(parsed.defaultRun.intervalMs),
+        loopIntervalMs: optionalBundleNumber(parsed.defaultRun.loopIntervalMs),
+        stopWhenIdle: typeof parsed.defaultRun.stopWhenIdle === "boolean" ? parsed.defaultRun.stopWhenIdle : undefined,
+        idleCycles: optionalBundleNumber(parsed.defaultRun.idleCycles),
+        backoffMs: optionalBundleNumber(parsed.defaultRun.backoffMs),
+        maxBackoffMs: optionalBundleNumber(parsed.defaultRun.maxBackoffMs),
+        maxErrors: optionalBundleNumber(parsed.defaultRun.maxErrors),
+        heartbeatTtlSeconds: optionalBundleNumber(parsed.defaultRun.heartbeatTtlSeconds),
+      }
+    : undefined;
+  return {
+    kind: "soloclaw.room_invite",
+    version: 1,
+    controlUrl,
+    controlToken: typeof parsed.controlToken === "string" && parsed.controlToken.trim().length > 0 ? parsed.controlToken : undefined,
+    roomId,
+    inviteToken,
+    inviteId: typeof parsed.inviteId === "string" ? parsed.inviteId : undefined,
+    inviteSignatureStatus: typeof parsed.inviteSignatureStatus === "string" ? parsed.inviteSignatureStatus : undefined,
+    role: typeof parsed.role === "string" ? parseRoomRole(parsed.role) : undefined,
+    aliases,
+    displayName: typeof parsed.displayName === "string" && parsed.displayName.trim().length > 0 ? parsed.displayName : undefined,
+    expiresAt: typeof parsed.expiresAt === "string" ? parsed.expiresAt : undefined,
+    maxUses: optionalBundleNumber(parsed.maxUses),
+    sensitivity: typeof parsed.sensitivity === "string" ? parsed.sensitivity : undefined,
+    defaultRun,
+  };
+}
+
+function requiredBundleString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Invite bundle is missing ${field}.`);
+  }
+  return value;
+}
+
+function optionalBundleNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+type RemoteRunnerStatus = {
+  kind: "soloclaw.remote_room_runner_status";
+  version: 1;
+  updatedAt: string;
+  roomId: string;
+  agentId: string;
+  machineId?: string;
+  status: "joined" | "starting" | "running" | "idle" | "error" | "stopped";
+  stopReason?: string;
+  cycles?: number;
+  idleCycles?: number;
+  messagesProcessed: number;
+  lastPollStopReason?: string;
+  lastAckMessageId?: string;
+  lastAckSigned?: boolean;
+  lastHeartbeat?: {
+    agentId: string;
+    machineId: string;
+    status?: AgentHeartbeatStatus;
+    lastHeartbeatAt?: string;
+    heartbeatExpiresAt?: string;
+    lastRoomId?: string;
+    lastError?: string;
+  };
+  lifecycle?: DaemonLifecycleSnapshot;
+  errorCount: number;
+  lastError?: string;
+};
+
+type RemoteRoomServicePlan = {
+  kind: "soloclaw.remote_room_service_plan";
+  version: 1;
+  generatedAt: string;
+  workspace: string;
+  controlUrl: string;
+  roomId: string;
+  platform: NodeJS.Platform;
+  serviceName: "soloclaw-remote-room-agent";
+  manager: {
+    kind: LocalAgentServiceManager;
+    label: string;
+    supported: boolean;
+  };
+  ready: boolean;
+  blocked: boolean;
+  entrypoint: {
+    foregroundCommand: string;
+    tokenSource: "AGENT_CONTROL_TOKEN";
+  };
+  health: {
+    statusFile: string;
+    stopFile: string;
+    statusCommand: string;
+    healthCommand: string;
+  };
+  supervision: {
+    installState: "plan_only";
+    restartPolicy: "supervisor_managed";
+    stopPolicy: string;
+    note: string;
+  };
+  nextCommand: string;
+  steps: LocalAgentRunbookStep[];
+};
+
+function buildRemoteRoomServicePlan(input: {
+  workspace: string;
+  controlUrl: string;
+  roomId: string;
+  options: RemoteCliOptions;
+}): RemoteRoomServicePlan {
+  const statusFile = input.options.statusFilePath ?? ".agent/tmp/remote-room-status.json";
+  const stopFile = input.options.stopFilePath ?? ".agent/tmp/remote-room.stop";
+  assertPathInsideWorkspace(input.workspace, statusFile, "--status-file");
+  assertPathInsideWorkspace(input.workspace, stopFile, "--stop-file");
+
+  const maxCycles = input.options.maxCycles ?? 10;
+  const limit = input.options.limit ?? 10;
+  const idleLimit = input.options.maxIdlePolls ?? 1;
+  const intervalMs = input.options.idleIntervalMs ?? 1000;
+  const loopIntervalMs = input.options.loopIntervalMs ?? 1000;
+  const idleCycles = input.options.maxIdleCycles ?? 1;
+  const backoffMs = input.options.baseBackoffMs ?? 1000;
+  const maxBackoffMs = input.options.maxBackoffMs ?? 30000;
+  const maxErrors = input.options.maxErrors ?? 3;
+  const heartbeatTtl = input.options.heartbeatTtlSeconds ?? 60;
+  const foregroundCommand = [
+    "agent remote run",
+    `--control-url ${input.controlUrl}`,
+    "--control-token <control-token>",
+    `--room ${input.roomId}`,
+    `--cycles ${maxCycles}`,
+    `--limit ${limit}`,
+    `--idle-limit ${idleLimit}`,
+    `--interval-ms ${intervalMs}`,
+    `--loop-interval-ms ${loopIntervalMs}`,
+    input.options.stopWhenIdle ? "--stop-when-idle" : undefined,
+    `--idle-cycles ${idleCycles}`,
+    `--backoff-ms ${backoffMs}`,
+    `--max-backoff-ms ${maxBackoffMs}`,
+    `--max-errors ${maxErrors}`,
+    `--heartbeat-ttl ${heartbeatTtl}`,
+    `--status-file ${statusFile}`,
+    `--stop-file ${stopFile}`,
+    "--json",
+  ].filter(Boolean).join(" ");
+  const statusCommand = [
+    "agent remote service",
+    `--control-url ${input.controlUrl}`,
+    `--room ${input.roomId}`,
+    `--status-file ${statusFile}`,
+    `--stop-file ${stopFile}`,
+    "--json",
+  ].join(" ");
+  const healthCommand = [
+    "agent remote heartbeat",
+    `--control-url ${input.controlUrl}`,
+    "--control-token <control-token>",
+    `--room ${input.roomId}`,
+    "--status online",
+    `--ttl ${heartbeatTtl}`,
+    "--json",
+  ].join(" ");
+  const manager = localAgentServiceManager(process.platform);
+  const steps: LocalAgentRunbookStep[] = [
+    {
+      id: "check-service-plan",
+      label: "Check remote service plan",
+      status: "required",
+      command: statusCommand,
+      reason: "Review the workspace-local runner paths and token-safe entrypoint before supervising this remote room agent.",
+    },
+    {
+      id: "run-foreground-loop",
+      label: "Run foreground remote room loop",
+      status: "recommended",
+      command: foregroundCommand,
+      reason: "Use the foreground runner as the supervised process until an OS service owns this remote room agent.",
+    },
+    {
+      id: "check-health",
+      label: "Submit signed heartbeat",
+      status: "recommended",
+      command: healthCommand,
+      reason: "Refresh signed room health after startup or before routing work to this agent.",
+    },
+    {
+      id: "request-shutdown",
+      label: "Request graceful shutdown",
+      status: "optional",
+      command: `create ${stopFile}`,
+      reason: "Create the workspace-local stop marker to ask the foreground runner to stop before claiming more inbox work.",
+    },
+    {
+      id: "wrap-os-supervisor",
+      label: "Wrap with OS supervisor",
+      status: "blocked",
+      reason: `${localAgentServiceManagerLabel(manager)} service installation is still plan-only for Phase 5; use the foreground command for evidence.`,
+    },
+  ];
+
+  return {
+    kind: "soloclaw.remote_room_service_plan",
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    workspace: input.workspace,
+    controlUrl: input.controlUrl,
+    roomId: input.roomId,
+    platform: process.platform,
+    serviceName: "soloclaw-remote-room-agent",
+    manager: {
+      kind: manager,
+      label: localAgentServiceManagerLabel(manager),
+      supported: manager !== "foreground",
+    },
+    ready: true,
+    blocked: false,
+    entrypoint: {
+      foregroundCommand,
+      tokenSource: "AGENT_CONTROL_TOKEN",
+    },
+    health: {
+      statusFile,
+      stopFile,
+      statusCommand,
+      healthCommand,
+    },
+    supervision: {
+      installState: "plan_only",
+      restartPolicy: "supervisor_managed",
+      stopPolicy: `create ${stopFile}, then inspect ${statusFile} and agent agents health --json from the control workspace`,
+      note: "This plan is metadata-only; it does not register, start, stop, or mutate an OS service and never records the control token.",
+    },
+    nextCommand: foregroundCommand,
+    steps,
+  };
+}
+
+function createRemoteRunnerStatusReporter(input: {
+  cwd: string;
+  statusFilePath: string;
+  roomId: string;
+  agentId: string;
+  machineId?: string;
+}) {
+  const state: Omit<RemoteRunnerStatus, "kind" | "version" | "updatedAt"> = {
+    roomId: input.roomId,
+    agentId: input.agentId,
+    machineId: input.machineId,
+    status: "starting",
+    messagesProcessed: 0,
+    errorCount: 0,
+  };
+
+  const write = async (patch: Partial<Omit<RemoteRunnerStatus, "kind" | "version" | "updatedAt" | "roomId" | "agentId" | "machineId">>) => {
+    Object.assign(state, patch);
+    await writeJsonOutputInsideWorkspace(input.cwd, input.statusFilePath, {
+      kind: "soloclaw.remote_room_runner_status",
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      ...state,
+    } satisfies RemoteRunnerStatus, "--status-file");
+  };
+
+  return {
+    write,
+    async recordPoll(poll: RemoteRoomPollResult) {
+      const lastAck = poll.acknowledgements.at(-1);
+      await write({
+        status: poll.messagesProcessed > 0 ? "running" : "idle",
+        messagesProcessed: state.messagesProcessed + poll.messagesProcessed,
+        lastPollStopReason: poll.stopReason,
+        lastAckMessageId: lastAck?.messageId ?? state.lastAckMessageId,
+        lastAckSigned: lastAck ? Boolean(lastAck.ackSignature) : state.lastAckSigned,
+        errorCount: state.errorCount,
+      });
+    },
+    async recordError(error: Error, cycle: number) {
+      await write({
+        status: "error",
+        cycles: cycle,
+        errorCount: state.errorCount + 1,
+        lastError: error.message,
+      });
+    },
+    async recordStop(result: RemoteRoomRunResult) {
+      const lastAck = result.acknowledgements.at(-1);
+      await write({
+        status: "stopped",
+        stopReason: result.stopReason,
+        cycles: result.cycles,
+        idleCycles: result.idleCycles,
+        messagesProcessed: result.messagesProcessed,
+        lastPollStopReason: result.polls.at(-1)?.stopReason ?? state.lastPollStopReason,
+        lastAckMessageId: lastAck?.messageId ?? state.lastAckMessageId,
+        lastAckSigned: lastAck ? Boolean(lastAck.ackSignature) : state.lastAckSigned,
+        lastHeartbeat: result.lastHeartbeat ?? state.lastHeartbeat,
+        lifecycle: result.lifecycle,
+        errorCount: result.errors.length,
+        lastError: result.errors.at(-1)?.message ?? state.lastError,
+      });
+    },
+  };
+}
+
+function createRemoteRunnerStopFileLifecycle(cwd: string, stopFilePath: string): {
+  lifecycle: DaemonLifecycleController;
+  requestShutdownIfStopFilePresent: () => Promise<void>;
+} {
+  const resolved = path.resolve(cwd, stopFilePath);
+  const relative = path.relative(cwd, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("--stop-file must stay inside the current workspace.");
+  }
+
+  const lifecycle = new DaemonLifecycleController("remote-room-runner");
+  return {
+    lifecycle,
+    async requestShutdownIfStopFilePresent() {
+      if (lifecycle.isShutdownRequested) {
+        return;
+      }
+      try {
+        await fs.stat(resolved);
+      } catch (error) {
+        const code = nodeErrorCode(error);
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          return;
+        }
+        throw error;
+      }
+      await lifecycle.requestShutdown("stop-file");
+    },
+  };
+}
+
+function nodeErrorCode(error: unknown): string | undefined {
+  if (error instanceof Error && "code" in error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
 }
 
 function isTargetModeCommand(value: string): boolean {
@@ -16242,6 +29598,28 @@ function parseRoomMemberStatus(value: string): RoomMemberStatus {
   throw new Error(`Invalid room member status: ${value}.`);
 }
 
+function parseAgentTrustStatus(value: string): AgentTrustStatus {
+  if (value === "pending" || value === "trusted" || value === "suspended" || value === "revoked" || value === "expired") {
+    return value;
+  }
+  throw new Error(`Invalid agent trust status: ${value}.`);
+}
+
+function parseRoomMessageKind(value: string): RoomMessageKind {
+  if (
+    value === "chat" ||
+    value === "task" ||
+    value === "decision" ||
+    value === "tool_request" ||
+    value === "approval" ||
+    value === "artifact" ||
+    value === "system"
+  ) {
+    return value;
+  }
+  throw new Error(`Invalid room message kind: ${value}.`);
+}
+
 function isWorkerHeartbeatEnvelope(value: unknown): value is WorkerHeartbeatEnvelope {
   return (
     isRecord(value) &&
@@ -16270,6 +29648,9 @@ function parseKnowledgeSafetyMode(value: string): KnowledgeSafetyMode {
 type RoomCliOptions = {
   actor?: string;
   agentId?: string;
+  controlUrl?: string;
+  controlToken?: string;
+  displayName?: string;
   role?: "owner" | "moderator" | "participant" | "observer" | "executor" | "reviewer" | "approver";
   status?: "invited" | "pending" | "active" | "suspended" | "left" | "removed" | "expired";
   kind?: "chat" | "task" | "decision" | "tool_request" | "approval" | "artifact" | "system";
@@ -16298,6 +29679,7 @@ type RoomCliOptions = {
 type RemoteCliOptions = {
   controlUrl?: string;
   controlToken?: string;
+  inviteBundlePath?: string;
   roomId?: string;
   inviteToken?: string;
   displayName?: string;
@@ -16317,8 +29699,47 @@ type RemoteCliOptions = {
   ttlSeconds?: number;
   heartbeatStatus?: AgentHeartbeatStatus;
   lastError?: string;
+  replyTemplate?: string;
+  statusFilePath?: string;
+  stopFilePath?: string;
+  runAfterJoin?: boolean;
   includeDelivered?: boolean;
+  kind?: RoomMessageKind;
   json?: boolean;
+};
+
+type RemoteInviteBundle = {
+  kind: "soloclaw.room_invite";
+  version: 1;
+  controlUrl: string;
+  controlToken?: string;
+  roomId: string;
+  inviteToken: string;
+  inviteId?: string;
+  inviteSignatureStatus?: string;
+  role?: RoomRole;
+  aliases?: string[];
+  displayName?: string;
+  expiresAt?: string;
+  maxUses?: number;
+  sensitivity?: string;
+  defaultRun?: {
+    cycles?: number;
+    limit?: number;
+    idleLimit?: number;
+    intervalMs?: number;
+    loopIntervalMs?: number;
+    stopWhenIdle?: boolean;
+    idleCycles?: number;
+    backoffMs?: number;
+    maxBackoffMs?: number;
+    maxErrors?: number;
+    heartbeatTtlSeconds?: number;
+  };
+  commands?: {
+    enroll: string;
+    run: string;
+  };
 };
 
 type WorkerCliOptions = {
@@ -17853,6 +31274,21 @@ function parseRoomArgs(args: string[]): { options: RoomCliOptions; positionals: 
       index += 1;
       continue;
     }
+    if (arg === "--control-url" && next) {
+      options.controlUrl = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--control-token" && next) {
+      options.controlToken = next;
+      index += 1;
+      continue;
+    }
+    if (arg === "--display-name" && next) {
+      options.displayName = next;
+      index += 1;
+      continue;
+    }
     if ((arg === "--agent-id" || arg === "--agent") && next) {
       options.agentId = next;
       index += 1;
@@ -18387,7 +31823,27 @@ function localUserActor() {
 
 async function readUtf8(filePath: string): Promise<string> {
   const { promises: fs } = await import("node:fs");
-  return fs.readFile(filePath, "utf8");
+  const bytes = await fs.readFile(filePath);
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return bytes.subarray(3).toString("utf8");
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return bytes.subarray(2).toString("utf16le");
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return decodeUtf16Be(bytes.subarray(2));
+  }
+  return bytes.toString("utf8");
+}
+
+function decodeUtf16Be(bytes: Buffer): string {
+  const evenLength = bytes.length - (bytes.length % 2);
+  const swapped = Buffer.alloc(evenLength);
+  for (let index = 0; index < evenLength; index += 2) {
+    swapped[index] = bytes[index + 1];
+    swapped[index + 1] = bytes[index];
+  }
+  return swapped.toString("utf16le");
 }
 
 function printWorker(worker: WorkerRegistration): void {

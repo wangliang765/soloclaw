@@ -1,4 +1,4 @@
-import type { ActorRef } from "../domain/index.js";
+import type { ActorRef, SessionTodo, SessionTodoPriority, SessionTodoStatus } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import type { JsonObject, RegisteredTool, ToolResult } from "../protocol/types.js";
 import type { AgentStore } from "../store/agent-store.js";
@@ -79,6 +79,44 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
           detailsHidden: true,
         });
       },
+    },
+    {
+      name: "todowrite",
+      description: "Create and maintain the structured task list for the current coding session. Use it during multi-step work and keep statuses current.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                content: { type: "string" },
+                status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+                priority: { type: "string", enum: ["high", "medium", "low"] },
+              },
+              required: ["content", "status", "priority"],
+            },
+          },
+        },
+        required: ["todos"],
+      },
+      handler: async (input) =>
+        wrap("todowrite", async () => {
+          const sessionId = resolveSessionId(options);
+          if (!options.store || !sessionId) {
+            throw new Error("todowrite requires a session store and session id.");
+          }
+          const todos = todosInput(input);
+          await options.store.replaceSessionTodos(sessionId, todos);
+          return {
+            output: JSON.stringify(todos, null, 2),
+            display: {
+              title: "Update task list",
+              detailsHidden: true,
+            },
+          };
+        }),
     },
     {
       name: "run_command",
@@ -273,6 +311,44 @@ function stringInput(input: JsonObject, key: string): string {
 function optionalString(input: JsonObject, key: string): string | undefined {
   const value = input[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function todosInput(input: JsonObject): SessionTodo[] {
+  const value = input.todos;
+  if (!Array.isArray(value)) {
+    throw new Error("Expected array input: todos");
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Expected todo object at index ${index}`);
+    }
+    const candidate = item as Record<string, unknown>;
+    const content = candidate.content;
+    const status = candidate.status;
+    const priority = candidate.priority;
+    if (typeof content !== "string" || content.trim().length === 0) {
+      throw new Error(`Expected non-empty todo content at index ${index}`);
+    }
+    if (!isSessionTodoStatus(status)) {
+      throw new Error(`Invalid todo status at index ${index}`);
+    }
+    if (!isSessionTodoPriority(priority)) {
+      throw new Error(`Invalid todo priority at index ${index}`);
+    }
+    return {
+      content,
+      status,
+      priority,
+    };
+  });
+}
+
+function isSessionTodoStatus(value: unknown): value is SessionTodoStatus {
+  return value === "pending" || value === "in_progress" || value === "completed" || value === "cancelled";
+}
+
+function isSessionTodoPriority(value: unknown): value is SessionTodoPriority {
+  return value === "high" || value === "medium" || value === "low";
 }
 
 function numberInput(input: JsonObject, key: string): number | undefined {

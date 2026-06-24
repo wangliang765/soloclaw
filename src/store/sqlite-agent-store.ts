@@ -10,6 +10,8 @@ import type {
   AuditEvent,
   CapabilityGrant,
   FileChange,
+  GoalCheckpoint,
+  GoalRun,
   KnowledgeChunk,
   KnowledgeEvalRun,
   KnowledgeEvalSet,
@@ -27,8 +29,10 @@ import type {
   RoomInvite,
   RoomMember,
   RoomMessage,
+  RoomMessageIntentNonce,
   Session,
   SessionLink,
+  SessionTodo,
   SessionSummary,
   Skill,
   SkillUsageEvent,
@@ -50,6 +54,7 @@ import type {
   AgentStore,
   AppendMessageInput,
   CreateSessionInput,
+  ListGoalRunsInput,
   ListAuditEventsInput,
   ListKnowledgeEvalRunsInput,
   ListKnowledgeEvalSetsInput,
@@ -63,6 +68,7 @@ import type {
   RecordAgentHeartbeatNonceInput,
   RecordTaskLeaseNonceInput,
   RecordRoomDeliveryAckNonceInput,
+  RecordRoomMessageIntentNonceInput,
   RecordWorkerHeartbeatNonceInput,
   RecordToolCallInput,
   WorkerHeartbeatInput,
@@ -174,6 +180,100 @@ export class SqliteAgentStore implements AgentStore {
       ? (this.db.prepare("SELECT * FROM file_changes WHERE session_id = ? ORDER BY created_at DESC").all(sessionId) as FileChangeRow[])
       : (this.db.prepare("SELECT * FROM file_changes ORDER BY created_at DESC").all() as FileChangeRow[]);
     return rows.map(fileChangeFromRow);
+  }
+
+  async createGoalRun(goal: GoalRun): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO goals (
+          id, session_id, objective, status, token_budget, token_used, model_calls,
+          repeated_blocker_key, repeated_blockers, created_by_json, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        goal.id,
+        goal.sessionId,
+        goal.objective,
+        goal.status,
+        goal.tokenBudget ?? null,
+        goal.tokenUsed,
+        goal.modelCalls,
+        goal.repeatedBlockerKey ?? null,
+        goal.repeatedBlockers,
+        JSON.stringify(goal.createdBy),
+        goal.createdAt,
+        goal.updatedAt,
+        goal.completedAt ?? null,
+      );
+  }
+
+  async updateGoalRun(goal: GoalRun): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE goals SET
+          objective = ?, status = ?, token_budget = ?, token_used = ?, model_calls = ?,
+          repeated_blocker_key = ?, repeated_blockers = ?, updated_at = ?, completed_at = ?
+        WHERE id = ?`,
+      )
+      .run(
+        goal.objective,
+        goal.status,
+        goal.tokenBudget ?? null,
+        goal.tokenUsed,
+        goal.modelCalls,
+        goal.repeatedBlockerKey ?? null,
+        goal.repeatedBlockers,
+        goal.updatedAt,
+        goal.completedAt ?? null,
+        goal.id,
+      );
+  }
+
+  async getGoalRun(goalId: string): Promise<GoalRun | undefined> {
+    const row = this.db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as GoalRunRow | undefined;
+    return row ? goalRunFromRow(row) : undefined;
+  }
+
+  async getGoalRunBySession(sessionId: string): Promise<GoalRun | undefined> {
+    const row = this.db.prepare("SELECT * FROM goals WHERE session_id = ?").get(sessionId) as GoalRunRow | undefined;
+    return row ? goalRunFromRow(row) : undefined;
+  }
+
+  async listGoalRuns(input: ListGoalRunsInput = {}): Promise<GoalRun[]> {
+    const values: SQLInputValue[] = [];
+    const where = input.status ? "WHERE status = ?" : "";
+    if (input.status) {
+      values.push(input.status);
+    }
+    values.push(input.limit ?? 50);
+    const rows = this.db.prepare(`SELECT * FROM goals ${where} ORDER BY updated_at DESC LIMIT ?`).all(...values) as GoalRunRow[];
+    return rows.map(goalRunFromRow);
+  }
+
+  async addGoalCheckpoint(checkpoint: GoalCheckpoint): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO goal_checkpoints (
+          id, goal_id, session_id, kind, summary, blocker_key, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        checkpoint.id,
+        checkpoint.goalId,
+        checkpoint.sessionId,
+        checkpoint.kind,
+        checkpoint.summary,
+        checkpoint.blockerKey ?? null,
+        JSON.stringify(checkpoint.metadata ?? {}),
+        checkpoint.createdAt,
+      );
+  }
+
+  async listGoalCheckpoints(goalId: string, limit = 50): Promise<GoalCheckpoint[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM goal_checkpoints WHERE goal_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(goalId, limit) as GoalCheckpointRow[];
+    return rows.map(goalCheckpointFromRow);
   }
 
   async createKnowledgeSource(source: KnowledgeSource): Promise<void> {
@@ -991,6 +1091,48 @@ export class SqliteAgentStore implements AgentStore {
          WHERE rowid IN (
            SELECT rowid
            FROM room_delivery_ack_nonces
+           WHERE expires_at IS NOT NULL AND expires_at <= ?
+           ORDER BY first_seen_at ASC
+           LIMIT ?
+         )`,
+      )
+      .run(input.before, limit);
+    return Number(result.changes ?? 0);
+  }
+
+  async recordRoomMessageIntentNonce(input: RecordRoomMessageIntentNonceInput): Promise<boolean> {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO room_message_intent_nonces (
+            agent_id, nonce, room_id, envelope_hash, first_seen_at, expires_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.agentId, input.nonce, input.roomId, input.envelopeHash, input.firstSeenAt, input.expiresAt ?? null);
+      return true;
+    } catch (error) {
+      if (error instanceof Error && /UNIQUE|constraint/i.test(error.message)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  async getRoomMessageIntentNonce(agentId: string, nonce: string): Promise<RoomMessageIntentNonce | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM room_message_intent_nonces WHERE agent_id = ? AND nonce = ?")
+      .get(agentId, nonce) as RoomMessageIntentNonceRow | undefined;
+    return row ? roomMessageIntentNonceFromRow(row) : undefined;
+  }
+
+  async deleteRoomMessageIntentNoncesBefore(input: { before: string; limit?: number }): Promise<number> {
+    const limit = input.limit ?? 1000;
+    const result = this.db
+      .prepare(
+        `DELETE FROM room_message_intent_nonces
+         WHERE rowid IN (
+           SELECT rowid
+           FROM room_message_intent_nonces
            WHERE expires_at IS NOT NULL AND expires_at <= ?
            ORDER BY first_seen_at ASC
            LIMIT ?
@@ -1841,6 +1983,32 @@ export class SqliteAgentStore implements AgentStore {
     return rows.map((row) => JSON.parse(row.result_json) as ToolResult);
   }
 
+  async replaceSessionTodos(sessionId: string, todos: SessionTodo[]): Promise<void> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM session_todos WHERE session_id = ?").run(sessionId);
+      const insert = this.db.prepare(
+        `INSERT INTO session_todos (
+          session_id, position, content, status, priority
+        ) VALUES (?, ?, ?, ?, ?)`,
+      );
+      todos.forEach((todo, position) => {
+        insert.run(sessionId, position, todo.content, todo.status, todo.priority);
+      });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async listSessionTodos(sessionId: string): Promise<SessionTodo[]> {
+    const rows = this.db
+      .prepare("SELECT content, status, priority FROM session_todos WHERE session_id = ? ORDER BY position ASC")
+      .all(sessionId) as SessionTodoRow[];
+    return rows.map(sessionTodoFromRow);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -2055,6 +2223,16 @@ export class SqliteAgentStore implements AgentStore {
         nonce TEXT NOT NULL,
         room_id TEXT NOT NULL,
         message_id TEXT NOT NULL,
+        envelope_hash TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        expires_at TEXT,
+        PRIMARY KEY (agent_id, nonce)
+      );
+
+      CREATE TABLE IF NOT EXISTS room_message_intent_nonces (
+        agent_id TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        room_id TEXT NOT NULL,
         envelope_hash TEXT NOT NULL,
         first_seen_at TEXT NOT NULL,
         expires_at TEXT,
@@ -2395,11 +2573,49 @@ export class SqliteAgentStore implements AgentStore {
         last_used_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS session_todos (
+        session_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        PRIMARY KEY (session_id, position),
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS session_summaries (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         summary TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS goals (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL UNIQUE,
+        objective TEXT NOT NULL,
+        status TEXT NOT NULL,
+        token_budget INTEGER,
+        token_used INTEGER NOT NULL,
+        model_calls INTEGER NOT NULL,
+        repeated_blocker_key TEXT,
+        repeated_blockers INTEGER NOT NULL,
+        created_by_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS goal_checkpoints (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        blocker_key TEXT,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
@@ -2421,6 +2637,7 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_task_lease_nonces_assignment ON task_lease_nonces(assignment_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_task_lease_nonces_worker ON task_lease_nonces(worker_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_room_delivery_ack_nonces_room ON room_delivery_ack_nonces(room_id, first_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_room_message_intent_nonces_room ON room_message_intent_nonces(room_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_room_invites_room ON room_invites(room_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_room_invites_token_hash ON room_invites(token_hash);
       CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at);
@@ -2452,7 +2669,10 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_eval_set ON knowledge_eval_runs(eval_set_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_scope ON knowledge_eval_runs(scope_type, scope_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_session_todos_session ON session_todos(session_id, position);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_session ON session_summaries(session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_goals_status_updated ON goals(status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_goal_checkpoints_goal_created ON goal_checkpoints(goal_id, created_at);
     `);
     this.addColumnIfMissing("sessions", "target_mode", "TEXT NOT NULL DEFAULT 'build'");
     this.addColumnIfMissing("pending_tool_calls", "tool_call_id", "TEXT");
@@ -2719,6 +2939,15 @@ type RoomDeliveryAckNonceRow = {
   expires_at: string | null;
 };
 
+type RoomMessageIntentNonceRow = {
+  agent_id: string;
+  nonce: string;
+  room_id: string;
+  envelope_hash: string;
+  first_seen_at: string;
+  expires_at: string | null;
+};
+
 function agentFromRow(row: AgentRow): AgentIdentity {
   return {
     id: row.id as AgentIdentity["id"],
@@ -2800,6 +3029,17 @@ function roomDeliveryAckNonceFromRow(row: RoomDeliveryAckNonceRow): RoomDelivery
     nonce: row.nonce,
     roomId: row.room_id as RoomDeliveryAckNonce["roomId"],
     messageId: row.message_id,
+    envelopeHash: row.envelope_hash,
+    firstSeenAt: row.first_seen_at,
+    expiresAt: row.expires_at ?? undefined,
+  };
+}
+
+function roomMessageIntentNonceFromRow(row: RoomMessageIntentNonceRow): RoomMessageIntentNonce {
+  return {
+    agentId: row.agent_id as RoomMessageIntentNonce["agentId"],
+    nonce: row.nonce,
+    roomId: row.room_id as RoomMessageIntentNonce["roomId"],
     envelopeHash: row.envelope_hash,
     firstSeenAt: row.first_seen_at,
     expiresAt: row.expires_at ?? undefined,
@@ -3493,6 +3733,39 @@ type SessionSummaryRow = {
   created_at: string;
 };
 
+type SessionTodoRow = {
+  content: string;
+  status: SessionTodo["status"];
+  priority: SessionTodo["priority"];
+};
+
+type GoalRunRow = {
+  id: string;
+  session_id: string;
+  objective: string;
+  status: GoalRun["status"];
+  token_budget: number | null;
+  token_used: number;
+  model_calls: number;
+  repeated_blocker_key: string | null;
+  repeated_blockers: number;
+  created_by_json: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
+type GoalCheckpointRow = {
+  id: string;
+  goal_id: string;
+  session_id: string;
+  kind: GoalCheckpoint["kind"];
+  summary: string;
+  blocker_key: string | null;
+  metadata_json: string;
+  created_at: string;
+};
+
 function skillFromRow(row: SkillRow): Skill {
   return {
     id: row.id,
@@ -3535,6 +3808,45 @@ function sessionSummaryFromRow(row: SessionSummaryRow): SessionSummary {
     id: row.id,
     sessionId: row.session_id,
     summary: row.summary,
+    createdAt: row.created_at,
+  };
+}
+
+function sessionTodoFromRow(row: SessionTodoRow): SessionTodo {
+  return {
+    content: row.content,
+    status: row.status,
+    priority: row.priority,
+  };
+}
+
+function goalRunFromRow(row: GoalRunRow): GoalRun {
+  return {
+    id: row.id,
+    sessionId: row.session_id as GoalRun["sessionId"],
+    objective: row.objective,
+    status: row.status,
+    tokenBudget: row.token_budget ?? undefined,
+    tokenUsed: row.token_used,
+    modelCalls: row.model_calls,
+    repeatedBlockerKey: row.repeated_blocker_key ?? undefined,
+    repeatedBlockers: row.repeated_blockers,
+    createdBy: JSON.parse(row.created_by_json) as GoalRun["createdBy"],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at ?? undefined,
+  };
+}
+
+function goalCheckpointFromRow(row: GoalCheckpointRow): GoalCheckpoint {
+  return {
+    id: row.id,
+    goalId: row.goal_id,
+    sessionId: row.session_id as GoalCheckpoint["sessionId"],
+    kind: row.kind,
+    summary: row.summary,
+    blockerKey: row.blocker_key ?? undefined,
+    metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
     createdAt: row.created_at,
   };
 }

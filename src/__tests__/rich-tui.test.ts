@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clip, padRight, visibleLength } from "../cli/tui/ansi.js";
+import { clip, padRight, stripAnsi, visibleLength } from "../cli/tui/ansi.js";
 import { renderEventRow, renderProjectedAssistantPartRow } from "../cli/tui/event-renderer.js";
 import { renderConversationScreen, renderWelcomeScreen } from "../cli/tui/layout.js";
 import { TUI_COMMANDS } from "../cli/tui/commands.js";
@@ -18,7 +18,7 @@ test("rich tui width helpers count CJK characters as double-width", () => {
   assert.equal(padRight("\u4f60\u597d", 6), "\u4f60\u597d  ");
 });
 
-test("rich tui welcome screen shows Soloclaw workbench ledger entry points", () => {
+test("rich tui welcome screen opens in the chat-first shell", () => {
   const state: RichTuiState = {
     workspace: "E:\\code\\agent",
     provider: "deepseek",
@@ -30,16 +30,19 @@ test("rich tui welcome screen shows Soloclaw workbench ledger entry points", () 
     events: [],
   };
   const screen = renderWelcomeScreen(state, { columns: 100, rows: 30 });
-  assert.match(screen, /SOLOCLAW Workbench/);
-  assert.match(screen, /MISSION/);
-  assert.match(screen, /MODEL/);
-  assert.match(screen, /NEXT/);
-  assert.match(screen, /INPUT DOCK/);
+  assert.match(screen, /Soloclaw/);
+  assert.match(screen, /Ask Soloclaw/);
+  assert.match(screen, /Plan/);
+  assert.match(screen, /Model/);
+  assert.match(screen, /Run/);
+  assert.match(screen, /Workspace/);
   assert.match(screen, /Build/);
   assert.match(screen, /deepseek-v4-flash/);
-  assert.match(screen, /E:\\code\\agent/);
+  assert.match(screen, /agent/);
+  assert.doesNotMatch(screen, /MISSION|LEDGER|CHECKS|INPUT DOCK/);
   assert.doesNotMatch(screen, /Ask anything/);
   assert.doesNotMatch(screen, /___.*\/ /);
+  assert.equal(screen.split("\n").every((line) => visibleLength(line) <= 100), true);
 });
 
 test("rich tui layout falls back gracefully on narrow terminals", () => {
@@ -58,7 +61,7 @@ test("rich tui layout falls back gracefully on narrow terminals", () => {
   assert.match(screen, /soloclaw/i);
 });
 
-test("rich tui conversation screen shows work ledger without right status rail", () => {
+test("rich tui conversation screen uses chat-first layout with a right status rail", () => {
   const state: RichTuiState = {
     workspace: "E:\\code\\agent",
     provider: "deepseek",
@@ -75,24 +78,147 @@ test("rich tui conversation screen shows work ledger without right status rail",
     lsp: { enabled: false, label: "LSPs are disabled" },
     objective: "Add lightning tower",
     runHealth: "Working",
+    currentActivity: "Editing",
+    stepCount: 2,
+    todos: [
+      { content: "Inspect TUI renderer", status: "completed", priority: "high" },
+      { content: "Polish chat layout", status: "in_progress", priority: "high" },
+      { content: "Update rich TUI tests", status: "pending", priority: "medium" },
+    ],
     version: "0.2.0",
   };
   const screen = renderConversationScreen(state, { columns: 140, rows: 34 });
-  assert.match(screen, /SOLOCLAW Workbench/);
-  assert.match(screen, /MISSION/);
-  assert.match(screen, /LEDGER/);
-  assert.match(screen, /CHECKS/);
+  assert.match(screen, /Soloclaw/);
+  assert.match(screen, /You/);
   assert.match(screen, /Plan/);
-  assert.match(screen, /Run: Working/);
+  assert.match(screen, /1 \/ 3 done/);
+  assert.match(screen, /Polish chat layout/);
+  assert.match(screen, /Model/);
+  assert.match(screen, /Run/);
   assert.match(screen, /Working/);
-  assert.match(screen, /Context:/);
   assert.match(screen, /9\.6K/);
   assert.match(screen, /5%/);
-  assert.match(screen, /LSPs are disabled/);
   assert.match(screen, /deepseek-v4-flash/);
+  assert.doesNotMatch(screen, /SOLOCLAW Workbench/);
+  assert.doesNotMatch(screen, /MISSION|LEDGER|CHECKS|INPUT DOCK/);
+  assert.equal(screen.split("\n").every((line) => visibleLength(line) <= 140), true);
 });
 
-test("rich tui work ledger renders projected assistant parts inside bounded main lane", () => {
+test("rich tui activity area folds duplicate projected and raw progress rows", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [{ role: "user", text: "Polish the TUI" }],
+    events: [
+      {
+        type: "session_started",
+        runId: "run_dup",
+        sessionId: "sess_dup",
+        objective: "Polish the TUI",
+        targetMode: "build",
+      },
+      {
+        type: "step_started",
+        runId: "run_dup",
+        sessionId: "sess_dup",
+        step: 1,
+      },
+    ],
+    projectedAssistantMessages: [
+      {
+        role: "assistant",
+        runId: "run_dup",
+        sessionId: "sess_dup",
+        parts: [
+          { type: "status", title: "Session sess_dup started", status: "started" },
+          { type: "status", title: "Thinking step 1", step: 1, status: "started" },
+        ],
+      },
+    ],
+    runHealth: "Working",
+    currentActivity: "Thinking",
+    stepCount: 1,
+  };
+
+  const plain = stripAnsi(renderConversationScreen(state, { columns: 120, rows: 24 }));
+
+  assert.equal(countOccurrences(plain, "Session sess_dup"), 1);
+  assert.equal(countOccurrences(plain, "Thinking step 1"), 1);
+});
+
+test("rich tui frames the chat, status rail, and input areas", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "continue polishing",
+    messages: [{ role: "user", text: "Make the TUI calmer" }],
+    events: [],
+    context: { tokens: 12500, percentUsed: 6, windowTokens: 200000 },
+    runHealth: "Working",
+    todos: [
+      { content: "Add pane borders", status: "in_progress", priority: "high" },
+      { content: "Verify smoke flow", status: "pending", priority: "medium" },
+    ],
+  };
+
+  const screen = renderConversationScreen(state, { columns: 132, rows: 30 });
+
+  assert.match(screen, /\+ Conversation -+\+/);
+  assert.match(screen, /\+ Status -+\+/);
+  assert.match(screen, /\+ Input -+\+/);
+  assert.match(screen, /esc stop/);
+  assert.match(screen, /ctrl\+c exit/);
+  assert.doesNotMatch(screen, /esc exit/);
+  assert.equal(screen.split("\n").every((line) => visibleLength(line) <= 132), true);
+});
+
+test("rich tui narrow conversation collapses right rail into compact footer", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "next draft",
+    messages: [
+      { role: "user", text: "Make the TUI calmer" },
+      { role: "assistant", text: "I will keep the chat lane primary." },
+    ],
+    events: [],
+    context: { tokens: 36000, percentUsed: 18, windowTokens: 200000 },
+    runHealth: "Working",
+    currentActivity: "Reading",
+    todos: [
+      { content: "Review layout", status: "completed", priority: "high" },
+      { content: "Render compact footer", status: "in_progress", priority: "medium" },
+    ],
+  };
+
+  const screen = renderConversationScreen(state, { columns: 72, rows: 24 });
+  const lines = screen.split("\n");
+
+  assert.match(screen, /You/);
+  assert.match(screen, /Soloclaw/);
+  assert.match(screen, /Make the TUI calmer/);
+  assert.match(screen, /Build/);
+  assert.match(screen, /Working/);
+  assert.match(screen, /deepseek-v4-flash/);
+  assert.match(screen, /36\.0K \(18%\)/);
+  assert.match(screen, /ctrl\+p commands/);
+  assert.doesNotMatch(screen, /\nPlan\n/);
+  assert.doesNotMatch(screen, /Remaining/);
+  assert.doesNotMatch(screen, /INPUT DOCK|MISSION|LEDGER|CHECKS/);
+  assert.equal(lines.every((line) => visibleLength(line) <= 72), true);
+});
+
+test("rich tui chat lane renders projected assistant parts inside bounded main lane", () => {
   const state: RichTuiState = {
     workspace: "E:\\code\\agent",
     provider: "deepseek",
@@ -131,16 +257,47 @@ test("rich tui work ledger renders projected assistant parts inside bounded main
   const screen = renderConversationScreen(state, { columns: 140, rows: 28 });
   const lines = screen.split("\n");
 
-  assert.match(screen, /LEDGER/);
+  assert.match(screen, /Soloclaw/);
   assert.match(screen, /Thinking step 1/);
   assert.match(screen, /我会先检查游戏数据结构。/);
   assert.match(screen, /Read src\/content\.js/);
   assert.match(screen, /details hidden/);
+  assert.match(screen, /Model/);
   assert.equal(screen.includes("raw stdout"), false);
   assert.equal(lines.every((line) => visibleLength(line) <= 140), true);
 });
 
-test("rich TUI workbench checks show workspace dirty summary", async () => {
+test("rich tui shows a working assistant placeholder after submitted user input", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "fail",
+    mode: "Build",
+    input: "",
+    messages: [{ role: "user", text: "你好" }],
+    events: [],
+    runHealth: "Working",
+    currentActivity: "Running Step 9",
+    stepCount: 9,
+    lastEventTitle: "Run command",
+    todos: [
+      { content: "Apply changes", status: "in_progress", priority: "high" },
+      { content: "Verify result", status: "pending", priority: "medium" },
+    ],
+  };
+
+  const screen = renderConversationScreen(state, { columns: 140, rows: 32 });
+  const plain = stripAnsi(screen);
+
+  assert.match(screen, /You/);
+  assert.match(screen, /你好/);
+  assert.match(plain, /Soloclaw[^\n]*\|\n\|\s+Working on it\.\.\. Running Step 9/);
+  assert.match(screen, /Running Step 9/);
+  assert.doesNotMatch(plain, /Step 9 Step 9/);
+});
+
+test("rich TUI right rail shows workspace dirty summary", async () => {
   const { createStatusMessage } = await import("../cli/tui/rich-shell.js");
   const state: RichTuiState = {
     workspace: "E:\\code\\agent",
@@ -162,7 +319,7 @@ test("rich TUI workbench checks show workspace dirty summary", async () => {
   const screen = renderConversationScreen(state, { columns: 140, rows: 28 });
   const status = createStatusMessage(state);
 
-  assert.match(screen, /phase-two/);
+  assert.match(screen, /Workspace/);
   assert.match(screen, /18 changed/);
   assert.match(status, /Workspace: E:\\code\\agent/);
   assert.match(status, /Git: phase-two, 18 changed/);
@@ -409,10 +566,41 @@ test("rich TUI sessions message summarizes recent sessions", async () => {
   assert.match(message, /Sessions: 1\/3/);
   assert.match(message, /status=completed:1/);
   assert.match(message, /outcome=succeeded:1/);
-  assert.match(message, /sess_test build completed/);
-  assert.match(message, /objective: Add a lightning tower/);
+  assert.match(message, /1\. Add a lightning tower/);
+  assert.match(message, /sess_test \| build \| completed \| succeeded/);
+  assert.match(message, /resume: \/resume 1/);
   assert.match(message, /changes: src\/game\.js/);
   assert.match(message, /next: agent session verify sess_test/);
+});
+
+test("rich TUI sessions message derives a readable title from the objective", async () => {
+  const { createSessionsMessage } = await import("../cli/tui/rich-shell.js");
+  const message = createSessionsMessage({
+    returned: 1,
+    scanned: 1,
+    limit: 5,
+    byStatus: { running: 1 },
+    byOutcome: { pending: 1 },
+    pendingApprovals: 0,
+    changedSessions: 0,
+    sessions: [
+      {
+        id: "sess_game",
+        targetMode: "build",
+        status: "running",
+        outcome: "pending",
+        pendingApprovals: 0,
+        commandsFinished: 0,
+        failedCommands: 0,
+        changedPaths: [],
+        updatedAt: "2026-06-20T10:00:00.000Z",
+        objective: "   怎么启动游戏\n请先检查项目脚本和 README，然后给我可执行步骤。   ",
+      },
+    ],
+  });
+
+  assert.match(message, /1\. 怎么启动游戏 请先检查项目脚本和 README，然后给我可执行步骤。/);
+  assert.match(message, /resume: \/resume 1/);
 });
 
 test("rich TUI key handler covers command palette mode and exit shortcuts", async () => {
@@ -447,6 +635,152 @@ test("rich TUI key handler covers command palette mode and exit shortcuts", asyn
 
   assert.equal(handleRichTuiKey(state, { key: { ctrl: true, name: "p" } }), "redraw");
   assert.equal(handleRichTuiKey(state, { key: { ctrl: true, name: "c" } }), "exit");
+});
+
+test("rich TUI Esc stops the active main-screen generation and Ctrl+C exits", async () => {
+  const { handleRichTuiKey } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [{ role: "user", text: "keep working" }],
+    events: [],
+    runHealth: "Working",
+    activeSessionId: "sess_stop",
+  };
+
+  assert.equal(handleRichTuiKey(state, { key: { name: "escape" }, busy: true }), "cancel");
+
+  state.runHealth = "Ready";
+  assert.equal(handleRichTuiKey(state, { key: { name: "escape" }, busy: false }), "none");
+  assert.equal(handleRichTuiKey(state, { key: { ctrl: true, name: "c" } }), "exit");
+});
+
+test("rich TUI suggests slash commands and completes them with Tab", async () => {
+  const { handleRichTuiKey } = await import("../cli/tui/rich-shell.js");
+  const suggestState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+  } as RichTuiState & { commandSuggestions?: { open: boolean; cursorIndex: number } };
+
+  for (const char of "/mo") {
+    assert.equal(handleRichTuiKey(suggestState, { value: char, key: { name: char } }), "redraw");
+  }
+
+  assert.equal(suggestState.commandSuggestions?.open, true);
+  assert.equal(suggestState.commandSuggestions?.cursorIndex, 0);
+  const suggestions = renderWelcomeScreen(suggestState, { columns: 120, rows: 28 });
+  assert.match(suggestions, /Commands/);
+  assert.match(suggestions, /\/models/);
+  assert.match(suggestions, /\/model setup/);
+
+  assert.equal(handleRichTuiKey(suggestState, { key: { name: "down" } }), "redraw");
+  assert.equal(suggestState.commandSuggestions?.cursorIndex, 1);
+  assert.equal(handleRichTuiKey(suggestState, { key: { name: "tab" } }), "redraw");
+  assert.equal(suggestState.commandSuggestions?.open, false);
+  assert.notEqual(suggestState.input, "/mo");
+
+  const completeState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/model c",
+    messages: [],
+    events: [],
+  } as RichTuiState & { commandSuggestions?: { open: boolean; cursorIndex: number } };
+
+  assert.equal(handleRichTuiKey(completeState, { key: { name: "tab" } }), "redraw");
+  assert.equal(completeState.input, "/model check");
+  assert.equal(completeState.commandSuggestions?.open ?? false, false);
+});
+
+test("rich TUI slash command suggestions render as a popup picker", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/mo",
+    messages: [],
+    events: [],
+    commandSuggestions: { open: true, cursorIndex: 0 },
+  };
+
+  const screen = stripAnsi(renderConversationScreen(state, { columns: 120, rows: 28 }));
+  const optionLine = screen.split("\n").find((line) => line.includes("> /models"));
+
+  assert.match(screen, /\+-+\+/);
+  assert.match(screen, /Commands\s+1-4 of 4/);
+  assert.match(screen, /up\/down select - enter run - tab complete - esc close/);
+  assert.ok(optionLine);
+  assert.ok(optionLine.startsWith(" "));
+});
+
+test("rich TUI executes the selected slash suggestion with Enter", async () => {
+  const { handleRichTuiKey, submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+  } as RichTuiState & { commandSuggestions?: { open: boolean; cursorIndex: number } };
+  let taskRan = false;
+
+  for (const char of "/mo") {
+    assert.equal(handleRichTuiKey(state, { value: char, key: { name: char } }), "redraw");
+  }
+  assert.equal(handleRichTuiKey(state, { key: { name: "down" } }), "redraw");
+  assert.equal(handleRichTuiKey(state, { key: { name: "return" } }), "submit");
+  assert.equal(state.input, "/model setup");
+
+  const action = await submitRichTuiInput(state, {
+    runTask: async () => {
+      taskRan = true;
+      return { answer: "should not run" };
+    },
+  });
+
+  assert.equal(action.type, "model_setup");
+  assert.equal(taskRan, false);
+});
+
+test("rich TUI submits a typed slash command with Enter even while suggestions are visible", async () => {
+  const { handleRichTuiKey } = await import("../cli/tui/rich-shell.js");
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+  } as RichTuiState & { commandSuggestions?: { open: boolean; cursorIndex: number } };
+
+  for (const char of "/resume") {
+    assert.equal(handleRichTuiKey(state, { value: char, key: { name: char } }), "redraw");
+  }
+
+  assert.equal(state.commandSuggestions?.open, true);
+  assert.equal(handleRichTuiKey(state, { key: { name: "return" } }), "submit");
+  assert.equal(state.input, "/resume");
+  assert.equal(state.commandSuggestions?.open ?? false, false);
 });
 
 test("rich TUI key handler submits selected command on enter", async () => {
@@ -741,6 +1075,42 @@ test("rich TUI renders runtime stop rows with resume guidance", async () => {
   assert.match(screen, /Step budget reached: 30/);
 });
 
+test("rich TUI renders guardrail rows and stopped state", async () => {
+  const { applyAgentRunEventToRichState } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+    activeSessionId: "sess_guardrail",
+  };
+  const event = {
+    type: "guardrail_tripped" as const,
+    runId: "run_guardrail",
+    sessionId: "sess_guardrail",
+    guardrail: "doom_loop" as const,
+    reason: "Stopped repeated identical tool call: progress_marker repeated 3 time(s).",
+    toolName: "progress_marker",
+    count: 3,
+    resumeCommand: "agent resume sess_guardrail",
+  };
+
+  applyAgentRunEventToRichState(state, event);
+
+  const row = renderEventRow(event);
+  const screen = renderConversationScreen(state, { columns: 120, rows: 28 });
+  assert.match(row, /Guardrail:/);
+  assert.match(row, /repeated identical tool call/);
+  assert.equal(state.runHealth, "Stopped");
+  assert.equal(state.currentActivity, "Stopped");
+  assert.match(screen, /Run: Stopped/);
+  assert.match(screen, /repeated identical tool call/);
+});
+
 test("rich TUI renders current activity and step in conversation chrome", () => {
   const state: RichTuiState = {
     workspace: "E:\\code\\agent",
@@ -787,6 +1157,168 @@ test("rich TUI stopped runs show resume guidance", async () => {
   assert.match(renderConversationScreen(state, { columns: 120, rows: 28 }), /\/continue/);
 });
 
+test("rich TUI long-task checks show goal budget and controls", () => {
+  assert.equal(TUI_COMMANDS.some((entry) => entry.command === "/pause"), true);
+  assert.equal(TUI_COMMANDS.some((entry) => entry.command === "/cancel"), true);
+  assert.equal(TUI_COMMANDS.some((entry) => entry.command === "/background"), true);
+  assert.equal(TUI_COMMANDS.some((entry) => entry.command === "/goal status"), true);
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Goal",
+    input: "",
+    messages: [{ role: "user", text: "Finish this long task" }],
+    events: [],
+    runHealth: "Working",
+    activeSessionId: "sess_goal",
+    goal: {
+      id: "goal_test",
+      status: "active",
+      objective: "Finish this long task",
+      summary: "editing files",
+      checkpoints: 2,
+      repeatedBlockers: 0,
+      modelCalls: 4,
+      tokenUsed: 1200,
+    },
+    runBudget: {
+      steps: 12,
+      modelCalls: 4,
+      elapsedMs: 1250,
+      maxModelCalls: 20,
+    },
+    todos: [
+      { content: "Inspect long-task state", status: "completed", priority: "high" },
+      { content: "Continue supervised goal", status: "in_progress", priority: "high" },
+      { content: "Run verification gate", status: "pending", priority: "medium" },
+    ],
+  } as RichTuiState;
+
+  const screen = renderConversationScreen(state, { columns: 140, rows: 32 });
+
+  assert.match(screen, /Goal: active/);
+  assert.match(screen, /Progress: 2 checkpoints/);
+  assert.match(screen, /Budget: 4 model calls/);
+  assert.match(screen, /TODO\s+active Continue supervised goal/);
+  assert.match(screen, /Next: \/pause \/cancel \/background/);
+});
+
+test("rich TUI surfaces session todos in checks and ledger", () => {
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [{ role: "user", text: "Finish the long task" }],
+    events: [],
+    runHealth: "Working",
+    activeSessionId: "sess_todos",
+    todos: [
+      { content: "Read project structure", status: "completed", priority: "high" },
+      { content: "Implement long-task continuation", status: "in_progress", priority: "high" },
+      { content: "Run verification gate", status: "pending", priority: "medium" },
+    ],
+  } as RichTuiState;
+
+  const screen = renderConversationScreen(state, { columns: 140, rows: 32 });
+
+  assert.match(screen, /Todos: 1 active, 1 pending, 1 done/);
+  assert.match(screen, /TODO\s+active Implement long-task continuation/);
+  assert.match(screen, /TODO\s+next Run verification gate/);
+});
+
+test("rich TUI long-task commands pause cancel background and show goal status", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Goal",
+    input: "/pause waiting for review",
+    messages: [],
+    events: [],
+    activeSessionId: "sess_goal",
+    goal: {
+      id: "goal_test",
+      status: "active",
+      objective: "Finish this long task",
+      summary: "editing files",
+      checkpoints: 2,
+      repeatedBlockers: 0,
+      modelCalls: 4,
+      tokenUsed: 1200,
+    } as never,
+  };
+  const calls: string[] = [];
+  const context = {
+    pauseSession: async ({ sessionId, reason }: { sessionId: string; reason: string }) => {
+      calls.push(`pause:${sessionId}:${reason}`);
+    },
+    cancelSession: async ({ sessionId, reason }: { sessionId: string; reason: string }) => {
+      calls.push(`cancel:${sessionId}:${reason}`);
+    },
+    backgroundSession: async ({ sessionId }: { sessionId: string }) => {
+      calls.push(`background:${sessionId}`);
+    },
+  } as never;
+
+  await submitRichTuiInput(state, context);
+  assert.equal(state.runHealth, "Paused");
+  assert.match(renderConversationScreen(state, { columns: 120, rows: 28 }), /Run: Paused/);
+  assert.deepEqual(calls, ["pause:sess_goal:waiting for review"]);
+
+  state.input = "/cancel no longer needed";
+  await submitRichTuiInput(state, context);
+  assert.equal(state.runHealth, "Cancelled");
+  assert.match(renderConversationScreen(state, { columns: 120, rows: 28 }), /Run: Cancelled/);
+  assert.equal(calls.at(-1), "cancel:sess_goal:no longer needed");
+
+  state.input = "/background";
+  await submitRichTuiInput(state, context);
+  assert.match(state.messages.at(-1)?.text ?? "", /queued for worker/);
+  assert.equal(calls.at(-1), "background:sess_goal");
+
+  state.input = "/goal status";
+  await submitRichTuiInput(state, context);
+  assert.match(state.messages.at(-1)?.text ?? "", /Goal active/);
+  assert.match(state.messages.at(-1)?.text ?? "", /2 checkpoints/);
+});
+
+test("rich TUI submit stores todos returned by the task runner", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "finish the task",
+    messages: [],
+    events: [],
+  };
+
+  await submitRichTuiInput(state, {
+    runTask: async () => ({
+      answer: "done",
+      sessionId: "sess_todos",
+      todos: [
+        { content: "Implement long-task continuation", status: "completed", priority: "high" },
+        { content: "Run verification gate", status: "pending", priority: "medium" },
+      ],
+    }),
+  });
+
+  assert.deepEqual(state.todos?.map((todo) => todo.content), [
+    "Implement long-task continuation",
+    "Run verification gate",
+  ]);
+});
+
 test("rich TUI does not duplicate final answer after streamed final text", async () => {
   const { applyAgentRunEventToRichState, commitAssistantAnswer } = await import("../cli/tui/rich-shell.js");
   const state: RichTuiState = {
@@ -804,6 +1336,30 @@ test("rich TUI does not duplicate final answer after streamed final text", async
   commitAssistantAnswer(state, "done");
 
   assert.deepEqual(state.messages, [{ role: "assistant", text: "done" }]);
+});
+
+test("rich TUI records the active session from session_started events", async () => {
+  const { applyAgentRunEventToRichState } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+  };
+
+  applyAgentRunEventToRichState(state, {
+    type: "session_started",
+    runId: "run_stop",
+    sessionId: "sess_stop",
+    objective: "stop this run",
+    targetMode: "build",
+  });
+
+  assert.equal(state.activeSessionId, "sess_stop");
 });
 
 test("rich TUI submit appends status and clears input", async () => {
@@ -1604,6 +2160,10 @@ test("rich TUI submit clears transcript without resetting shell status", async (
     stepCount: 1,
     lastEventTitle: "Read file",
     activeSessionId: "sess_test",
+    todos: [
+      { content: "Old active step", status: "in_progress", priority: "high" },
+      { content: "Old pending step", status: "pending", priority: "medium" },
+    ],
   };
 
   const action = await submitRichTuiInput(state);
@@ -1618,6 +2178,7 @@ test("rich TUI submit clears transcript without resetting shell status", async (
   assert.equal(state.stepCount, undefined);
   assert.equal(state.lastEventTitle, undefined);
   assert.equal(state.activeSessionId, undefined);
+  assert.equal(state.todos, undefined);
   assert.equal(state.mode, "Goal");
   assert.equal(state.provider, "deepseek");
   assert.equal(state.model, "deepseek-v4-flash");
@@ -1657,6 +2218,305 @@ test("rich TUI submit lists recent sessions", async () => {
   assert.equal(called, true);
   assert.equal(state.runHealth, "Ready");
   assert.match(state.messages.at(-1)?.text ?? "", /No sessions found/);
+});
+
+test("rich TUI submit stores listed sessions as resume choices", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/sessions",
+    messages: [],
+    events: [],
+  };
+
+  const action = await submitRichTuiInput(state, {
+    listSessions: async () => ({
+      returned: 2,
+      scanned: 2,
+      limit: 5,
+      byStatus: { running: 1, completed: 1 },
+      byOutcome: { pending: 1, succeeded: 1 },
+      pendingApprovals: 0,
+      changedSessions: 0,
+      sessions: [
+        {
+          id: "sess_first",
+          targetMode: "build",
+          status: "running",
+          outcome: "pending",
+          pendingApprovals: 0,
+          commandsFinished: 0,
+          failedCommands: 0,
+          changedPaths: [],
+          updatedAt: "2026-06-20T10:00:00.000Z",
+          objective: "怎么启动游戏",
+        },
+        {
+          id: "sess_second",
+          targetMode: "goal",
+          status: "completed",
+          outcome: "succeeded",
+          pendingApprovals: 0,
+          commandsFinished: 3,
+          failedCommands: 0,
+          changedPaths: [],
+          updatedAt: "2026-06-20T09:00:00.000Z",
+          objective: "增加新的防御塔和敌人",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(action.type, "redraw");
+  assert.deepEqual((state as RichTuiState & { sessionChoices?: Array<{ id: string }> }).sessionChoices?.map((entry) => entry.id), [
+    "sess_first",
+    "sess_second",
+  ]);
+  assert.match(state.messages.at(-1)?.text ?? "", /1\. 怎么启动游戏/);
+  assert.match(state.messages.at(-1)?.text ?? "", /2\. 增加新的防御塔和敌人/);
+});
+
+test("rich TUI sessions command opens an interactive picker sorted by recent update", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/sessions",
+    messages: [],
+    events: [],
+  };
+
+  const action = await submitRichTuiInput(state, {
+    listSessions: async () => ({
+      returned: 2,
+      scanned: 2,
+      limit: 5,
+      byStatus: { completed: 2 },
+      byOutcome: { succeeded: 2 },
+      pendingApprovals: 0,
+      changedSessions: 0,
+      sessions: [
+        {
+          id: "sess_old",
+          targetMode: "build",
+          status: "completed",
+          outcome: "succeeded",
+          pendingApprovals: 0,
+          commandsFinished: 1,
+          failedCommands: 0,
+          changedPaths: [],
+          updatedAt: "2026-06-20T08:00:00.000Z",
+          objective: "Older task",
+          workspace: "E:\\code\\legacy",
+        },
+        {
+          id: "sess_new",
+          targetMode: "goal",
+          status: "completed",
+          outcome: "succeeded",
+          pendingApprovals: 0,
+          commandsFinished: 3,
+          failedCommands: 0,
+          changedPaths: [],
+          updatedAt: "2026-06-20T10:00:00.000Z",
+          objective: "Newer task",
+          workspace: "E:\\code\\agent",
+        },
+      ],
+    }),
+  });
+
+  const pickerState = state as RichTuiState & { sessionPicker?: { open: boolean; cursorIndex: number } };
+  const screen = renderConversationScreen(state, { columns: 120, rows: 28 });
+
+  assert.equal(action.type, "redraw");
+  assert.deepEqual(state.sessionChoices?.map((entry) => entry.id), ["sess_new", "sess_old"]);
+  assert.equal(pickerState.sessionPicker?.open, true);
+  assert.equal(pickerState.sessionPicker?.cursorIndex, 0);
+  assert.match(screen, /Sessions/);
+  assert.match(screen, /> Newer task/);
+  assert.match(screen, /workspace=agent/);
+  assert.match(screen, /Older task/);
+  assert.match(screen, /workspace=legacy/);
+  assert.equal(screen.indexOf("Newer task") < screen.indexOf("Older task"), true);
+});
+
+test("rich TUI session picker renders as a popup overlay instead of inline rail content", () => {
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+    sessionChoices: [
+      { id: "sess_alpha", title: "Alpha session" },
+      { id: "sess_beta", title: "Beta session" },
+    ],
+    sessionPicker: { open: true, cursorIndex: 0 },
+  };
+
+  const screen = stripAnsi(renderConversationScreen(state, { columns: 120, rows: 28 }));
+  const optionLine = screen.split("\n").find((line) => line.includes("> Alpha session"));
+
+  assert.match(screen, /\+-+\+/);
+  assert.ok(optionLine);
+  assert.doesNotMatch(optionLine, /\b(?:Plan|Model|Run|Workspace)\b/);
+});
+
+test("rich TUI session picker moves with arrows and submits the selected session", async () => {
+  const { handleRichTuiKey, submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+    sessionChoices: [
+      { id: "sess_new", title: "Newer task" },
+      { id: "sess_old", title: "Older task" },
+    ],
+    sessionPicker: { open: true, cursorIndex: 0 },
+  } as RichTuiState & { sessionPicker?: { open: boolean; cursorIndex: number } };
+  const resumed: string[] = [];
+
+  assert.equal(handleRichTuiKey(state, { key: { name: "down" } }), "redraw");
+  assert.equal(state.sessionPicker?.cursorIndex, 1);
+  assert.equal(handleRichTuiKey(state, { key: { name: "enter" } }), "submit");
+  assert.equal(state.sessionPicker, undefined);
+  assert.equal(state.input, "/resume sess_old");
+
+  await submitRichTuiInput(state, {
+    resumeSession: async ({ sessionId, onEvent }) => {
+      resumed.push(sessionId);
+      await onEvent({ type: "assistant_text", runId: "run_picker", step: 1, text: "resumed", final: true });
+      return { answer: "resumed", sessionId, durationMs: 30 };
+    },
+  });
+
+  assert.deepEqual(resumed, ["sess_old"]);
+  assert.equal(state.activeSessionId, "sess_old");
+});
+
+test("rich TUI resume restores prior visible conversation before appending the continuation answer", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/resume sess_story",
+    messages: [],
+    events: [],
+  };
+
+  await submitRichTuiInput(state, {
+    resumeSession: async () => ({
+      answer: "继续后的新回复",
+      sessionId: "sess_story",
+      transcript: [
+        { role: "user", text: "之前的问题" },
+        { role: "assistant", text: "之前的回答" },
+      ],
+    }),
+  });
+
+  assert.deepEqual(state.messages, [
+    { role: "user", text: "之前的问题" },
+    { role: "assistant", text: "之前的回答" },
+    { role: "assistant", text: "继续后的新回复" },
+  ]);
+});
+
+test("rich TUI resume can restore a completed session without appending an empty answer", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/resume sess_done",
+    messages: [],
+    events: [],
+  };
+
+  await submitRichTuiInput(state, {
+    resumeSession: async () => ({
+      answer: "",
+      sessionId: "sess_done",
+      restoredOnly: true,
+      sessionStatus: "completed",
+      transcript: [
+        { role: "user", text: "completed question" },
+        { role: "assistant", text: "completed answer" },
+      ],
+    }),
+  });
+
+  assert.deepEqual(state.messages, [
+    { role: "user", text: "completed question" },
+    { role: "assistant", text: "completed answer" },
+  ]);
+  assert.equal(state.runHealth, "Done");
+  assert.equal(state.currentActivity, "Done");
+  assert.equal(state.activeSessionId, "sess_done");
+});
+
+test("rich TUI session picker closes with escape without exiting", async () => {
+  const { handleRichTuiKey } = await import("../cli/tui/rich-shell.js");
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+    sessionChoices: [{ id: "sess_new", title: "Newer task" }],
+    sessionPicker: { open: true, cursorIndex: 0 },
+  } as RichTuiState & { sessionPicker?: { open: boolean; cursorIndex: number } };
+
+  assert.equal(handleRichTuiKey(state, { key: { name: "escape" } }), "redraw");
+  assert.equal(state.sessionPicker, undefined);
+});
+
+test("rich TUI session picker keeps the highlighted row visible in long lists", () => {
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "",
+    messages: [],
+    events: [],
+    sessionChoices: Array.from({ length: 12 }, (_, index) => ({
+      id: `sess_${index + 1}`,
+      title: `Task ${index + 1}`,
+    })),
+    sessionPicker: { open: true, cursorIndex: 11 },
+  } as RichTuiState;
+
+  const screen = renderConversationScreen(state, { columns: 100, rows: 30 });
+
+  assert.match(screen, /> Task 12/);
+  assert.match(screen, /8-12 of 12/);
+  assert.doesNotMatch(screen, /> Task 1\s/);
 });
 
 test("rich TUI submit runs natural language task with streamed events", async () => {
@@ -1748,7 +2608,11 @@ test("rich TUI plan mode requires approval before build execution", async () => 
   assert.equal(state.mode, "Plan");
   assert.equal(state.runHealth, "Needs approval");
   assert.equal(state.pendingPlanApproval?.task, "Add a lightning tower");
-  assert.match(renderConversationScreen(state, { columns: 140, rows: 30 }), /Plan needs approval/);
+  const planScreen = renderConversationScreen(state, { columns: 140, rows: 30 });
+  assert.match(planScreen, /Plan needs approval/);
+  assert.match(planScreen, /Awaiting approval/);
+  assert.match(planScreen, /Approve plan/);
+  assert.match(planScreen, /Execute build/);
 
   state.input = "/approve plan";
   const approveAction = await submitRichTuiInput(state, {
@@ -1808,6 +2672,77 @@ test("rich TUI submit resumes the active session", async () => {
     { role: "system", text: "Resuming session sess_existing" },
     { role: "assistant", text: "resumed" },
   ]);
+});
+
+test("rich TUI submit resumes a session selected from the sessions menu", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/resume 1",
+    messages: [],
+    events: [],
+    sessionChoices: [
+      {
+        id: "sess_first",
+        targetMode: "build",
+        status: "running",
+        outcome: "pending",
+        pendingApprovals: 0,
+        commandsFinished: 0,
+        failedCommands: 0,
+        changedPaths: [],
+        updatedAt: "2026-06-20T10:00:00.000Z",
+        objective: "怎么启动游戏",
+      },
+    ],
+  } as unknown as RichTuiState & { sessionChoices: Array<{ id: string }> };
+  const resumed: string[] = [];
+
+  const action = await submitRichTuiInput(state, {
+    resumeSession: async ({ sessionId, onEvent }) => {
+      resumed.push(sessionId);
+      await onEvent({ type: "assistant_text", runId: "run_resume", step: 1, text: "resumed", final: true });
+      return { answer: "resumed", sessionId, durationMs: 25 };
+    },
+  });
+
+  assert.equal(action.type, "redraw");
+  assert.deepEqual(resumed, ["sess_first"]);
+  assert.equal(state.activeSessionId, "sess_first");
+  assert.deepEqual(state.messages, [
+    { role: "system", text: "Resuming session sess_first" },
+    { role: "assistant", text: "resumed" },
+  ]);
+});
+
+test("rich TUI submit asks for sessions before resuming by menu number", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/resume 1",
+    messages: [],
+    events: [],
+  };
+  const resumed: string[] = [];
+
+  const action = await submitRichTuiInput(state, {
+    resumeSession: async ({ sessionId }) => {
+      resumed.push(sessionId);
+      return { answer: "unexpected" };
+    },
+  });
+
+  assert.equal(action.type, "redraw");
+  assert.deepEqual(resumed, []);
+  assert.match(state.messages.at(-1)?.text ?? "", /Use \/sessions first/);
 });
 
 test("rich TUI continue resumes a stopped Goal session", async () => {
@@ -1878,6 +2813,26 @@ test("rich TUI submit returns special action for model setup", async () => {
     readiness: "pass",
     mode: "Build",
     input: "/model setup",
+    messages: [],
+    events: [],
+  };
+
+  const action = await submitRichTuiInput(state);
+
+  assert.equal(action.type, "model_setup");
+  assert.equal(state.input, "");
+});
+
+test("rich TUI /models opens the model configuration entry", async () => {
+  const { submitRichTuiInput } = await import("../cli/tui/rich-shell.js");
+  assert.equal(TUI_COMMANDS.some((entry) => entry.command === "/models"), true);
+  const state: RichTuiState = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    mode: "Build",
+    input: "/models",
     messages: [],
     events: [],
   };
@@ -2083,12 +3038,134 @@ test("rich shell supports an injected TTY smoke flow with progress and clean exi
 
   await waitFor(() => output.text.includes("done") && output.text.includes("Editing") && output.text.includes("Step 1"));
 
-  input.emit("keypress", "", { name: "escape" });
+  input.emit("keypress", "", { ctrl: true, name: "c" });
   await run;
 
   assert.equal(input.rawModes.at(-1), false);
   assert.equal(output.text.includes("\x1b[?25l"), true);
   assert.equal(output.text.includes("\x1b[?25h"), true);
+});
+
+test("rich shell rewrites a single full-screen frame when typed input redraws", async () => {
+  const { startRichTuiShellWithTerminal } = await import("../cli/tui/rich-shell.js");
+  const input = new FakeTtyInput();
+  const output = new FakeTtyOutput(120, 28);
+  const run = startRichTuiShellWithTerminal({
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    version: "0.1.0",
+    startupSplash: false,
+  }, {
+    input,
+    output,
+    emitKeypressEvents: () => undefined,
+  });
+
+  await waitFor(() => output.latestFrame().includes("Ask Soloclaw"));
+  const initialClears = countFullScreenClears(output.text);
+  for (const char of "calm") {
+    input.emit("keypress", char, { name: char });
+  }
+
+  await waitFor(() => output.latestFrame().includes("calm"));
+  assert.equal(countFullScreenClears(output.text) > initialClears, true);
+  assert.match(stripAnsi(output.latestFrame()), /calm/);
+  assert.equal(countOccurrences(stripAnsi(output.latestFrame()), "+ Conversation"), 1);
+  assert.equal(countOccurrences(stripAnsi(output.latestFrame()), "+ Status"), 1);
+
+  input.emit("keypress", "", { ctrl: true, name: "c" });
+  await run;
+});
+
+test("rich shell Esc stops the active generation without exiting the TUI", async () => {
+  const { startRichTuiShellWithTerminal } = await import("../cli/tui/rich-shell.js");
+  const input = new FakeTtyInput();
+  const output = new FakeTtyOutput(132, 30);
+  let releaseRun: (() => void) | undefined;
+  const cancelCalls: Array<{ sessionId: string; reason: string }> = [];
+  const run = startRichTuiShellWithTerminal({
+    workspace: "E:\\code\\agent",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    version: "0.1.0",
+    runTask: async ({ onEvent }) => {
+      await onEvent({
+        type: "session_started",
+        runId: "run_stop",
+        sessionId: "sess_stop",
+        objective: "Stop this generation",
+        targetMode: "build",
+      });
+      await new Promise<void>((resolve) => {
+        releaseRun = resolve;
+      });
+      return {
+        answer: "late answer should not render",
+        sessionId: "sess_stop",
+        durationMs: 25,
+      };
+    },
+    cancelSession: async (input) => {
+      cancelCalls.push(input);
+    },
+  }, {
+    input,
+    output,
+    emitKeypressEvents: () => undefined,
+  });
+
+  await flushPromises();
+  for (const char of "Stop this generation") {
+    input.emit("keypress", char, { name: char });
+  }
+  input.emit("keypress", "\r", { name: "return" });
+
+  await waitFor(() => output.latestFrame().includes("sess_stop") || output.latestFrame().includes("Starting"));
+  input.emit("keypress", "", { name: "escape" });
+
+  await waitFor(() => cancelCalls.length === 1);
+  assert.equal(cancelCalls[0]?.sessionId, "sess_stop");
+  assert.match(cancelCalls[0]?.reason ?? "", /Stopped from Soloclaw TUI/);
+  assert.equal(input.rawModes.at(-1), true);
+
+  releaseRun?.();
+  await waitFor(() => output.latestFrame().includes("Run: Stopped"));
+  assert.doesNotMatch(stripAnsi(output.latestFrame()), /late answer should not render/);
+
+  input.emit("keypress", "", { ctrl: true, name: "c" });
+  await run;
+
+  assert.equal(input.rawModes.at(-1), false);
+});
+
+test("rich shell can show an animated Soloclaw startup logo before the main UI", async () => {
+  const { startRichTuiShellWithTerminal } = await import("../cli/tui/rich-shell.js");
+  const input = new FakeTtyInput();
+  const output = new FakeTtyOutput(100, 24);
+  const context = {
+    workspace: "E:\\code\\agent",
+    provider: "deepseek" as const,
+    model: "deepseek-v4-flash",
+    readiness: "pass",
+    version: "0.1.0",
+    startupSplash: { frames: 3, frameMs: 0 },
+  };
+  const run = startRichTuiShellWithTerminal(context, {
+    input,
+    output,
+    emitKeypressEvents: () => undefined,
+  });
+
+  await waitFor(() => output.text.includes("Ask Soloclaw"));
+  const plain = stripAnsi(output.text);
+  assert.match(plain, /SOLOCLAW/);
+  assert.match(plain, /local agent workspace/);
+
+  input.emit("keypress", "", { ctrl: true, name: "c" });
+  await run;
 });
 
 test("rich shell preserves typed draft while progress redraws", async () => {
@@ -2144,7 +3221,7 @@ test("rich shell preserves typed draft while progress redraws", async () => {
   const frame = output.latestFrame();
   assert.match(frame, /next draft/);
 
-  input.emit("keypress", "", { name: "escape" });
+  input.emit("keypress", "", { ctrl: true, name: "c" });
   await run;
 
   assert.equal(input.rawModes.at(-1), false);
@@ -2189,7 +3266,7 @@ test("rich shell keeps approval errors visible without exiting or stale thinking
   assert.equal(frame.includes("Activity: Thinking"), false);
   assert.equal(frame.includes("sk-test-secret"), false);
 
-  input.emit("keypress", "", { name: "escape" });
+  input.emit("keypress", "", { ctrl: true, name: "c" });
   await run;
 
   assert.equal(input.rawModes.at(-1), false);
@@ -2223,7 +3300,7 @@ test("rich shell reports context unavailable before provider usage arrives", asy
   assert.equal(frame.includes("0 tokens (0%)"), false);
   assert.equal(frame.includes("$0.00 spent"), false);
 
-  input.emit("keypress", "", { name: "escape" });
+  input.emit("keypress", "", { ctrl: true, name: "c" });
   await run;
 
   assert.equal(input.rawModes.at(-1), false);
@@ -2289,7 +3366,7 @@ test("rich shell drives native model setup wizard from command palette without l
   assert.equal(output.text.includes("sk-test-secret-123456"), false);
   assert.match(output.text, /readiness: pass/);
 
-  input.emit("keypress", "", { name: "escape" });
+  input.emit("keypress", "", { ctrl: true, name: "c" });
   await run;
 
   assert.equal(input.rawModes.at(-1), false);
@@ -2323,8 +3400,17 @@ class FakeTtyOutput extends EventEmitter {
   }
 
   latestFrame(): string {
-    return this.text.split("\x1b[2J\x1b[H").at(-1) ?? this.text;
+    const afterFullClear = this.text.split("\x1b[2J\x1b[H").at(-1) ?? this.text;
+    return afterFullClear.split("\x1b[H").at(-1) ?? afterFullClear;
   }
+}
+
+function countFullScreenClears(text: string): number {
+  return text.split("\x1b[2J\x1b[H").length - 1;
+}
+
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {

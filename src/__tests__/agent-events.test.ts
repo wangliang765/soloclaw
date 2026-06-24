@@ -73,6 +73,127 @@ test("runtime stopped events keep safe resumability metadata", () => {
   assert.equal(typeof event.createdAt, "string");
 });
 
+test("plan target mode writes a markdown plan document only under the configured plan directory", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-plan-file-"));
+  t.after(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const planDirectory = path.join(dir, ".agent", "plans");
+  const store = new MemoryAgentStore();
+  let observedToolCount = -1;
+  let observedSystemPrompt = "";
+  let toolExecuted = false;
+  const model: ModelClient = {
+    async complete(request) {
+      observedToolCount = request.tools.length;
+      observedSystemPrompt = request.messages.find((message) => message.role === "system")?.content ?? "";
+      return {
+        type: "message",
+        content: "Plan:\n1. Inspect the TUI renderer.\n2. Update the layout.\n3. Verify with smoke tests.",
+      };
+    },
+  };
+  const options = {
+    model,
+    tools: [
+      {
+        name: "dangerous_write",
+        description: "Should never run in plan mode.",
+        inputSchema: {},
+        handler: async () => {
+          toolExecuted = true;
+          return { callId: "dangerous_write", ok: true };
+        },
+      },
+    ],
+    systemPrompt: "system",
+    store,
+    actor: { type: "user" as const, id: "planner", displayName: "Planner" },
+    targetMode: "plan" as const,
+    planDirectory,
+  } as ConstructorParameters<typeof AgentLoop>[0] & { planDirectory: string };
+  const agent = new AgentLoop(options);
+
+  const result = await agent.runWithSession("make the TUI simpler");
+  const planPath = (result as typeof result & { planPath?: string }).planPath;
+
+  assert.equal(observedToolCount, 0);
+  assert.equal(toolExecuted, false);
+  assert.match(observedSystemPrompt, /only file/i);
+  assert.match(observedSystemPrompt, /\.agent[\\/]+plans/i);
+  assert(planPath);
+  assert.equal(path.dirname(planPath), planDirectory);
+  assert.equal(path.extname(planPath), ".md");
+  const planFiles = await fs.readdir(planDirectory);
+  assert.deepEqual(planFiles, [path.basename(planPath)]);
+  const planText = await fs.readFile(planPath, "utf8");
+  assert.match(planText, /# Plan:/);
+  assert.match(planText, /make the TUI simpler/);
+  assert.match(planText, /Inspect the TUI renderer/);
+  const topLevelFiles = await fs.readdir(dir);
+  assert.deepEqual(topLevelFiles, [".agent"]);
+});
+
+test("goal_updated events project safe goal progress", () => {
+  const event: AgentRunEvent = {
+    type: "goal_updated",
+    runId: "run_goal",
+    sessionId: "sess_goal",
+    goalId: "goal_test",
+    status: "complete",
+    objective: "ship without exposing sk-testsecretvalue1234567890",
+    summary: "verified with sk-testsecretvalue1234567890",
+    modelCalls: 3,
+    tokenUsed: 42,
+  };
+
+  const messages = projectAgentRunEventsToAssistantMessages([event]);
+  const projectedJson = JSON.stringify(messages);
+
+  assert.equal(messages[0]?.parts[0]?.type, "status");
+  assert.equal(projectedJson.includes("sk-testsecretvalue1234567890"), false);
+  assert.match(projectedJson, /\[REDACTED:api_key\]/);
+});
+
+test("agent loop emits run budget checkpoints before runtime stops", async () => {
+  const events: AgentRunEvent[] = [];
+  const model: ModelClient = {
+    async complete() {
+      return {
+        type: "tool_calls",
+        content: "continue",
+        toolCalls: [{ id: "call_missing", name: "missing_tool", input: {} }],
+      };
+    },
+  };
+  const agent = new AgentLoop({
+    model,
+    tools: [],
+    systemPrompt: "system",
+    maxSteps: 1,
+    onProgress: (event) => {
+      events.push(event as AgentRunEvent);
+    },
+  });
+
+  await agent.run("force a budget stop");
+
+  const checkpoint = events.find((event) => (event.type as string) === "run_budget_checkpoint") as
+    | {
+        steps: number;
+        modelCalls: number;
+        maxSteps?: number;
+        targetMode?: string;
+      }
+    | undefined;
+  assert(checkpoint);
+  assert.equal(checkpoint.steps, 1);
+  assert.equal(checkpoint.modelCalls, 1);
+  assert.equal(checkpoint.maxSteps, 1);
+  assert.equal(checkpoint.targetMode, "build");
+  assert.equal(events.some((event) => event.type === "runtime_stopped" && event.stopKind === "step_budget"), true);
+});
+
 test("projects agent events into replayable safe assistant parts", () => {
   const unsafeCommand = "powershell -Command Write-Output sk-testsecretvalue1234567890";
   const unsafePatch = "diff --git a/src/main.js b/src/main.js\n+console.log('sk-testsecretvalue1234567890')";
@@ -488,7 +609,9 @@ test("local event bus receives safe agent progress events from platform runs", a
   const eventBus = new LocalEventBus();
   const events: AgentRunEvent[] = [];
   const unsubscribe = eventBus.subscribe((event) => {
-    events.push(event);
+    if ("runId" in event) {
+      events.push(event);
+    }
   });
   t.after(() => unsubscribe());
 
@@ -543,12 +666,492 @@ test("web API streams safe agent events through SSE", async (t) => {
   controller.abort();
 });
 
-async function readSseUntilData(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
+test("web API streams control-plane heartbeat events through SSE", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-control-event-sse-"));
+  const eventBus = new LocalEventBus();
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token", eventBus });
+  const healthResponse = await fetch(`${server.baseUrl}/api/health`, {
+    headers: { "x-agent-control-token": "test-token" },
+  });
+  const health = await healthResponse.json() as { localAgentId?: string };
+  assert(health.localAgentId);
+
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const response = await fetch(`${server.baseUrl}/api/events`, {
+    headers: { "x-agent-control-token": "test-token" },
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body?.getReader();
+  assert(reader);
+  try {
+    const heartbeat = await fetch(`${server.baseUrl}/api/agents/${encodeURIComponent(health.localAgentId)}/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+      body: JSON.stringify({
+        actor: `agent:${health.localAgentId}`,
+        status: "online",
+        ttlSeconds: 60,
+      }),
+    });
+    assert.equal(heartbeat.status, 200);
+
+    const text = await readSseUntilData(reader, 2_000);
+    assert.match(text, /event: message/);
+    assert.match(text, /"type":"control_plane.action"/);
+    assert.match(text, /"summary":"Agent heartbeat from control plane"/);
+    assert.match(text, /"agentId":"[^"]+"/);
+    assert.equal(text.includes("test-token"), false);
+  } finally {
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+  }
+});
+
+test("web API filters control-plane SSE events by room and agent", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-control-event-room-filter-"));
+  const eventBus = new LocalEventBus();
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token", eventBus });
+
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const response = await fetch(`${server.baseUrl}/api/events?room=room_target&agent=agent_target`, {
+    headers: { "x-agent-control-token": "test-token" },
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body?.getReader();
+  assert(reader);
+  try {
+    eventBus.publish({
+      id: "evt_wrong_room",
+      type: "control_plane.action",
+      scope: { roomId: "room_other", agentId: "agent_target" },
+      payload: { summary: "wrong room" },
+      createdAt: "2026-06-21T00:00:00.000Z",
+    });
+    eventBus.publish({
+      id: "evt_wrong_agent",
+      type: "control_plane.action",
+      scope: { roomId: "room_target", agentId: "agent_other" },
+      payload: { summary: "wrong agent" },
+      createdAt: "2026-06-21T00:00:01.000Z",
+    });
+    eventBus.publish({
+      id: "evt_matching_room_agent",
+      type: "control_plane.action",
+      scope: { roomId: "room_target", agentId: "agent_target" },
+      payload: { summary: "matching remote heartbeat" },
+      createdAt: "2026-06-21T00:00:02.000Z",
+    });
+
+    const text = await readSseUntilData(reader, 2_000);
+    assert.match(text, /evt_matching_room_agent/);
+    assert.doesNotMatch(text, /evt_wrong_room|evt_wrong_agent/);
+  } finally {
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+  }
+});
+
+test("web API streams room message events through room-scoped SSE without message body", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-room-message-event-sse-"));
+  const eventBus = new LocalEventBus();
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const setupPlatform = await createLocalPlatform(dir, { provider: "mock", workspaceSnapshot: false });
+  const owner = { type: "agent" as const, id: setupPlatform.localAgent.id, displayName: setupPlatform.localAgent.displayName };
+  const room = await setupPlatform.rooms.createRoom({
+    name: "Room Message SSE",
+    createdBy: owner,
+    policy: { joinPolicy: "manual", defaultCapabilities: ["room.message.send"] },
+  });
+  setupPlatform.locks.close?.();
+  setupPlatform.store.close();
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token", eventBus });
+
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const response = await fetch(`${server.baseUrl}/api/events?room=${encodeURIComponent(room.id)}&type=room.message.sent`, {
+    headers: { "x-agent-control-token": "test-token" },
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body?.getReader();
+  assert(reader);
+  try {
+    const messageBody = "@agent:agent_target hello from room event stream phase5-control-token";
+    const messageResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+      body: JSON.stringify({
+        actor: `agent:${owner.id}`,
+        kind: "chat",
+        body: messageBody,
+      }),
+    });
+    assert.equal(messageResponse.status, 200);
+    const messagePayload = await messageResponse.json() as { message?: { id?: string } };
+    assert.ok(messagePayload.message?.id);
+
+    const text = await readSseUntilData(reader, 2_000);
+    assert.match(text, /event: message/);
+    assert.match(text, /"type":"room.message.sent"/);
+    assert.match(text, new RegExp(`"messageId":"${messagePayload.message.id}"`));
+    assert.match(text, /"kind":"chat"/);
+    assert.match(text, /"senderId":"[^"]+"/);
+    assert.match(text, /"bodyLength":\d+/);
+    assert.doesNotMatch(text, /phase5-control-token|hello from room event stream/);
+  } finally {
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+  }
+});
+
+test("web API streams room delivery ack events through room-scoped SSE without ack signature", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-room-ack-event-sse-"));
+  const eventBus = new LocalEventBus();
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const setupPlatform = await createLocalPlatform(dir, { provider: "mock", workspaceSnapshot: false });
+  const owner = { type: "agent" as const, id: setupPlatform.localAgent.id, displayName: setupPlatform.localAgent.displayName };
+  const room = await setupPlatform.rooms.createRoom({
+    name: "Room Ack SSE",
+    createdBy: owner,
+    policy: { joinPolicy: "manual", defaultCapabilities: ["room.message.send", "room.delivery.ack"] },
+  });
+  setupPlatform.locks.close?.();
+  setupPlatform.store.close();
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token", eventBus });
+
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const response = await fetch(`${server.baseUrl}/api/events?room=${encodeURIComponent(room.id)}&type=room.delivery.acknowledged`, {
+    headers: { "x-agent-control-token": "test-token" },
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body?.getReader();
+  assert(reader);
+  try {
+    const messageResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+      body: JSON.stringify({
+        actor: `agent:${owner.id}`,
+        kind: "task",
+        body: `@agent:${owner.id} ack event smoke phase5-control-token`,
+      }),
+    });
+    assert.equal(messageResponse.status, 200);
+    const messagePayload = await messageResponse.json() as { message?: { id?: string } };
+    assert.ok(messagePayload.message?.id);
+
+    const ackResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/agent-inbox/ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+      body: JSON.stringify({
+        actor: `agent:${owner.id}`,
+        agentId: owner.id,
+        messageId: messagePayload.message.id,
+      }),
+    });
+    assert.equal(ackResponse.status, 200);
+
+    const text = await readSseUntilData(reader, 2_000);
+    assert.match(text, /event: message/);
+    assert.match(text, /"type":"room.delivery.acknowledged"/);
+    assert.match(text, new RegExp(`"messageId":"${messagePayload.message.id}"`));
+    assert.match(text, new RegExp(`"agentId":"${owner.id}"`));
+    assert.match(text, /"signedAck":true/);
+    assert.doesNotMatch(text, /phase5-control-token|ack event smoke|ed25519|signature|nonce/);
+  } finally {
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+  }
+});
+
+test("web API summarizes per-agent room delivery status without transcript bodies or ack envelopes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-room-delivery-status-"));
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const setupPlatform = await createLocalPlatform(dir, { provider: "mock", workspaceSnapshot: false });
+  const owner = { type: "user" as const, id: "owner", displayName: "Owner" };
+  const room = await setupPlatform.rooms.createRoom({
+    name: "Room Delivery Status",
+    createdBy: owner,
+    policy: {
+      joinPolicy: "manual",
+      defaultCapabilities: ["room.message.send"],
+      agentResponseMode: "mentions_only",
+    },
+  });
+  await setupPlatform.store.addRoomMember({
+    roomId: room.id,
+    actor: { type: "agent", id: "agent_alpha", displayName: "Alpha" },
+    role: "executor",
+    status: "active",
+    joinedAt: new Date().toISOString(),
+  });
+  await setupPlatform.store.addRoomMember({
+    roomId: room.id,
+    actor: { type: "agent", id: "agent_beta", displayName: "Beta" },
+    role: "executor",
+    status: "active",
+    joinedAt: new Date().toISOString(),
+  });
+  setupPlatform.locks.close?.();
+  setupPlatform.store.close();
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token" });
+
+  const alphaResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+    body: JSON.stringify({
+      actor: "user:owner",
+      kind: "task",
+      body: "@agent:agent_alpha alpha secret phase5-control-token",
+    }),
+  });
+  assert.equal(alphaResponse.status, 200);
+  const alphaPayload = await alphaResponse.json() as { message?: { id?: string } };
+  assert.ok(alphaPayload.message?.id);
+
+  const betaResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+    body: JSON.stringify({
+      actor: "user:owner",
+      kind: "task",
+      body: "@agent:agent_beta beta secret phase5-control-token",
+    }),
+  });
+  assert.equal(betaResponse.status, 200);
+  const betaPayload = await betaResponse.json() as { message?: { id?: string } };
+  assert.ok(betaPayload.message?.id);
+
+  const ackResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/agent-inbox/ack`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+    body: JSON.stringify({
+      actor: "user:owner",
+      agentId: "agent_alpha",
+      messageId: alphaPayload.message.id,
+    }),
+  });
+  assert.equal(ackResponse.status, 200);
+
+  const statusResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/delivery-status`, {
+    headers: { "x-agent-control-token": "test-token" },
+  });
+  assert.equal(statusResponse.status, 200);
+  const statusText = await statusResponse.text();
+  assert.doesNotMatch(statusText, /phase5-control-token|alpha secret|beta secret|signature|nonce|ackEnvelope/i);
+  const status = JSON.parse(statusText) as {
+    roomId?: string;
+    transcriptMessageCount?: number;
+    agents?: Array<{
+      agentId?: string;
+      displayName?: string;
+      memberStatus?: string;
+      role?: string;
+      routedMessageCount?: number;
+      pendingRoutedCount?: number;
+      lastRoutedMessageId?: string;
+      lastAckMessageId?: string;
+      lastAckSigned?: boolean;
+    }>;
+  };
+  assert.equal(status.roomId, room.id);
+  assert.equal(status.transcriptMessageCount, 2);
+  const agents = new Map((status.agents ?? []).map((agent) => [agent.agentId, agent]));
+  assert.equal(agents.get("agent_alpha")?.displayName, "Alpha");
+  assert.equal(agents.get("agent_alpha")?.memberStatus, "active");
+  assert.equal(agents.get("agent_alpha")?.role, "executor");
+  assert.equal(agents.get("agent_alpha")?.routedMessageCount, 1);
+  assert.equal(agents.get("agent_alpha")?.pendingRoutedCount, 0);
+  assert.equal(agents.get("agent_alpha")?.lastRoutedMessageId, alphaPayload.message.id);
+  assert.equal(agents.get("agent_alpha")?.lastAckMessageId, alphaPayload.message.id);
+  assert.equal(agents.get("agent_alpha")?.lastAckSigned, false);
+  assert.equal(agents.get("agent_beta")?.routedMessageCount, 1);
+  assert.equal(agents.get("agent_beta")?.pendingRoutedCount, 1);
+  assert.equal(agents.get("agent_beta")?.lastRoutedMessageId, betaPayload.message.id);
+  assert.equal(agents.get("agent_beta")?.lastAckMessageId, undefined);
+
+  const stateResponse = await fetch(`${server.baseUrl}/api/state`, {
+    headers: { "x-agent-control-token": "test-token" },
+  });
+  assert.equal(stateResponse.status, 200);
+  const state = await stateResponse.json() as {
+    rooms?: Array<{
+      room?: { id?: string };
+      deliveryStatus?: {
+        roomId?: string;
+        transcriptMessageCount?: number;
+        agents?: Array<{
+          agentId?: string;
+          pendingRoutedCount?: number;
+          lastAckMessageId?: string;
+          lastAckSigned?: boolean;
+        }>;
+      };
+    }>;
+  };
+  const stateRoom = state.rooms?.find((candidate) => candidate.room?.id === room.id);
+  assert.ok(stateRoom?.deliveryStatus);
+  const stateDeliveryText = JSON.stringify(stateRoom.deliveryStatus);
+  assert.doesNotMatch(stateDeliveryText, /phase5-control-token|alpha secret|beta secret|signature|nonce|ackEnvelope/i);
+  assert.equal(stateRoom.deliveryStatus.roomId, room.id);
+  assert.equal(stateRoom.deliveryStatus.transcriptMessageCount, 2);
+  const stateAgents = new Map((stateRoom.deliveryStatus.agents ?? []).map((agent) => [agent.agentId, agent]));
+  assert.equal(stateAgents.get("agent_alpha")?.pendingRoutedCount, 0);
+  assert.equal(stateAgents.get("agent_alpha")?.lastAckMessageId, alphaPayload.message.id);
+  assert.equal(stateAgents.get("agent_alpha")?.lastAckSigned, false);
+  assert.equal(stateAgents.get("agent_beta")?.pendingRoutedCount, 1);
+  assert.equal(stateAgents.get("agent_beta")?.lastAckMessageId, undefined);
+
+  const htmlResponse = await fetch(`${server.baseUrl}/?token=test-token`);
+  assert.equal(htmlResponse.status, 200);
+  const html = await htmlResponse.text();
+  assert.match(html, /Delivery Status/);
+  assert.match(html, /id="delivery-status"/);
+});
+
+test("web API creates a remote room invite bundle without persisting invite secrets", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-web-room-invite-bundle-"));
+  let server: Awaited<ReturnType<typeof startLocalRoomWebServer>> | undefined;
+  t.after(async () => {
+    await server?.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  const setupPlatform = await createLocalPlatform(dir, { provider: "mock", workspaceSnapshot: false });
+  const owner = { type: "agent" as const, id: setupPlatform.localAgent.id, displayName: setupPlatform.localAgent.displayName };
+  const room = await setupPlatform.rooms.createRoom({
+    name: "Web Remote Invite Bundle",
+    createdBy: owner,
+    policy: {
+      joinPolicy: "invite_token",
+      defaultCapabilities: ["room.message.send"],
+      requireSignedInvites: true,
+    },
+  });
+  setupPlatform.locks.close?.();
+  setupPlatform.store.close();
+  server = await startLocalRoomWebServer(dir, { port: 0, token: "test-token" });
+
+  const inviteResponse = await fetch(`${server.baseUrl}/api/rooms/${encodeURIComponent(room.id)}/invite-bundle`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-agent-control-token": "test-token" },
+    body: JSON.stringify({
+      actor: `agent:${owner.id}`,
+      controlUrl: "http://control.example.test:4317",
+      alias: "linux-builder",
+      displayName: "Linux Builder",
+      role: "executor",
+      ttlHours: 12,
+      maxUses: 1,
+    }),
+  });
+  assert.equal(inviteResponse.status, 200);
+  const inviteText = await inviteResponse.text();
+  const invitePayload = JSON.parse(inviteText) as {
+    bundle?: {
+      kind?: string;
+      version?: number;
+      controlUrl?: string;
+      controlToken?: string;
+      roomId?: string;
+      inviteToken?: string;
+      inviteId?: string;
+      inviteSignatureStatus?: string;
+      role?: string;
+      aliases?: string[];
+      displayName?: string;
+      sensitivity?: string;
+      commands?: { enroll?: string; run?: string };
+    };
+    fileName?: string;
+    warning?: string;
+  };
+  const bundle = invitePayload.bundle;
+  assert.equal(bundle?.kind, "soloclaw.room_invite");
+  assert.equal(bundle?.version, 1);
+  assert.equal(bundle?.controlUrl, "http://control.example.test:4317");
+  assert.equal(bundle?.controlToken, "test-token");
+  assert.equal(bundle?.roomId, room.id);
+  assert.match(bundle?.inviteToken ?? "", /^rinv_/);
+  assert.match(bundle?.inviteId ?? "", /^rinv_/);
+  assert.equal(bundle?.inviteSignatureStatus, "valid");
+  assert.equal(bundle?.role, "executor");
+  assert.deepEqual(bundle?.aliases, ["linux-builder"]);
+  assert.equal(bundle?.displayName, "Linux Builder");
+  assert.match(bundle?.sensitivity ?? "", /contains_control_token_and_invite_token/);
+  assert.match(bundle?.commands?.enroll ?? "", /room join --invite-bundle room-invite\.json --json/);
+  assert.match(bundle?.commands?.run ?? "", /room join --invite-bundle room-invite\.json --run/);
+  assert.equal(invitePayload.fileName, "room-invite.json");
+  assert.match(invitePayload.warning ?? "", /Do not commit/i);
+  assert.doesNotMatch(inviteText, /BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY|ackEnvelope|messageEnvelope/i);
+
+  const stateResponse = await fetch(`${server.baseUrl}/api/state`, {
+    headers: { "x-agent-control-token": "test-token" },
+  });
+  assert.equal(stateResponse.status, 200);
+  const stateText = await stateResponse.text();
+  assert.doesNotMatch(stateText, new RegExp(bundle?.inviteToken ?? "rinv_unset"));
+  assert.doesNotMatch(stateText, /test-token|control.example.test/);
+  assert.match(stateText, new RegExp(bundle?.inviteId ?? "rinv_unset"));
+
+  const auditResponse = await fetch(`${server.baseUrl}/api/audit?type=control_plane.action`, {
+    headers: { "x-agent-control-token": "test-token" },
+  });
+  assert.equal(auditResponse.status, 200);
+  const auditText = await auditResponse.text();
+  assert.match(auditText, /Created remote room invite bundle from control plane/);
+  assert.match(auditText, new RegExp(bundle?.inviteId ?? "rinv_unset"));
+  assert.doesNotMatch(auditText, new RegExp(bundle?.inviteToken ?? "rinv_unset"));
+  assert.doesNotMatch(auditText, /test-token|control.example.test/);
+
+  const htmlResponse = await fetch(`${server.baseUrl}/?token=test-token`);
+  assert.equal(htmlResponse.status, 200);
+  const html = await htmlResponse.text();
+  assert.match(html, /Invite Remote Agent/);
+  assert.match(html, /id="invite-bundle-output"/);
+});
+
+async function readSseUntilData(reader: ReadableStreamDefaultReader<Uint8Array>, timeoutMs = 5_000): Promise<string> {
   const decoder = new TextDecoder();
   let text = "";
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const { value, done } = await reader.read();
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<{ timedOut: true }>((resolve) => setTimeout(() => resolve({ timedOut: true }), remainingMs)),
+    ]);
+    if ("timedOut" in result) {
+      break;
+    }
+    const { value, done } = result;
     if (done) {
       break;
     }
@@ -557,5 +1160,5 @@ async function readSseUntilData(reader: ReadableStreamDefaultReader<Uint8Array>)
       return text;
     }
   }
-  throw new Error(`Timed out waiting for SSE data. Received: ${text}`);
+  throw new Error(`Timed out waiting for SSE data. Received: ${JSON.stringify(text)}`);
 }

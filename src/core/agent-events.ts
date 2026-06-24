@@ -26,6 +26,16 @@ export type AgentRunEvent =
   | (AgentRunEventBase & { type: "assistant_text"; step: number; text: string; final?: boolean })
   | (AgentRunEventBase & { type: "assistant_note"; step: number; text: string })
   | (AgentRunEventBase & {
+      type: "goal_updated";
+      goalId: string;
+      status: "active" | "complete" | "blocked" | "cancelled";
+      objective: string;
+      summary: string;
+      repeatedBlockers?: number;
+      tokenUsed?: number;
+      modelCalls?: number;
+    })
+  | (AgentRunEventBase & {
       type: "tool_started";
       step: number;
       callId: string;
@@ -51,6 +61,24 @@ export type AgentRunEvent =
       stderrBytes?: number;
     })
   | (AgentRunEventBase & { type: "file_changed"; step: number; path: string; change: "create" | "modify" | "delete" | "patch" })
+  | (AgentRunEventBase & {
+      type: "run_budget_checkpoint";
+      targetMode?: ExecutionTargetMode;
+      steps: number;
+      modelCalls: number;
+      elapsedMs: number;
+      maxSteps?: number;
+      maxModelCalls?: number;
+      maxDurationMs?: number;
+    })
+  | (AgentRunEventBase & {
+      type: "guardrail_tripped";
+      guardrail: "doom_loop" | "idle_budget";
+      reason: string;
+      toolName?: string;
+      count?: number;
+      resumeCommand?: string;
+    })
   | (AgentRunEventBase & { type: "step_limit_reached"; maxSteps: number })
   | (AgentRunEventBase & {
       type: "runtime_stopped";

@@ -8,6 +8,8 @@ import type {
   AuditEvent,
   CapabilityGrant,
   FileChange,
+  GoalCheckpoint,
+  GoalRun,
   KnowledgeChunk,
   KnowledgeEvalRun,
   KnowledgeEvalSet,
@@ -18,6 +20,7 @@ import type {
   RoomInvite,
   RoomMember,
   RoomMessage,
+  RoomMessageIntentNonce,
   Organization,
   Project,
   RetentionPolicy,
@@ -27,6 +30,7 @@ import type {
   SkillUsageEvent,
   MemoryRecord,
   MemoryScope,
+  SessionTodo,
   PendingToolCall,
   PendingToolCallStatus,
   SessionSummary,
@@ -108,6 +112,7 @@ export type RecordWorkerHeartbeatNonceInput = WorkerHeartbeatNonce;
 export type RecordAgentHeartbeatNonceInput = AgentHeartbeatNonce;
 export type RecordTaskLeaseNonceInput = TaskLeaseNonce;
 export type RecordRoomDeliveryAckNonceInput = RoomDeliveryAckNonce;
+export type RecordRoomMessageIntentNonceInput = RoomMessageIntentNonce;
 
 export type ListTaskAssignmentsInput = {
   status?: TaskAssignmentStatus;
@@ -166,6 +171,11 @@ export type ListKnowledgeEvalRunsInput = {
   limit?: number;
 };
 
+export type ListGoalRunsInput = {
+  status?: GoalRun["status"];
+  limit?: number;
+};
+
 export type CompactSessionResult = {
   sessionId: string;
   messagesDeleted: number;
@@ -178,11 +188,20 @@ export interface AgentStore {
   listSessions(limit?: number): Promise<Session[]>;
   getMessages(sessionId: string): Promise<AgentMessage[]>;
   getToolResults(sessionId: string): Promise<ToolResult[]>;
+  replaceSessionTodos(sessionId: string, todos: SessionTodo[]): Promise<void>;
+  listSessionTodos(sessionId: string): Promise<SessionTodo[]>;
   updateSessionStatus(sessionId: string, status: Session["status"]): Promise<void>;
   appendMessage(input: AppendMessageInput): Promise<void>;
   recordToolCall(input: RecordToolCallInput): Promise<void>;
   recordFileChange(change: FileChange): Promise<void>;
   listFileChanges(sessionId?: string): Promise<FileChange[]>;
+  createGoalRun(goal: GoalRun): Promise<void>;
+  updateGoalRun(goal: GoalRun): Promise<void>;
+  getGoalRun(goalId: string): Promise<GoalRun | undefined>;
+  getGoalRunBySession(sessionId: string): Promise<GoalRun | undefined>;
+  listGoalRuns(input?: ListGoalRunsInput): Promise<GoalRun[]>;
+  addGoalCheckpoint(checkpoint: GoalCheckpoint): Promise<void>;
+  listGoalCheckpoints(goalId: string, limit?: number): Promise<GoalCheckpoint[]>;
   createKnowledgeSource(source: KnowledgeSource): Promise<void>;
   getKnowledgeSource(sourceId: string): Promise<KnowledgeSource | undefined>;
   listKnowledgeSources(input?: { scopeType?: KnowledgeSource["scopeType"]; scopeId?: string; kind?: KnowledgeSource["kind"]; limit?: number }): Promise<KnowledgeSource[]>;
@@ -234,6 +253,9 @@ export interface AgentStore {
   recordRoomDeliveryAckNonce(input: RecordRoomDeliveryAckNonceInput): Promise<boolean>;
   getRoomDeliveryAckNonce(agentId: string, nonce: string): Promise<RoomDeliveryAckNonce | undefined>;
   deleteRoomDeliveryAckNoncesBefore(input: { before: string; limit?: number }): Promise<number>;
+  recordRoomMessageIntentNonce(input: RecordRoomMessageIntentNonceInput): Promise<boolean>;
+  getRoomMessageIntentNonce(agentId: string, nonce: string): Promise<RoomMessageIntentNonce | undefined>;
+  deleteRoomMessageIntentNoncesBefore(input: { before: string; limit?: number }): Promise<number>;
   createRoom(room: Room): Promise<void>;
   getRoom(roomId: string): Promise<Room | undefined>;
   listRooms(limit?: number): Promise<Room[]>;

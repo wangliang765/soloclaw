@@ -5,6 +5,7 @@ export type TuiCommand = {
 };
 
 export const TUI_COMMANDS: TuiCommand[] = [
+  { name: "/models", command: "/models", description: "Configure or switch model provider" },
   { name: "/model setup", command: "/model setup", description: "Configure model provider and API key" },
   { name: "/mode [plan|build|goal]", command: "/mode", description: "Switch task mode" },
   { name: "/approve plan", command: "/approve plan", description: "Approve the current plan and execute in Build mode" },
@@ -26,10 +27,39 @@ export const TUI_COMMANDS: TuiCommand[] = [
   { name: "/phase2 evidence-record", command: "/phase2 evidence-record", description: "Record paste-safe Phase 2 evidence notes" },
   { name: "/phase2 closure-task", command: "/phase2 closure-task", description: "Check a reviewed Phase 2 closure task" },
   { name: "/phase2 evidence-check [--strict]", command: "/phase2 evidence-check", description: "Check Phase 2 evidence notes for sections and secret shapes" },
-  { name: "/sessions", command: "/sessions", description: "Show recent agent sessions" },
+  { name: "/sessions", command: "/sessions", description: "Open recent sessions picker" },
   { name: "/continue", command: "/continue", description: "Continue the stopped Goal session" },
-  { name: "/resume [session-id]", command: "/resume", description: "Resume the active or selected session" },
+  { name: "/resume [session-id|number]", command: "/resume", description: "Resume the active or selected session" },
+  { name: "/pause [reason]", command: "/pause", description: "Pause the active Goal session" },
+  { name: "/cancel [reason]", command: "/cancel", description: "Cancel the active Goal session" },
+  { name: "/background", command: "/background", description: "Queue the active Goal session for worker continuation" },
+  { name: "/goal status", command: "/goal status", description: "Show durable Goal progress" },
   { name: "/clear", command: "/clear", description: "Clear transcript and run state" },
   { name: "/help", command: "/help", description: "Show commands" },
   { name: "/exit", command: "/exit", description: "Quit Soloclaw" },
 ];
+
+export function commandSuggestionsForInput(input: string): TuiCommand[] {
+  const prefix = commandPrefix(input);
+  if (!prefix.startsWith("/")) {
+    return [];
+  }
+  return TUI_COMMANDS.filter((entry) => entry.command.startsWith(prefix) || entry.name.startsWith(prefix));
+}
+
+export function commonCommandPrefix(commands: TuiCommand[]): string {
+  if (commands.length === 0) {
+    return "";
+  }
+  let prefix = commands[0]?.command ?? "";
+  for (const command of commands.slice(1)) {
+    while (prefix && !command.command.startsWith(prefix)) {
+      prefix = prefix.slice(0, -1);
+    }
+  }
+  return prefix;
+}
+
+function commandPrefix(input: string): string {
+  return input.trimStart();
+}

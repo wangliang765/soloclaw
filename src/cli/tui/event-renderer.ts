@@ -27,6 +27,13 @@ export function renderEventRow(event: AgentRunEvent, width = 100): string {
       return clip(`${ansi.gray}-${ansi.reset} ${event.text}`, width);
     case "assistant_text":
       return clip(`${ansi.purple}>${ansi.reset} ${event.text}`, width);
+    case "goal_updated": {
+      const tail = [
+        event.modelCalls !== undefined ? `${event.modelCalls} model calls` : undefined,
+        event.repeatedBlockers ? `${event.repeatedBlockers} blockers` : undefined,
+      ].filter(Boolean).join(", ");
+      return clip(`${ansi.purple}GOAL${ansi.reset} ${event.status}: ${event.summary}${tail ? ` (${tail})` : ""}`, width);
+    }
     case "tool_started":
       return clip(`${ansi.gray}.${ansi.reset} ${event.title}${event.detailsHidden ? " (details hidden)" : ""}`, width);
     case "tool_finished": {
@@ -41,6 +48,16 @@ export function renderEventRow(event: AgentRunEvent, width = 100): string {
     }
     case "file_changed":
       return clip(`${ansi.purple}FILE${ansi.reset} ${event.change} ${event.path}`, width);
+    case "run_budget_checkpoint": {
+      const tail = [
+        event.maxSteps !== undefined ? `max steps=${event.maxSteps}` : undefined,
+        event.maxModelCalls !== undefined ? `max model calls=${event.maxModelCalls}` : undefined,
+        `${event.elapsedMs}ms`,
+      ].filter(Boolean).join(", ");
+      return clip(`${ansi.gray}.${ansi.reset} Budget ${event.steps} steps / ${event.modelCalls} model calls${tail ? ` (${tail})` : ""}`, width);
+    }
+    case "guardrail_tripped":
+      return clip(`${ansi.orange}!${ansi.reset} Guardrail: ${event.reason}`, width);
     case "step_limit_reached":
       return clip(`${ansi.orange}!${ansi.reset} Step budget reached: ${event.maxSteps}`, width);
     case "runtime_stopped": {
@@ -71,6 +88,7 @@ export function renderProjectedAssistantPartRow(part: ProjectedAssistantPart, wi
     case "tool": {
       const icon = part.status === "failed" ? "ERR" : part.status === "ok" ? "OK" : ".";
       const color = part.status === "failed" ? ansi.orange : part.status === "ok" ? ansi.purple : ansi.gray;
+      const title = `${activityLabelForToolName(part.toolName)}: ${part.title}`;
       const collapsedTail = [
         part.exitCode !== undefined ? `exit=${part.exitCode ?? "-"}` : undefined,
         part.timedOut ? "timed out" : undefined,
@@ -79,9 +97,25 @@ export function renderProjectedAssistantPartRow(part: ProjectedAssistantPart, wi
       ].filter(Boolean).join(", ");
       const expandedTail = options.expanded ? safeToolDetailsTail(part) : undefined;
       const tail = expandedTail || collapsedTail;
-      return clip(`${color}${icon}${ansi.reset} ${part.title}${tail ? ` (${tail})` : ""}`, width);
+      return clip(`${color}${icon}${ansi.reset} ${title}${tail ? ` (${tail})` : ""}`, width);
     }
   }
+}
+
+function activityLabelForToolName(toolName: string): string {
+  if (/read|list|stat|get/i.test(toolName)) {
+    return "Reading";
+  }
+  if (/search|grep|find/i.test(toolName)) {
+    return "Searching";
+  }
+  if (/command|shell|exec|test/i.test(toolName)) {
+    return "Running";
+  }
+  if (/patch|replace|edit|write|create|delete|move/i.test(toolName)) {
+    return /create|write/i.test(toolName) ? "Writing" : "Editing";
+  }
+  return "Working";
 }
 
 function safeToolDetailsTail(part: Extract<ProjectedAssistantPart, { type: "tool" }>): string | undefined {

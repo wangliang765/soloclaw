@@ -1,5 +1,7 @@
 import { AgentLoop } from "../core/agent-loop.js";
-import type { AgentContextAttachment, AgentLoopProgressEvent } from "../core/agent-loop.js";
+import type { AgentContextAttachment, AgentLoopOptions, AgentLoopProgressEvent } from "../core/agent-loop.js";
+import { AgentRunSupervisor } from "../core/agent-run-supervisor.js";
+import type { AgentRunBudget } from "../core/run-budget.js";
 import type { LocalEventBus } from "../events/local-event-bus.js";
 import { LocalAssignmentTaskBroker, taskLeaseEnvelopeHash } from "../broker/local-assignment-task-broker.js";
 import { SYSTEM_PROMPT } from "../core/system-prompt.js";
@@ -10,8 +12,9 @@ import { ConfiguredModelClient } from "../model/configured-model-client.js";
 import { FallbackModelClient } from "../model/fallback-model-client.js";
 import { GuardedModelClient, hasModelReliabilityGuards } from "../model/guarded-model-client.js";
 import { MockModelClient } from "../model/mock-model-client.js";
-import { AnthropicCompatibleMessagesClient, OpenAICompatibleChatClient } from "../model/http-model-clients.js";
+import { AnthropicCompatibleMessagesClient, OpenAICompatibleChatClient, OpenAIResponsesClient } from "../model/http-model-clients.js";
 import { DefaultModelRegistry } from "../model/model-registry.js";
+import { GlobalModelProfileStore, globalProfileToProviderProfile, globalSecretVaultPassphraseFile, globalSecretVaultPath } from "../model/global-model-profile-store.js";
 import { resolveLocalDefaultProvider, resolveLocalProviderProfiles } from "../model/local-provider-profile-store.js";
 import type { ModelProviderProfile } from "../model/provider-profiles.js";
 import { makeId } from "../domain/common.js";
@@ -44,12 +47,13 @@ import { createWorkspaceTools } from "../tools/workspace-tools.js";
 import { LocalWorkerRunner } from "../workers/local-worker-runner.js";
 import { WorkerHealthService } from "../workers/worker-health-service.js";
 import { WorkerRegistryService } from "../workers/worker-registry-service.js";
-import { LocalWorkspaceRuntime } from "../workspace/local-workspace-runtime.js";
 import { collectWorkspaceKeyFilePreviews, collectWorkspaceSnapshot, renderWorkspaceFilePreviews, renderWorkspaceSnapshot } from "../workspace/workspace-snapshot.js";
 import { SqliteWorkspaceLockManager } from "../workspace/sqlite-workspace-lock-manager.js";
+import { resolveWorkspaceRuntime, type WorkspaceRuntimeMode } from "../workspace/workspace-runtime-selector.js";
 
 export type LocalPlatformOptions = {
   provider?: ModelProviderName;
+  modelProfile?: string;
   model?: string;
   baseUrl?: string;
   apiKeyEnv?: string;
@@ -65,6 +69,7 @@ export type LocalPlatformOptions = {
   executionMode?: "strict" | "balanced" | "trusted" | "full_access";
   targetMode?: "plan" | "build" | "goal";
   maxSteps?: number;
+  runBudget?: AgentRunBudget;
   onAgentProgress?: (event: AgentLoopProgressEvent) => void | Promise<void>;
   eventBus?: LocalEventBus;
   parentSessionId?: string;
@@ -87,6 +92,9 @@ export type LocalPlatformOptions = {
   workspaceMaxKeyFiles?: number;
   workspaceMaxPreviewLines?: number;
   workspaceMaxPreviewChars?: number;
+  workspaceRuntime?: WorkspaceRuntimeMode;
+  workspaceRuntimeRunner?: string;
+  contextCompaction?: AgentLoopOptions["contextCompaction"];
 };
 
 export async function createLocalPlatform(cwd: string, options: LocalPlatformOptions = {}) {
@@ -95,7 +103,11 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
   const secrets = new EncryptedFileSecretStore(`${cwd}/.agent/secrets.vault.json`, localSecretVaultStoreOptions(cwd));
   const identity = new LocalAgentIdentityService(cwd, store);
   const localAgent = await identity.getOrCreate();
-  const workspace = new LocalWorkspaceRuntime(cwd);
+  const workspaceRuntime = await resolveWorkspaceRuntime(cwd, {
+    mode: options.workspaceRuntime,
+    runnerPath: options.workspaceRuntimeRunner,
+  });
+  const workspace = workspaceRuntime.runtime;
   const locks = new SqliteWorkspaceLockManager(agentDbPath);
   const modelRegistry = new DefaultModelRegistry();
   const redactor = new BasicRedactor();
@@ -104,9 +116,24 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
   const policyScope = await resolvePolicyScope(store, options);
   const platformActor: ActorRef = { type: "user", id: "local-user", displayName: "Local User" };
   const secretBroker = new PolicySecretBroker(secrets, policy, store);
+  const globalModelProfileStore = new GlobalModelProfileStore();
+  const selectedGlobalProfile = options.modelProfile ? await globalModelProfileStore.resolveProfile(options.modelProfile) : undefined;
+  const globalSecrets = new EncryptedFileSecretStore(
+    globalSecretVaultPath(globalModelProfileStore.home),
+    { passphraseFile: globalSecretVaultPassphraseFile(globalModelProfileStore.home) },
+  );
+  const globalSecretBroker = new PolicySecretBroker(globalSecrets, policy, store);
   const modelProviderProfiles = await resolveLocalProviderProfiles(cwd);
+  if (selectedGlobalProfile) {
+    modelProviderProfiles[selectedGlobalProfile.provider] = globalProfileToProviderProfile(selectedGlobalProfile);
+  }
   const configuredDefaultProvider = await resolveLocalDefaultProvider(cwd);
-  const provider = options.provider ?? configuredDefaultProvider ?? "mock";
+  const provider = selectedGlobalProfile?.provider ?? options.provider ?? configuredDefaultProvider ?? "mock";
+  const primaryModelName = options.model ?? defaultModelFor(provider, modelProviderProfiles);
+  const contextCompaction = resolveContextCompactionOptions(options, process.env, {
+    provider,
+    model: primaryModelName,
+  });
   const mcpRegistry = new LocalMcpRegistry(`${cwd}/.agent`);
   const mcpRuntime = new LocalMcpRuntime({ redactor });
   const mcpHealth = new McpHealthService(mcpRegistry, mcpRuntime, policy, store, secretBroker, { planAudit: false });
@@ -124,8 +151,9 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
       continue;
     }
     const apiKeySecretRef = provider === profile.name ? options.apiKeySecretRef ?? profile.apiKeySecretRef : profile.apiKeySecretRef;
+    const profileSecretBroker = selectedGlobalProfile?.provider === profile.name ? globalSecretBroker : secretBroker;
     const apiKey = apiKeyResolver(
-      secretBroker,
+      profileSecretBroker,
       apiKeySecretRef,
       provider === profile.name && options.apiKeyEnv ? [options.apiKeyEnv] : profile.apiKeyEnvNames,
       {
@@ -138,6 +166,18 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
       modelRegistry.register(
         profile.name,
         new OpenAICompatibleChatClient({
+          baseUrl,
+          apiKey,
+          defaultModel: provider === profile.name && options.model ? options.model : profile.defaultModel,
+          ...modelRetryOptions(options),
+        }),
+      );
+      continue;
+    }
+    if (profile.protocol === "openai_responses") {
+      modelRegistry.register(
+        profile.name,
+        new OpenAIResponsesClient({
           baseUrl,
           apiKey,
           defaultModel: provider === profile.name && options.model ? options.model : profile.defaultModel,
@@ -166,7 +206,7 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
       ? modelClient
       : new ConfiguredModelClient(modelClient, {
           name: provider,
-          model: options.model ?? defaultModelFor(provider, modelProviderProfiles),
+          model: primaryModelName,
           baseUrl: options.baseUrl,
           maxRetries: options.modelMaxRetries,
           retryBaseDelayMs: options.modelRetryBaseDelayMs,
@@ -231,13 +271,16 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
         sessionId: () => activeSession.id,
       }),
       systemPrompt: SYSTEM_PROMPT,
-      modelAudit: modelAuditOptions(provider, options, modelProviderProfiles),
+      modelAudit: modelAuditOptions(provider, options, modelProviderProfiles, primaryModelName),
       store,
       actor,
       contextAttachments: context.attachments,
       selectedSkillIds: context.selectedSkillIds,
       targetMode: options.targetMode ?? "build",
+      planDirectory: `${cwd}/.agent/plans`,
       maxSteps: options.maxSteps,
+      runBudget: options.runBudget,
+      contextCompaction,
       sessionScope: policyScope,
       onSessionActivated: (session) => {
         activeSession.id = session.id;
@@ -277,13 +320,16 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
         sessionId: () => activeSession.id,
       }),
       systemPrompt: SYSTEM_PROMPT,
-      modelAudit: modelAuditOptions(provider, options, modelProviderProfiles),
+      modelAudit: modelAuditOptions(provider, options, modelProviderProfiles, primaryModelName),
       store,
       actor,
       contextAttachments: context.attachments,
       selectedSkillIds: context.selectedSkillIds,
       targetMode: options.targetMode ?? "build",
+      planDirectory: `${cwd}/.agent/plans`,
       maxSteps: options.maxSteps,
+      runBudget: options.runBudget,
+      contextCompaction,
       sessionScope: policyScope,
       onSessionActivated: (session) => {
         activeSession.id = session.id;
@@ -347,6 +393,7 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
     modelRegistry,
     store,
     workspace,
+    workspaceRuntime: workspaceRuntime.selection,
     policy,
     secrets,
     secretBroker,
@@ -372,6 +419,11 @@ export async function createLocalPlatform(cwd: string, options: LocalPlatformOpt
     agentHealth,
     workerHealth,
     workerRunner,
+    eventBus: options.eventBus,
+    goalSupervisor: new AgentRunSupervisor({
+      store,
+      createAgent: createMainAgent,
+    }),
     scheduler: new LocalSchedulerService({
       assignments,
       taskBroker,
@@ -517,6 +569,156 @@ async function buildContextAttachments(
   return { attachments, selectedSkillIds };
 }
 
+type ContextCompactionModelHint = {
+  provider?: ModelProviderName;
+  model?: string;
+};
+
+export function resolveContextCompactionOptions(
+  options: LocalPlatformOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  modelHint?: ContextCompactionModelHint,
+): AgentLoopOptions["contextCompaction"] {
+  const disabledByEnv = isTruthyEnv(env.SOLOCLAW_DISABLE_AUTOCOMPACT);
+  const envOptions: AgentLoopOptions["contextCompaction"] = {
+    auto: disabledByEnv ? false : optionalBooleanEnv("SOLOCLAW_CONTEXT_COMPACTION_AUTO", env),
+    contextWindowTokens: optionalPositiveIntegerEnv("SOLOCLAW_CONTEXT_WINDOW_TOKENS", env),
+    bufferTokens: optionalNonNegativeIntegerEnv("SOLOCLAW_CONTEXT_COMPACTION_BUFFER_TOKENS", env),
+    outputReserveTokens: optionalNonNegativeIntegerEnv("SOLOCLAW_CONTEXT_OUTPUT_RESERVE_TOKENS", env),
+    keepRecentTokens: optionalNonNegativeIntegerEnv("SOLOCLAW_CONTEXT_COMPACTION_KEEP_TOKENS", env),
+    thresholdPercent: optionalPercentageIntegerEnv("SOLOCLAW_CONTEXT_COMPACTION_THRESHOLD_PERCENT", env),
+    summaryMode: optionalContextCompactionSummaryModeEnv("SOLOCLAW_CONTEXT_COMPACTION_SUMMARY_MODE", env),
+  };
+  const merged = {
+    ...envOptions,
+    ...options.contextCompaction,
+  };
+  if (merged.auto === false) {
+    return {
+      ...merged,
+      auto: false,
+    };
+  }
+
+  const inferredContextWindowTokens = inferContextWindowTokens(modelHint ?? {
+    provider: options.provider,
+    model: options.model,
+  });
+  const hasEnvOption = disabledByEnv || Object.values(envOptions).some((value) => value !== undefined);
+  if (!hasEnvOption && !options.contextCompaction && inferredContextWindowTokens === undefined) {
+    return undefined;
+  }
+  return {
+    ...merged,
+    auto: merged.auto ?? true,
+    contextWindowTokens: merged.contextWindowTokens ?? inferredContextWindowTokens,
+  };
+}
+
+function inferContextWindowTokens(hint: ContextCompactionModelHint | undefined): number | undefined {
+  if (!hint?.provider || !hint.model || hint.provider === "mock") {
+    return undefined;
+  }
+  const model = hint.model.toLowerCase();
+  for (const entry of MODEL_CONTEXT_WINDOWS) {
+    if (entry.provider === hint.provider && entry.pattern.test(model)) {
+      return entry.tokens;
+    }
+  }
+  return undefined;
+}
+
+const MODEL_CONTEXT_WINDOWS: Array<{ provider: ModelProviderName; pattern: RegExp; tokens: number }> = [
+  { provider: "openai", pattern: /^gpt-4\.1/, tokens: 1_000_000 },
+  { provider: "openai", pattern: /^gpt-4o/, tokens: 128_000 },
+  { provider: "openai", pattern: /^o[34]/, tokens: 200_000 },
+  { provider: "anthropic", pattern: /^claude-/, tokens: 200_000 },
+  { provider: "anthropic_compatible", pattern: /^claude-/, tokens: 200_000 },
+  { provider: "gemini", pattern: /^gemini-2\./, tokens: 1_000_000 },
+  { provider: "kimi", pattern: /^moonshot-v1-8k/, tokens: 8_000 },
+  { provider: "kimi", pattern: /^moonshot-v1-32k/, tokens: 32_000 },
+  { provider: "kimi", pattern: /^moonshot-v1-128k/, tokens: 128_000 },
+  { provider: "kimi", pattern: /^kimi-/, tokens: 128_000 },
+  { provider: "deepseek", pattern: /^deepseek-/, tokens: 128_000 },
+  { provider: "glm", pattern: /^glm-/, tokens: 128_000 },
+  { provider: "qwen", pattern: /^qwen/, tokens: 128_000 },
+  { provider: "minimax", pattern: /^(minimax|abab)/, tokens: 128_000 },
+  { provider: "grok", pattern: /^grok-/, tokens: 128_000 },
+  { provider: "mimo", pattern: /^mimo-/, tokens: 128_000 },
+];
+
+function optionalBooleanEnv(name: string, env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+  const value = env[name];
+  if (!value) {
+    return undefined;
+  }
+  if (isTruthyEnv(value)) {
+    return true;
+  }
+  if (isFalseyEnv(value)) {
+    return false;
+  }
+  throw new Error(`${name} must be true or false.`);
+}
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "yes" || value === "on";
+}
+
+function isFalseyEnv(value: string | undefined): boolean {
+  return value === "0" || value === "false" || value === "no" || value === "off";
+}
+
+function optionalPositiveIntegerEnv(name: string, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const value = env[name];
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
+function optionalNonNegativeIntegerEnv(name: string, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const value = env[name];
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer.`);
+  }
+  return parsed;
+}
+
+function optionalPercentageIntegerEnv(name: string, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const value = env[name];
+  if (!value) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 100) {
+    throw new Error(`${name} must be an integer between 1 and 100.`);
+  }
+  return parsed;
+}
+
+function optionalContextCompactionSummaryModeEnv(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonNullable<AgentLoopOptions["contextCompaction"]>["summaryMode"] | undefined {
+  const value = env[name];
+  if (!value) {
+    return undefined;
+  }
+  if (value === "heuristic" || value === "model" || value === "auto") {
+    return value;
+  }
+  throw new Error(`${name} must be heuristic, model, or auto.`);
+}
+
 function apiKeyResolver(
   secretBroker: PolicySecretBroker,
   secretRef: string | undefined,
@@ -572,10 +774,16 @@ function withModelReliabilityGuards(model: ModelClient, options: LocalPlatformOp
   return hasModelReliabilityGuards(guardOptions) ? new GuardedModelClient(model, guardOptions) : model;
 }
 
-function modelAuditOptions(provider: ModelProviderName, options: LocalPlatformOptions, profiles: Record<ModelProviderName, ModelProviderProfile>) {
+function modelAuditOptions(
+  provider: ModelProviderName,
+  options: LocalPlatformOptions,
+  profiles: Record<ModelProviderName, ModelProviderProfile>,
+  model: string = options.model ?? defaultModelFor(provider, profiles),
+) {
   return {
     provider,
-    model: options.model ?? defaultModelFor(provider, profiles),
+    modelProfile: options.modelProfile,
+    model,
     fallbackProviders: options.fallbackProviders ?? [],
   };
 }

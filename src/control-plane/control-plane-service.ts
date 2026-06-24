@@ -1,6 +1,6 @@
 ﻿import type { IncomingMessage } from "node:http";
 import { createHash, createPublicKey, randomUUID } from "node:crypto";
-import type { ActorRef, AgentHeartbeatEnvelope, AgentHeartbeatStatus, AgentIdentity, ApprovalRequest, ArtifactKind, McpServerRegistration, RoomDeliveryAckEnvelope, RoomMemberStatus, RoomRole, TaskAssignmentStatus, WorkerStatus } from "../domain/index.js";
+import type { ActorRef, AgentHeartbeatEnvelope, AgentHeartbeatStatus, AgentIdentity, ApprovalRequest, ArtifactKind, AuditEvent, McpServerRegistration, RoomDeliveryAckEnvelope, RoomMessageIntentEnvelope, RoomMemberStatus, RoomRole, TaskAssignmentStatus, WorkerStatus } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import type { createLocalPlatform } from "../platform/local-platform.js";
 import { buildRoomActivationContext, shouldActorRespondToRoomMessage } from "../rooms/message-routing.js";
@@ -8,6 +8,7 @@ import { buildRoomRoster } from "../rooms/room-roster.js";
 import type { McpHealthCheckResult } from "../mcp/mcp-health-service.js";
 import type { ListArtifactsInput, ListAuditEventsInput, ListTaskAssignmentsInput, ListWorkersInput } from "../store/agent-store.js";
 import type { AgentStore } from "../store/agent-store.js";
+import type { PlatformEvent } from "../events/event-stream.js";
 import { buildOperatorViewModel } from "../operator/operator-view-models.js";
 import type { OperatorRowsOptions } from "../operator/operator-rows.js";
 import { collectOperatorRows } from "../operator/operator-rows.js";
@@ -29,6 +30,91 @@ type CachedMcpHealth = {
   consecutiveFailures: number;
 };
 
+export type StaleAgentRecoveryResult = {
+  kind: "soloclaw.agent_stale_recovery";
+  generatedAt: string;
+  now: string;
+  action: "suspend_room_member";
+  summary: {
+    scanned: number;
+    stale: number;
+    recovered: number;
+    skipped: number;
+  };
+  recovered: Array<{
+    agentId: string;
+    roomId: string;
+    healthStateBefore: "stale";
+    memberStatusBefore: RoomMemberStatus;
+    memberStatusAfter: "suspended";
+    heartbeatStatusBefore?: AgentHeartbeatStatus;
+    heartbeatStatusAfter: "offline";
+    heartbeatExpired: true;
+    heartbeatExpiresAt?: string;
+  }>;
+  skipped: Array<{
+    agentId: string;
+    reason: "agent_missing" | "last_room_missing" | "member_missing" | "member_not_active";
+    roomId?: string;
+  }>;
+};
+
+export type RoomDeliveryAgentStatus = {
+  agentId: string;
+  displayName?: string;
+  role: RoomRole;
+  memberStatus: RoomMemberStatus;
+  routedMessageCount: number;
+  pendingRoutedCount: number;
+  lastRoutedMessageId?: string;
+  lastAckMessageId?: string;
+  lastAckAt?: string;
+  lastAckSigned: boolean;
+  cursorUpdatedAt?: string;
+  cursorUpdatedBy?: ActorRef;
+};
+
+export type RoomDeliveryStatus = {
+  roomId: string;
+  generatedAt: string;
+  transcriptMessageCount: number;
+  agents: RoomDeliveryAgentStatus[];
+};
+
+export type RemoteRoomInviteBundle = {
+  kind: "soloclaw.room_invite";
+  version: 1;
+  controlUrl: string;
+  controlToken: string;
+  roomId: string;
+  inviteToken: string;
+  inviteId?: string;
+  inviteSignatureStatus: string;
+  role: RoomRole;
+  aliases: string[];
+  displayName?: string;
+  expiresAt?: string;
+  maxUses?: number;
+  sensitivity: "contains_control_token_and_invite_token_do_not_commit";
+  defaultRun: {
+    cycles: number;
+    limit: number;
+    idleLimit: number;
+    intervalMs: number;
+    loopIntervalMs: number;
+    stopWhenIdle: boolean;
+    idleCycles: number;
+    backoffMs: number;
+    maxBackoffMs: number;
+    maxErrors: number;
+    heartbeatTtlSeconds: number;
+  };
+  commands: {
+    enroll: string;
+    run: string;
+  };
+};
+
 export class ControlPlaneService {
   private readonly mcpHealthCache = new Map<string, CachedMcpHealth>();
 
@@ -45,12 +131,17 @@ export class ControlPlaneService {
   async getState(options: { operatorProjection?: OperatorProjectionMode; operatorActor?: ActorRef } = {}) {
     const rooms = await this.platform.rooms.listRooms(50);
     const roomDetails = await Promise.all(
-      rooms.map(async (room) => ({
-        room,
-        members: await this.platform.rooms.listMembers(room.id),
-        messages: await this.platform.rooms.listMessages(room.id, 80),
-        invites: await this.listSignedRoomInvites(room.id),
-      })),
+      rooms.map(async (room) => {
+        const members = await this.platform.rooms.listMembers(room.id);
+        const messages = await this.platform.rooms.listMessages(room.id, 1000);
+        return {
+          room,
+          members,
+          messages: messages.slice(-80),
+          invites: await this.listSignedRoomInvites(room.id),
+          deliveryStatus: await this.buildRoomDeliveryStatus(room.id, members, messages),
+        };
+      }),
     );
     const projects = await this.platform.store.listProjects(undefined, 50);
     const artifacts = await this.platform.store.listArtifacts({ status: "active", limit: 30 });
@@ -270,8 +361,123 @@ export class ControlPlaneService {
     return this.platform.store.getAgent(agentId);
   }
 
+  async listRoomInvitationsForAgent(agentId: string) {
+    const agent = await this.platform.store.getAgent(agentId);
+    if (!agent) {
+      return undefined;
+    }
+    const rooms = await this.platform.rooms.listRooms(1000);
+    const invitations = [];
+    for (const room of rooms) {
+      const members = await this.platform.rooms.listMembers(room.id);
+      const member = members.find((candidate) => candidate.actor.type === "agent" && candidate.actor.id === agentId);
+      if (!member || (member.status !== "invited" && member.status !== "pending")) {
+        continue;
+      }
+      invitations.push({
+        room,
+        member,
+      });
+    }
+    return {
+      generatedAt: new Date().toISOString(),
+      agent,
+      invitations,
+    };
+  }
+
   async getAgentHealth(input: { now?: string; limit?: number } = {}) {
     return this.platform.agentHealth.getSummary(input);
+  }
+
+  async recoverStaleAgents(input: { actor: ActorRef; now?: string; limit?: number }): Promise<StaleAgentRecoveryResult> {
+    const now = input.now ?? new Date().toISOString();
+    const summary = await this.platform.agentHealth.getSummary({ now, limit: input.limit ?? 1000 });
+    const staleAgents = summary.perAgent.filter((agent) => agent.healthState === "stale");
+    const recovered: StaleAgentRecoveryResult["recovered"] = [];
+    const skipped: StaleAgentRecoveryResult["skipped"] = [];
+
+    for (const healthAgent of staleAgents) {
+      const agent = await this.platform.store.getAgent(healthAgent.agentId);
+      if (!agent) {
+        skipped.push({ agentId: healthAgent.agentId, reason: "agent_missing", roomId: healthAgent.lastRoomId });
+        continue;
+      }
+      const roomId = healthAgent.lastRoomId ?? agent.lastRoomId;
+      if (!roomId) {
+        skipped.push({ agentId: healthAgent.agentId, reason: "last_room_missing" });
+        continue;
+      }
+      const members = await this.platform.rooms.listMembers(roomId);
+      const member = members.find((candidate) => candidate.actor.type === "agent" && candidate.actor.id === healthAgent.agentId);
+      if (!member) {
+        skipped.push({ agentId: healthAgent.agentId, reason: "member_missing", roomId });
+        continue;
+      }
+      if (member.status !== "active") {
+        skipped.push({ agentId: healthAgent.agentId, reason: "member_not_active", roomId });
+        continue;
+      }
+
+      const updatedMember = await this.platform.rooms.updateMemberStatus(roomId, healthAgent.agentId, "suspended", input.actor);
+      const updatedAgent: AgentIdentity = {
+        ...agent,
+        heartbeatStatus: "offline",
+        heartbeatMetadata: {
+          ...(agent.heartbeatMetadata ?? {}),
+          staleRecovery: {
+            action: "suspend_room_member",
+            recoveredAt: now,
+            recoveredBy: `${input.actor.type}:${input.actor.id}`,
+            roomId,
+            healthStateBefore: healthAgent.healthState,
+            heartbeatStatusBefore: agent.heartbeatStatus,
+            heartbeatExpiresAt: agent.heartbeatExpiresAt,
+          },
+        },
+      };
+      await this.platform.store.updateAgentHeartbeat(updatedAgent);
+      recovered.push({
+        agentId: healthAgent.agentId,
+        roomId,
+        healthStateBefore: "stale",
+        memberStatusBefore: member.status,
+        memberStatusAfter: updatedMember.status as "suspended",
+        heartbeatStatusBefore: agent.heartbeatStatus,
+        heartbeatStatusAfter: "offline",
+        heartbeatExpired: true,
+        heartbeatExpiresAt: agent.heartbeatExpiresAt,
+      });
+    }
+
+    const result: StaleAgentRecoveryResult = {
+      kind: "soloclaw.agent_stale_recovery",
+      generatedAt: new Date().toISOString(),
+      now,
+      action: "suspend_room_member",
+      summary: {
+        scanned: summary.perAgent.length,
+        stale: staleAgents.length,
+        recovered: recovered.length,
+        skipped: skipped.length,
+      },
+      recovered,
+      skipped,
+    };
+    await this.auditControlAction(input.actor, "Recovered stale agents from control plane", {
+      action: result.action,
+      now,
+      scanned: result.summary.scanned,
+      stale: result.summary.stale,
+      recovered: result.summary.recovered,
+      skipped: result.summary.skipped,
+      recoveredAgentIds: recovered.map((agent) => agent.agentId),
+      skippedReasons: skipped.map((agent) => agent.reason),
+    }, {
+      roomId: recovered.length === 1 ? recovered[0].roomId : undefined,
+      agentId: recovered.length === 1 ? recovered[0].agentId : undefined,
+    });
+    return result;
   }
 
   async heartbeatAgent(input: {
@@ -331,7 +537,7 @@ export class ControlPlaneService {
       hasLastError: Boolean(updated.lastError),
       signedHeartbeat: Boolean(input.heartbeatEnvelope?.signature),
       expiresAt: updated.heartbeatExpiresAt,
-    }, { roomId: updated.lastRoomId });
+    }, { roomId: updated.lastRoomId, agentId: input.agentId });
     return stored;
   }
 
@@ -386,6 +592,79 @@ export class ControlPlaneService {
     return agent;
   }
 
+  async updateAgentTrustStatus(input: { actor: ActorRef; agentId: string; trustStatus: AgentIdentity["trustStatus"]; reason?: string }): Promise<{
+    agent: AgentIdentity;
+    previousTrustStatus: AgentIdentity["trustStatus"];
+    reason?: string;
+  }> {
+    const existing = await this.platform.store.getAgent(input.agentId);
+    if (!existing) {
+      throw new Error(`Agent not found: ${input.agentId}`);
+    }
+    const updated: AgentIdentity = {
+      ...existing,
+      trustStatus: input.trustStatus,
+    };
+    await this.platform.store.registerAgent(updated);
+    await this.auditControlAction(input.actor, "Updated agent trust status from control plane", {
+      agentId: updated.id,
+      machineId: updated.machineId,
+      previousTrustStatus: existing.trustStatus,
+      trustStatus: updated.trustStatus,
+      reason: input.reason,
+    }, { agentId: updated.id, roomId: updated.lastRoomId });
+    return {
+      agent: updated,
+      previousTrustStatus: existing.trustStatus,
+      reason: input.reason,
+    };
+  }
+
+  async rotateAgentIdentityKey(input: {
+    actor: ActorRef;
+    agentId: string;
+    publicKeyPem: string;
+    fingerprint?: string;
+    reason?: string;
+  }): Promise<{
+    agent: AgentIdentity;
+    previousFingerprint: string;
+    reason?: string;
+  }> {
+    const existing = await this.platform.store.getAgent(input.agentId);
+    if (!existing) {
+      throw new Error(`Agent not found: ${input.agentId}`);
+    }
+    const normalizedPublicKey = normalizePublicKeyPem(input.publicKeyPem);
+    const fingerprint = fingerprintPublicKey(normalizedPublicKey);
+    if (input.fingerprint && normalizeFingerprint(input.fingerprint) !== normalizeFingerprint(fingerprint)) {
+      throw new Error("Invalid agent identity: fingerprint does not match public key.");
+    }
+    if (existing.publicKeyPem === normalizedPublicKey) {
+      throw new Error(`Agent identity key rotation requires a new public key: ${input.agentId}`);
+    }
+    const updated: AgentIdentity = {
+      ...existing,
+      publicKeyPem: normalizedPublicKey,
+      fingerprint,
+      lastSeenAt: new Date().toISOString(),
+    };
+    await this.platform.store.registerAgent(updated);
+    await this.auditControlAction(input.actor, "Rotated agent identity key from control plane", {
+      agentId: updated.id,
+      machineId: updated.machineId,
+      previousFingerprint: existing.fingerprint,
+      fingerprint: updated.fingerprint,
+      trustStatus: updated.trustStatus,
+      reason: input.reason,
+    }, { agentId: updated.id, roomId: updated.lastRoomId });
+    return {
+      agent: updated,
+      previousFingerprint: existing.fingerprint,
+      reason: input.reason,
+    };
+  }
+
   async getRoom(roomId: string) {
     const room = await this.platform.rooms.getRoom(roomId);
     if (!room) {
@@ -409,6 +688,53 @@ export class ControlPlaneService {
       members: await this.platform.rooms.listMembers(roomId),
       agents: await this.platform.store.listAgents(1000),
     });
+  }
+
+  async getRoomDeliveryStatus(roomId: string): Promise<RoomDeliveryStatus | undefined> {
+    const room = await this.platform.rooms.getRoom(roomId);
+    if (!room) {
+      return undefined;
+    }
+    const members = await this.platform.rooms.listMembers(roomId);
+    const messages = await this.platform.rooms.listMessages(roomId, 1000);
+    return this.buildRoomDeliveryStatus(room.id, members, messages);
+  }
+
+  private async buildRoomDeliveryStatus(
+    roomId: string,
+    members: Awaited<ReturnType<LocalPlatform["rooms"]["listMembers"]>>,
+    messages: Awaited<ReturnType<LocalPlatform["rooms"]["listMessages"]>>,
+  ): Promise<RoomDeliveryStatus> {
+    const agentMembers = members.filter((member) => member.actor.type === "agent");
+    const agents = await Promise.all(
+      agentMembers.map(async (member): Promise<RoomDeliveryAgentStatus> => {
+        const agentId = member.actor.id;
+        const cursor = await this.platform.store.getRoomDeliveryCursor(roomId, agentId);
+        const routedMessages = messages.filter((message) => shouldActorRespondToRoomMessage(message, member));
+        const pendingMessages = messagesAfterCursor(messages, cursor?.lastDeliveredMessageId)
+          .filter((message) => shouldActorRespondToRoomMessage(message, member));
+        return {
+          agentId,
+          displayName: member.actor.displayName,
+          role: member.role,
+          memberStatus: member.status,
+          routedMessageCount: routedMessages.length,
+          pendingRoutedCount: pendingMessages.length,
+          lastRoutedMessageId: routedMessages.at(-1)?.id,
+          lastAckMessageId: cursor?.lastDeliveredMessageId,
+          lastAckAt: cursor?.lastAckEnvelope?.acknowledgedAt ?? cursor?.updatedAt,
+          lastAckSigned: Boolean(cursor?.lastAckEnvelope?.signature),
+          cursorUpdatedAt: cursor?.updatedAt,
+          cursorUpdatedBy: cursor?.updatedBy,
+        };
+      }),
+    );
+    return {
+      roomId,
+      generatedAt: new Date().toISOString(),
+      transcriptMessageCount: messages.length,
+      agents,
+    };
   }
 
   private async listSignedRoomInvites(roomId: string) {
@@ -498,6 +824,24 @@ export class ControlPlaneService {
       updatedBy: input.actor,
     };
     await this.platform.store.upsertRoomDeliveryCursor(cursor);
+    this.publishControlPlaneEvent({
+      id: `evt_${message.id}_${input.agentId}_ack`,
+      type: "room.delivery.acknowledged",
+      actor: input.actor,
+      scope: {
+        roomId: input.roomId,
+        agentId: input.agentId,
+      },
+      payload: {
+        messageId: message.id,
+        agentId: input.agentId,
+        actorType: input.actor.type,
+        actorId: input.actor.id,
+        signedAck: Boolean(ackEnvelope?.signature),
+        acknowledgedAt: ackEnvelope?.acknowledgedAt ?? cursor.updatedAt,
+      },
+      createdAt: cursor.updatedAt,
+    });
     await this.auditControlAction(
       input.actor,
       "Acknowledged routed room inbox from control plane",
@@ -568,6 +912,7 @@ export class ControlPlaneService {
     if (envelope.acknowledgedBy.type !== "agent" || envelope.acknowledgedBy.id !== envelope.agentId) {
       throw new Error("Room delivery ack envelope must be acknowledged by the target agent.");
     }
+    await this.requireAgentTrustForSignedOperation(envelope.agentId, "room delivery ack");
     const status = await this.platform.identity.verifyRoomDeliveryAckEnvelope(envelope);
     if (status !== "valid") {
       throw new Error(`Invalid room delivery ack envelope signature: ${status}`);
@@ -610,6 +955,7 @@ export class ControlPlaneService {
     if (!agent) {
       throw new Error(`Agent not found: ${envelope.agentId}`);
     }
+    await this.requireAgentTrustForSignedOperation(envelope.agentId, "agent heartbeat");
     if (envelope.machineId !== agent.machineId) {
       throw new Error("Agent heartbeat envelope machine does not match registered identity.");
     }
@@ -1053,20 +1399,126 @@ export class ControlPlaneService {
     kind: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["kind"];
     body: string;
     routing?: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["routing"];
+    messageEnvelope?: RoomMessageIntentEnvelope;
   }) {
+    const remoteIntentMetadata = await this.resolveRoomMessageIntentMetadata(input);
     const message = await this.platform.rooms.sendMessage({
       roomId: input.roomId as Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["roomId"],
       sender: input.sender,
       kind: input.kind,
       body: input.body,
       routing: input.routing,
+      metadata: remoteIntentMetadata,
+    });
+    this.publishControlPlaneEvent({
+      id: `evt_${message.id}`,
+      type: "room.message.sent",
+      actor: input.sender,
+      scope: {
+        roomId: input.roomId,
+        agentId: input.sender.type === "agent" ? input.sender.id : undefined,
+      },
+      payload: {
+        messageId: message.id,
+        kind: message.kind,
+        senderType: message.sender.type,
+        senderId: message.sender.id,
+        bodyLength: message.body.length,
+        routingMode: message.routing?.mode,
+        routingSource: message.routing?.source,
+        routedAgentIds: message.routing?.targets.flatMap((target) =>
+          target.type === "actor" && target.actor.type === "agent" ? [target.actor.id] : [],
+        ) ?? [],
+        signedRemoteIntent: remoteIntentMetadata?.remoteIntentSignatureStatus === "valid",
+      },
+      createdAt: message.createdAt,
     });
     await this.auditControlAction(input.sender, "Sent room message from control plane", {
       roomId: input.roomId,
       messageId: message.id,
       routing: message.routing,
+      signedRemoteIntent: remoteIntentMetadata?.remoteIntentSignatureStatus === "valid",
     }, { roomId: input.roomId });
     return message;
+  }
+
+  private async resolveRoomMessageIntentMetadata(input: {
+    roomId: string;
+    sender: ActorRef;
+    kind: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["kind"];
+    body: string;
+    routing?: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["routing"];
+    messageEnvelope?: RoomMessageIntentEnvelope;
+  }): Promise<Record<string, unknown> | undefined> {
+    if (!input.messageEnvelope) {
+      if (input.sender.type === "agent" && input.sender.id !== this.platform.localAgent.id) {
+        throw new Error("Signed room message intent envelope is required for remote agent room messages.");
+      }
+      return undefined;
+    }
+    await this.verifyAndRecordRoomMessageIntentEnvelope(input.messageEnvelope, input);
+    return {
+      remoteIntentSignatureStatus: "valid",
+      remoteIntentNonce: input.messageEnvelope.nonce,
+      remoteIntentSentAt: input.messageEnvelope.sentAt,
+    };
+  }
+
+  private async verifyAndRecordRoomMessageIntentEnvelope(
+    envelope: RoomMessageIntentEnvelope,
+    expected: {
+      roomId: string;
+      sender: ActorRef;
+      kind: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["kind"];
+      body: string;
+      routing?: Parameters<LocalPlatform["rooms"]["sendMessage"]>[0]["routing"];
+    },
+  ): Promise<void> {
+    if (envelope.version !== 1) {
+      throw new Error(`Unsupported room message intent envelope version: ${envelope.version}`);
+    }
+    if (expected.sender.type !== "agent" || envelope.agentId !== expected.sender.id) {
+      throw new Error("Room message intent envelope must be signed by the sending agent.");
+    }
+    if (envelope.sentBy.type !== "agent" || envelope.sentBy.id !== envelope.agentId) {
+      throw new Error("Room message intent envelope must be sent by the signing agent.");
+    }
+    if (envelope.roomId !== expected.roomId || envelope.kind !== expected.kind || envelope.body !== expected.body) {
+      throw new Error("Room message intent envelope does not match the room message request.");
+    }
+    if (JSON.stringify(envelope.routing ?? null) !== JSON.stringify(expected.routing ?? null)) {
+      throw new Error("Room message intent envelope routing does not match the room message request.");
+    }
+    await this.requireAgentTrustForSignedOperation(envelope.agentId, "room message intent");
+    const status = await this.platform.identity.verifyRoomMessageIntentEnvelope(envelope);
+    if (status !== "valid") {
+      throw new Error(`Invalid room message intent envelope signature: ${status}`);
+    }
+    await this.recordRoomMessageIntentNonce(envelope);
+  }
+
+  private async recordRoomMessageIntentNonce(envelope: RoomMessageIntentEnvelope): Promise<void> {
+    const recorded = await this.platform.store.recordRoomMessageIntentNonce({
+      agentId: envelope.agentId,
+      nonce: envelope.nonce,
+      roomId: envelope.roomId,
+      envelopeHash: roomMessageIntentEnvelopeHash(envelope),
+      firstSeenAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    if (!recorded) {
+      throw new Error(`Room message intent nonce replay detected: ${envelope.nonce}`);
+    }
+  }
+
+  private async requireAgentTrustForSignedOperation(agentId: string, operation: string): Promise<void> {
+    const agent = await this.platform.store.getAgent(agentId);
+    if (!agent) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
+    if (agent.trustStatus === "revoked" || agent.trustStatus === "suspended" || agent.trustStatus === "expired") {
+      throw new Error(`Agent trust status ${agent.trustStatus} does not allow signed ${operation}.`);
+    }
   }
 
   async approveRoomMember(input: { roomId: string; actorId: string; approver: ActorRef }) {
@@ -1078,6 +1530,53 @@ export class ControlPlaneService {
       { roomId: input.roomId },
     );
     return member;
+  }
+
+  async inviteRoomAgent(input: { roomId: string; agentId: string; invitedBy: ActorRef; role?: RoomRole; aliases?: string[] }) {
+    const member = await this.platform.rooms.inviteAgent({
+      roomId: input.roomId,
+      agentId: input.agentId,
+      invitedBy: input.invitedBy,
+      role: input.role,
+      aliases: input.aliases ?? [],
+    });
+    await this.auditControlAction(
+      input.invitedBy,
+      "Invited remote agent to room from control plane",
+      {
+        roomId: input.roomId,
+        agentId: input.agentId,
+        role: member.role,
+        status: member.status,
+        aliases: member.aliases ?? [],
+      },
+      { roomId: input.roomId, agentId: input.agentId },
+    );
+    return { member };
+  }
+
+  async acceptRoomAgentInvitation(input: { roomId: string; agentId: string; actor: ActorRef; aliases?: string[] }) {
+    if (input.actor.type !== "agent" || input.actor.id !== input.agentId) {
+      throw new Error("Room agent invitation must be accepted by the invited agent.");
+    }
+    const member = await this.platform.rooms.acceptAgentInvitation({
+      roomId: input.roomId,
+      actor: input.actor,
+      aliases: input.aliases,
+    });
+    await this.auditControlAction(
+      input.actor,
+      "Accepted remote room invitation from control plane",
+      {
+        roomId: input.roomId,
+        agentId: input.agentId,
+        role: member.role,
+        status: member.status,
+        aliases: member.aliases ?? [],
+      },
+      { roomId: input.roomId, agentId: input.agentId },
+    );
+    return { member };
   }
 
   async joinRoomWithInvite(input: { roomId: string; token: string; actor: ActorRef; aliases?: string[] }) {
@@ -1096,6 +1595,71 @@ export class ControlPlaneService {
       { roomId: input.roomId },
     );
     return member;
+  }
+
+  async createRemoteRoomInviteBundle(input: {
+    roomId: string;
+    controlUrl: string;
+    controlToken: string;
+    actor: ActorRef;
+    role?: RoomRole;
+    aliases?: string[];
+    displayName?: string;
+    ttlHours?: number;
+    maxUses?: number;
+  }) {
+    const created = await this.platform.rooms.createInvite({
+      roomId: input.roomId,
+      createdBy: input.actor,
+      role: input.role ?? "participant",
+      ttlHours: input.ttlHours,
+      maxUses: input.maxUses,
+    });
+    const signatureStatus = await this.platform.rooms.verifyInvite(created.invite);
+    const bundle = buildRemoteRoomInviteBundle({
+      controlUrl: input.controlUrl,
+      controlToken: input.controlToken,
+      roomId: input.roomId,
+      inviteToken: created.token,
+      inviteId: created.invite.id,
+      inviteSignatureStatus: signatureStatus,
+      role: created.invite.role,
+      aliases: input.aliases ?? [],
+      displayName: input.displayName,
+      expiresAt: created.invite.expiresAt,
+      maxUses: created.invite.maxUses,
+    });
+    await this.auditControlAction(
+      input.actor,
+      "Created remote room invite bundle from control plane",
+      {
+        roomId: input.roomId,
+        inviteId: created.invite.id,
+        role: created.invite.role,
+        aliases: bundle.aliases,
+        displayName: bundle.displayName,
+        maxUses: created.invite.maxUses,
+        expiresAt: created.invite.expiresAt,
+        inviteSignatureStatus: signatureStatus,
+        sensitivity: "bundle_response_only_tokens_omitted",
+      },
+      { roomId: input.roomId },
+    );
+    return {
+      bundle,
+      invite: {
+        id: created.invite.id,
+        roomId: created.invite.roomId,
+        role: created.invite.role,
+        status: created.invite.status,
+        maxUses: created.invite.maxUses,
+        uses: created.invite.uses,
+        expiresAt: created.invite.expiresAt,
+        signatureStatus,
+      },
+      fileName: "room-invite.json",
+      warning: "This invite bundle contains the control token and invite token. Do not commit it or paste it into evidence logs.",
+    };
   }
 
   async updateRoomMemberAliases(input: { roomId: string; actorId: string; aliases: string[]; updatedBy: ActorRef }) {
@@ -1196,9 +1760,9 @@ export class ControlPlaneService {
     actor: ActorRef,
     summary: string,
     metadata: Record<string, unknown>,
-    scope: { roomId?: string; sessionId?: string; projectId?: string } = {},
+    scope: { roomId?: string; sessionId?: string; projectId?: string; workerId?: string; agentId?: string } = {},
   ): Promise<void> {
-    await this.platform.store.recordAuditEvent({
+    const auditEvent: AuditEvent = {
       id: makeId<"ArtifactId">("audit"),
       type: "control_plane.action",
       actor,
@@ -1209,7 +1773,34 @@ export class ControlPlaneService {
       metadata,
       artifactRefs: [],
       createdAt: new Date().toISOString(),
+    };
+    await this.platform.store.recordAuditEvent(auditEvent);
+    this.publishControlPlaneEvent({
+      id: auditEvent.id,
+      type: auditEvent.type,
+      actor,
+      scope: {
+        roomId: scope.roomId,
+        sessionId: scope.sessionId,
+        projectId: scope.projectId,
+        workerId: scope.workerId,
+        agentId: scope.agentId,
+      },
+      payload: {
+        summary,
+        metadata,
+      },
+      auditEvent,
+      createdAt: auditEvent.createdAt,
     });
+  }
+
+  private publishControlPlaneEvent(event: PlatformEvent): void {
+    try {
+      this.platform.eventBus?.publish(event);
+    } catch {
+      // Realtime subscribers are observational; persistent audit remains authoritative.
+    }
   }
 }
 
@@ -1221,11 +1812,63 @@ function messagesAfterCursor<T extends { id: string }>(messages: T[], cursorMess
   return index >= 0 ? messages.slice(index + 1) : messages;
 }
 
+function buildRemoteRoomInviteBundle(input: {
+  controlUrl: string;
+  controlToken: string;
+  roomId: string;
+  inviteToken: string;
+  inviteId?: string;
+  inviteSignatureStatus: string;
+  role: RoomRole;
+  aliases: string[];
+  displayName?: string;
+  expiresAt?: string;
+  maxUses?: number;
+}): RemoteRoomInviteBundle {
+  return {
+    kind: "soloclaw.room_invite",
+    version: 1,
+    controlUrl: input.controlUrl,
+    controlToken: input.controlToken,
+    roomId: input.roomId,
+    inviteToken: input.inviteToken,
+    inviteId: input.inviteId,
+    inviteSignatureStatus: input.inviteSignatureStatus,
+    role: input.role,
+    aliases: input.aliases,
+    displayName: input.displayName,
+    expiresAt: input.expiresAt,
+    maxUses: input.maxUses,
+    sensitivity: "contains_control_token_and_invite_token_do_not_commit",
+    defaultRun: {
+      cycles: 20,
+      limit: 5,
+      idleLimit: 1,
+      intervalMs: 1000,
+      loopIntervalMs: 1000,
+      stopWhenIdle: true,
+      idleCycles: 2,
+      backoffMs: 1000,
+      maxBackoffMs: 30000,
+      maxErrors: 3,
+      heartbeatTtlSeconds: 60,
+    },
+    commands: {
+      enroll: "agent room join --invite-bundle room-invite.json --json",
+      run: "agent room join --invite-bundle room-invite.json --run --status-file .agent/tmp/remote-room-status.json --stop-file .agent/tmp/remote-room.stop --reply-template \"@owner handled {messageId}\" --json",
+    },
+  };
+}
+
 function roomDeliveryAckEnvelopeHash(envelope: RoomDeliveryAckEnvelope): string {
   return createHash("sha256").update(JSON.stringify(envelope)).digest("hex");
 }
 
 function agentHeartbeatEnvelopeHash(envelope: AgentHeartbeatEnvelope): string {
+  return createHash("sha256").update(JSON.stringify(envelope)).digest("hex");
+}
+
+function roomMessageIntentEnvelopeHash(envelope: RoomMessageIntentEnvelope): string {
   return createHash("sha256").update(JSON.stringify(envelope)).digest("hex");
 }
 

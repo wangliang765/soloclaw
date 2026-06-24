@@ -3,7 +3,7 @@ import type { ModelProviderName } from "./model-client.js";
 export type ModelProviderProfile = {
   name: ModelProviderName;
   displayName?: string;
-  protocol: "openai_chat" | "anthropic_messages" | "mock";
+  protocol: "openai_chat" | "openai_responses" | "anthropic_messages" | "mock";
   defaultBaseUrl?: string;
   defaultModel: string;
   apiKeyEnvNames: string[];

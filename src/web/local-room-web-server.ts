@@ -12,8 +12,8 @@ import {
   readJson,
   requiredString,
 } from "../control-plane/control-plane-service.js";
-import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, PolicyAction, RoomDeliveryAckEnvelope, RoomMemberStatus, RoomRole, Session } from "../domain/index.js";
-import type { LocalEventBus } from "../events/local-event-bus.js";
+import type { AgentHeartbeatEnvelope, AgentHeartbeatStatus, AgentTrustStatus, PolicyAction, RoomDeliveryAckEnvelope, RoomMessageIntentEnvelope, RoomMemberStatus, RoomRole, Session } from "../domain/index.js";
+import type { LocalEvent, LocalEventBus } from "../events/local-event-bus.js";
 import type { OperatorItemKind, OperatorSeverity, OperatorStatus } from "../operator/operator-view-models.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
 import { COMMAND_EXECUTION_PROFILE_NAMES, type CommandExecutionProfileName } from "../workspace/workspace-runtime.js";
@@ -57,6 +57,9 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
       if (request.method === "GET" && url.pathname === "/api/events") {
         sendEventStream(response, eventBus, eventUnsubscribers, {
           sessionId: url.searchParams.get("session") ?? undefined,
+          roomId: url.searchParams.get("room") ?? undefined,
+          agentId: url.searchParams.get("agent") ?? undefined,
+          type: url.searchParams.get("type") ?? undefined,
         });
         return;
       }
@@ -144,6 +147,16 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
         sendJson(response, { health: await control.getAgentHealth({ now: optionalUrlString(url, "now"), limit: optionalUrlInteger(url, "limit") }) });
         return;
       }
+      if (request.method === "POST" && url.pathname === "/api/agents/recover-stale") {
+        const body = await readJson(request);
+        const recovery = await control.recoverStaleAgents({
+          actor: actorFromBody(body),
+          now: optionalBodyString(body.now),
+          limit: optionalBodyInteger(body.limit),
+        });
+        sendJson(response, { recovery });
+        return;
+      }
       const agentMatch = url.pathname.match(/^\/api\/agents\/([^/]+)$/);
       if (request.method === "GET" && agentMatch) {
         const agentId = decodeURIComponent(agentMatch[1]);
@@ -153,6 +166,44 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
           return;
         }
         sendJson(response, { agent });
+        return;
+      }
+      const agentRoomInvitationsMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/room-invitations$/);
+      if (request.method === "GET" && agentRoomInvitationsMatch) {
+        const agentId = decodeURIComponent(agentRoomInvitationsMatch[1]);
+        const invitations = await control.listRoomInvitationsForAgent(agentId);
+        if (!invitations) {
+          sendJson(response, { error: `Agent not found: ${agentId}` }, 404);
+          return;
+        }
+        sendJson(response, invitations);
+        return;
+      }
+      const agentTrustMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/trust$/);
+      if (request.method === "POST" && agentTrustMatch) {
+        const body = await readJson(request);
+        const agentId = decodeURIComponent(agentTrustMatch[1]);
+        const result = await control.updateAgentTrustStatus({
+          actor: actorFromBody(body),
+          agentId,
+          trustStatus: requiredAgentTrustStatus(body.trustStatus),
+          reason: optionalBodyString(body.reason),
+        });
+        sendJson(response, result);
+        return;
+      }
+      const agentRotateKeyMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/rotate-key$/);
+      if (request.method === "POST" && agentRotateKeyMatch) {
+        const body = await readJson(request);
+        const agentId = decodeURIComponent(agentRotateKeyMatch[1]);
+        const result = await control.rotateAgentIdentityKey({
+          actor: actorFromBody(body),
+          agentId,
+          publicKeyPem: requiredString(body.publicKeyPem, "publicKeyPem"),
+          fingerprint: optionalBodyString(body.fingerprint),
+          reason: optionalBodyString(body.reason),
+        });
+        sendJson(response, result);
         return;
       }
       if (request.method === "POST" && url.pathname === "/api/agents/register") {
@@ -423,6 +474,17 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
         return;
       }
 
+      const roomDeliveryStatusMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/delivery-status$/);
+      if (request.method === "GET" && roomDeliveryStatusMatch) {
+        const status = await control.getRoomDeliveryStatus(decodeURIComponent(roomDeliveryStatusMatch[1]));
+        if (!status) {
+          sendJson(response, { error: `Room not found: ${decodeURIComponent(roomDeliveryStatusMatch[1])}` }, 404);
+          return;
+        }
+        sendJson(response, status);
+        return;
+      }
+
       const roomInboxMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/agent-inbox$/);
       if (request.method === "GET" && roomInboxMatch) {
         const agentId = optionalUrlString(url, "agentId") ?? platform.localAgent.id;
@@ -469,6 +531,26 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
           aliases: optionalBodyStringArray(body.aliases),
         });
         sendJson(response, { member });
+        return;
+      }
+
+      const roomInviteBundleMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/invite-bundle$/);
+      if (request.method === "POST" && roomInviteBundleMatch) {
+        const body = await readJson(request);
+        const alias = optionalBodyString(body.alias);
+        const aliases = optionalBodyStringArray(body.aliases) ?? (alias ? [alias] : []);
+        const result = await control.createRemoteRoomInviteBundle({
+          roomId: decodeURIComponent(roomInviteBundleMatch[1]),
+          controlUrl: requiredString(body.controlUrl, "controlUrl"),
+          controlToken: token,
+          actor: actorFromBody(body),
+          role: body.role === undefined ? undefined : requiredRoomRole(body.role),
+          aliases,
+          displayName: optionalBodyString(body.displayName),
+          ttlHours: optionalBodyInteger(body.ttlHours),
+          maxUses: optionalBodyInteger(body.maxUses),
+        });
+        sendJson(response, result);
         return;
       }
 
@@ -643,6 +725,7 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
           sender,
           kind: typeof body.kind === "string" ? (body.kind as Parameters<typeof control.sendRoomMessage>[0]["kind"]) : "chat",
           body: requiredString(body.body, "body"),
+          messageEnvelope: optionalRoomMessageIntentEnvelope(body.messageEnvelope),
         });
         sendJson(response, { message });
         return;
@@ -658,6 +741,37 @@ export async function startLocalRoomWebServer(cwd: string, options: LocalRoomWeb
           approver,
         });
         sendJson(response, { member });
+        return;
+      }
+
+      const memberInviteMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/members\/([^/]+)\/invite$/);
+      if (request.method === "POST" && memberInviteMatch) {
+        const body = await readJson(request);
+        const alias = optionalBodyString(body.alias);
+        const aliases = optionalBodyStringArray(body.aliases) ?? (alias ? [alias] : undefined);
+        const result = await control.inviteRoomAgent({
+          roomId: decodeURIComponent(memberInviteMatch[1]),
+          agentId: decodeURIComponent(memberInviteMatch[2]),
+          invitedBy: actorFromBody(body),
+          role: body.role === undefined ? undefined : requiredRoomRole(body.role),
+          aliases,
+        });
+        sendJson(response, result);
+        return;
+      }
+
+      const memberAcceptInvitationMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)\/members\/([^/]+)\/accept-invitation$/);
+      if (request.method === "POST" && memberAcceptInvitationMatch) {
+        const body = await readJson(request);
+        const alias = optionalBodyString(body.alias);
+        const aliases = optionalBodyStringArray(body.aliases) ?? (alias ? [alias] : undefined);
+        const result = await control.acceptRoomAgentInvitation({
+          roomId: decodeURIComponent(memberAcceptInvitationMatch[1]),
+          agentId: decodeURIComponent(memberAcceptInvitationMatch[2]),
+          actor: actorFromBody(body),
+          aliases,
+        });
+        sendJson(response, result);
         return;
       }
 
@@ -801,7 +915,7 @@ function sendEventStream(
   response: ServerResponse,
   eventBus: LocalEventBus | undefined,
   unsubscribers: Set<() => void>,
-  filters: { sessionId?: string } = {},
+  filters: { sessionId?: string; roomId?: string; agentId?: string; type?: string } = {},
 ): void {
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -813,7 +927,16 @@ function sendEventStream(
     return;
   }
   const unsubscribe = eventBus.subscribe((event) => {
-    if (filters.sessionId && event.sessionId !== filters.sessionId) {
+    if (filters.sessionId && localEventSessionId(event) !== filters.sessionId) {
+      return;
+    }
+    if (filters.roomId && localEventRoomId(event) !== filters.roomId) {
+      return;
+    }
+    if (filters.agentId && localEventAgentId(event) !== filters.agentId) {
+      return;
+    }
+    if (filters.type && event.type !== filters.type) {
       return;
     }
     response.write("event: message\n");
@@ -826,9 +949,36 @@ function sendEventStream(
   });
 }
 
+function localEventSessionId(event: LocalEvent): string | undefined {
+  if ("sessionId" in event && typeof event.sessionId === "string") {
+    return event.sessionId;
+  }
+  if ("scope" in event && event.scope && typeof event.scope.sessionId === "string") {
+    return event.scope.sessionId;
+  }
+  return undefined;
+}
+
+function localEventRoomId(event: LocalEvent): string | undefined {
+  if ("scope" in event && event.scope && typeof event.scope.roomId === "string") {
+    return event.scope.roomId;
+  }
+  return undefined;
+}
+
+function localEventAgentId(event: LocalEvent): string | undefined {
+  if ("scope" in event && event.scope && typeof event.scope.agentId === "string") {
+    return event.scope.agentId;
+  }
+  return undefined;
+}
+
 function httpErrorStatus(error: unknown): number {
   const message = error instanceof Error ? error.message : String(error);
   if (/Actor lacks room capability|lacks capability|Policy denied/i.test(message)) {
+    return 403;
+  }
+  if (/Agent trust status .* does not allow signed/i.test(message)) {
     return 403;
   }
   if (/not found|No pending member found/i.test(message)) {
@@ -838,7 +988,7 @@ function httpErrorStatus(error: unknown): number {
     return 409;
   }
   if (
-    /Missing required|Invalid room|Invalid agent identity|Invalid worker status|Invalid exhausted target status|Invalid kind|Invalid status|Invalid severity|Invalid targetMode|Expected non-negative|must be a number|must be an integer between|alias already exists|alias conflicts|alias is reserved|exceeding maxRoutedAgentTargets|Wide room mentions are disabled|Signed .* envelope is required/i.test(
+    /Missing required|Invalid room|Invalid agent identity|Invalid agent trust status|Invalid worker status|Invalid exhausted target status|Invalid kind|Invalid status|Invalid severity|Invalid targetMode|Expected non-negative|must be a number|must be an integer between|alias already exists|alias conflicts|alias is reserved|exceeding maxRoutedAgentTargets|Wide room mentions are disabled|Signed .* envelope is required/i.test(
       message,
     )
   ) {
@@ -1087,6 +1237,14 @@ function optionalRoomDeliveryAckEnvelope(value: unknown): RoomDeliveryAckEnvelop
   return record as RoomDeliveryAckEnvelope;
 }
 
+function optionalRoomMessageIntentEnvelope(value: unknown): RoomMessageIntentEnvelope | undefined {
+  const record = optionalBodyRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  return record as RoomMessageIntentEnvelope;
+}
+
 function optionalAgentHeartbeatEnvelope(value: unknown): AgentHeartbeatEnvelope | undefined {
   const record = optionalBodyRecord(value);
   if (!record) {
@@ -1100,6 +1258,13 @@ function requiredAgentHeartbeatStatus(value: unknown): AgentHeartbeatStatus {
     return value;
   }
   throw new Error(`Invalid agent heartbeat status: ${String(value)}`);
+}
+
+function requiredAgentTrustStatus(value: unknown): AgentTrustStatus {
+  if (value === "pending" || value === "trusted" || value === "suspended" || value === "revoked" || value === "expired") {
+    return value;
+  }
+  throw new Error(`Invalid agent trust status: ${String(value)}`);
 }
 
 function optionalWorkerStatus(value: unknown): "online" | "offline" | "draining" | "suspended" | undefined {
@@ -1184,6 +1349,19 @@ export function renderAppHtml(): string {
     .invites { display: grid; gap: 8px; margin: 0 0 14px; }
     .invite-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px; }
     .invite-title { font-weight: 700; overflow-wrap: anywhere; }
+    .invite-bundle { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 10px; margin: 0 0 14px; display: grid; gap: 8px; }
+    .invite-bundle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+    .invite-bundle-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .invite-bundle textarea { min-height: 150px; font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    .room-subhead { margin: 14px 0 8px; color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .delivery-status { display: grid; gap: 8px; margin: 0 0 14px; }
+    .delivery-row { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(260px, 1.25fr); gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 8px; }
+    .delivery-row.pending { border-color: #e8c873; background: #fffdf4; }
+    .delivery-row.clear { border-color: #b7dfc6; }
+    .delivery-main { display: grid; gap: 3px; min-width: 0; }
+    .delivery-title { font-weight: 700; overflow-wrap: anywhere; }
+    .delivery-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .delivery-stats { display: grid; gap: 3px; min-width: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .transcript { display: grid; gap: 8px; }
     .message { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
     .message-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
@@ -1202,6 +1380,7 @@ export function renderAppHtml(): string {
     .agent-event-row { border-left: 3px solid var(--line); background: #fff; padding: 7px 8px; display: grid; gap: 3px; min-width: 0; }
     .agent-event-row.tool, .agent-event-row.file { border-left-color: var(--accent); }
     .agent-event-row.error { border-left-color: var(--danger); }
+    .agent-event-row.control { border-left-color: var(--good); }
     .agent-event-row.reasoning, .agent-event-row.status { border-left-color: #9fb3bf; }
     .agent-event-title { font-weight: 700; overflow-wrap: anywhere; }
     .agent-event-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
@@ -1266,6 +1445,7 @@ export function renderAppHtml(): string {
       .composer { grid-template-columns: 1fr; }
       .member-row { grid-template-columns: 1fr; }
       .invite-row { grid-template-columns: 1fr; }
+      .invite-bundle-grid { grid-template-columns: 1fr; }
       .operator-detail-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -1295,6 +1475,31 @@ export function renderAppHtml(): string {
       </div>
       <div class="members" id="members"></div>
       <div class="invites" id="invites"></div>
+      <div class="room-subhead">Invite Remote Agent</div>
+      <div class="invite-bundle" id="invite-bundle-panel">
+        <div class="invite-bundle-grid">
+          <input id="invite-control-url" placeholder="Control URL" aria-label="Invite control URL">
+          <input id="invite-agent-alias" placeholder="Alias" aria-label="Invite alias">
+          <input id="invite-display-name" placeholder="Display name" aria-label="Invite display name">
+          <select id="invite-role" aria-label="Invite role">
+            <option value="participant">participant</option>
+            <option value="executor">executor</option>
+            <option value="reviewer">reviewer</option>
+            <option value="approver">approver</option>
+            <option value="observer">observer</option>
+          </select>
+          <input id="invite-ttl-hours" type="number" min="1" value="12" aria-label="Invite TTL hours">
+          <input id="invite-max-uses" type="number" min="1" value="1" aria-label="Invite max uses">
+        </div>
+        <div class="invite-bundle-actions">
+          <button id="invite-bundle-generate" type="button" class="primary">Generate Bundle</button>
+          <button id="invite-bundle-copy" type="button">Copy</button>
+          <span class="meta" id="invite-bundle-status"></span>
+        </div>
+        <textarea id="invite-bundle-output" readonly aria-label="Invite bundle output"></textarea>
+      </div>
+      <div class="room-subhead">Delivery Status</div>
+      <div class="delivery-status" id="delivery-status"></div>
       <div class="transcript" id="messages"></div>
       <form class="composer" id="composer">
         <select id="message-kind">
@@ -1347,7 +1552,7 @@ export function renderAppHtml(): string {
       </section>
       <section class="section">
         <div class="section-heading">
-          <h2>Agent Event Stream</h2>
+          <h2>Room Events</h2>
           <span class="meta" id="agent-event-stream-status">connecting</span>
         </div>
         <div class="agent-event-stream" id="agent-event-stream"></div>
@@ -1402,6 +1607,9 @@ export function renderAppHtml(): string {
     let selectedSessionInspectionKind = null;
     let sessionDashboard = null;
     const agentEventRows = [];
+    let agentEventStream = null;
+    let agentEventStreamRoomId = null;
+    let pendingStateRefresh = null;
     const controlToken = new URLSearchParams(window.location.search).get('token') || '';
 
     function apiFetch(path, options = {}) {
@@ -1412,8 +1620,15 @@ export function renderAppHtml(): string {
     async function loadState() {
       const response = await apiFetch('/api/state');
       state = await response.json();
-      selectedRoomId = selectedRoomId || state.rooms[0]?.room.id || null;
+      const previousRoomId = selectedRoomId;
+      if (!state.rooms.some((item) => item.room.id === selectedRoomId)) {
+        selectedRoomId = state.rooms[0]?.room.id || null;
+      }
+      if (previousRoomId !== selectedRoomId) {
+        agentEventRows.length = 0;
+      }
       render();
+      connectAgentEventStream();
     }
 
     function render() {
@@ -1447,11 +1662,22 @@ export function renderAppHtml(): string {
         const button = document.createElement('button');
         button.className = 'room-item' + (item.room.id === selectedRoomId ? ' active' : '');
         button.type = 'button';
-        button.onclick = () => { selectedRoomId = item.room.id; render(); };
+        button.onclick = () => selectRoom(item.room.id);
         button.append(text('strong', item.room.name));
         button.append(text('span', item.room.id + ' | ' + item.members.length + ' members', 'meta'));
         root.append(button);
       }
+    }
+
+    function selectRoom(roomId) {
+      if (selectedRoomId === roomId) {
+        return;
+      }
+      selectedRoomId = roomId;
+      agentEventRows.length = 0;
+      clearInviteBundleOutput();
+      render();
+      connectAgentEventStream();
     }
 
     function renderRoom() {
@@ -1462,9 +1688,14 @@ export function renderAppHtml(): string {
         document.getElementById('room-meta').textContent = '';
         document.getElementById('members').textContent = '';
         document.getElementById('invites').textContent = '';
+        document.getElementById('invite-bundle-panel').style.display = 'none';
+        clearInviteBundleOutput();
+        document.getElementById('delivery-status').replaceChildren(empty('No delivery status'));
         document.getElementById('messages').replaceChildren(empty('No transcript'));
         return;
       }
+      document.getElementById('invite-bundle-panel').style.display = 'grid';
+      ensureInviteBundleDefaults();
       document.getElementById('room-title').textContent = selected.room.name;
       document.getElementById('room-meta').textContent = selected.room.id + ' | ' + selected.room.policy.joinPolicy + ' | ' + selected.room.createdAt;
       const members = document.getElementById('members');
@@ -1477,6 +1708,7 @@ export function renderAppHtml(): string {
       for (const invite of selected.invites || []) {
         invites.append(inviteRow(selected.room.id, invite));
       }
+      renderDeliveryStatus(selected.deliveryStatus);
       const messages = document.getElementById('messages');
       messages.textContent = '';
       if (selected.messages.length === 0) {
@@ -1496,6 +1728,32 @@ export function renderAppHtml(): string {
           box.append(text('div', diagnostic.message || diagnostic.code || 'Routing warning', 'routing-warning'));
         }
         messages.append(box);
+      }
+    }
+
+    function renderDeliveryStatus(status) {
+      const root = document.getElementById('delivery-status');
+      root.textContent = '';
+      const agents = status?.agents || [];
+      if (agents.length === 0) {
+        root.append(empty('No routed agents'));
+        return;
+      }
+      for (const agent of agents) {
+        const pending = Number(agent.pendingRoutedCount || 0);
+        const row = document.createElement('div');
+        row.className = 'delivery-row ' + (pending > 0 ? 'pending' : 'clear');
+        const main = document.createElement('div');
+        main.className = 'delivery-main';
+        main.append(text('div', (agent.displayName || agent.agentId || 'agent') + ' | ' + (agent.agentId || '-'), 'delivery-title'));
+        main.append(text('div', (agent.role || '-') + ' | ' + (agent.memberStatus || '-') + ' | ackSigned=' + Boolean(agent.lastAckSigned), 'delivery-meta'));
+        const stats = document.createElement('div');
+        stats.className = 'delivery-stats';
+        stats.append(text('div', 'routed=' + Number(agent.routedMessageCount || 0) + ' | pending=' + pending));
+        stats.append(text('div', 'lastRouted=' + (agent.lastRoutedMessageId || '-')));
+        stats.append(text('div', 'lastAck=' + (agent.lastAckMessageId || '-') + (agent.lastAckAt ? ' | at=' + agent.lastAckAt : '')));
+        row.append(main, stats);
+        root.append(row);
       }
     }
 
@@ -1621,6 +1879,63 @@ export function renderAppHtml(): string {
         return;
       }
       await loadState();
+    }
+
+    function ensureInviteBundleDefaults() {
+      const controlUrl = document.getElementById('invite-control-url');
+      if (!controlUrl.value.trim()) {
+        controlUrl.value = window.location.origin;
+      }
+    }
+
+    function clearInviteBundleOutput() {
+      const output = document.getElementById('invite-bundle-output');
+      const status = document.getElementById('invite-bundle-status');
+      if (output) output.value = '';
+      if (status) status.textContent = '';
+    }
+
+    async function generateInviteBundle() {
+      if (!selectedRoomId) return;
+      ensureInviteBundleDefaults();
+      const alias = document.getElementById('invite-agent-alias').value.trim();
+      const displayName = document.getElementById('invite-display-name').value.trim();
+      const ttlHours = Number(document.getElementById('invite-ttl-hours').value || 12);
+      const maxUses = Number(document.getElementById('invite-max-uses').value || 1);
+      const response = await apiFetch('/api/rooms/' + encodeURIComponent(selectedRoomId) + '/invite-bundle', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          actor: controlActor(),
+          controlUrl: document.getElementById('invite-control-url').value.trim(),
+          alias,
+          displayName,
+          role: document.getElementById('invite-role').value,
+          ttlHours,
+          maxUses,
+        })
+      });
+      if (!response.ok) {
+        alert((await response.json()).error || 'Request failed');
+        return;
+      }
+      const payload = await response.json();
+      document.getElementById('invite-bundle-output').value = JSON.stringify(payload.bundle, null, 2);
+      document.getElementById('invite-bundle-status').textContent = payload.warning || 'Bundle generated';
+      await loadState();
+    }
+
+    async function copyInviteBundle() {
+      const output = document.getElementById('invite-bundle-output');
+      if (!output.value.trim()) return;
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(output.value);
+        document.getElementById('invite-bundle-status').textContent = 'Copied';
+        return;
+      }
+      output.select();
+      document.execCommand('copy');
+      document.getElementById('invite-bundle-status').textContent = 'Copied';
     }
 
     function renderAgentHealth() {
@@ -1753,19 +2068,39 @@ export function renderAppHtml(): string {
     function connectAgentEventStream() {
       const status = document.getElementById('agent-event-stream-status');
       if (!window.EventSource || !controlToken) {
+        if (agentEventStream) {
+          agentEventStream.close();
+          agentEventStream = null;
+          agentEventStreamRoomId = null;
+        }
         status.textContent = 'unavailable';
         renderAgentEventStream();
         return;
       }
-      const stream = new EventSource('/api/events?token=' + encodeURIComponent(controlToken));
-      stream.onopen = () => { status.textContent = 'live'; };
-      stream.onerror = () => { status.textContent = 'reconnecting'; };
+      const roomId = selectedRoomId || '';
+      if (agentEventStream && agentEventStreamRoomId === roomId && agentEventStream.readyState !== EventSource.CLOSED) {
+        return;
+      }
+      if (agentEventStream) {
+        agentEventStream.close();
+      }
+      const params = new URLSearchParams({ token: controlToken });
+      if (roomId) {
+        params.set('room', roomId);
+      }
+      const stream = new EventSource('/api/events?' + params.toString());
+      agentEventStream = stream;
+      agentEventStreamRoomId = roomId;
+      status.textContent = roomId ? 'connecting room' : 'connecting';
+      stream.onopen = () => { status.textContent = roomId ? 'live room' : 'live'; };
+      stream.onerror = () => { status.textContent = roomId ? 'reconnecting room' : 'reconnecting'; };
       stream.onmessage = (message) => {
         try {
           const event = JSON.parse(message.data);
           agentEventRows.unshift(projectAgentEventForWeb(event));
           agentEventRows.splice(12);
           renderAgentEventStream();
+          scheduleStateRefreshForEvent(event);
         } catch {
           status.textContent = 'parse error';
         }
@@ -1794,6 +2129,29 @@ export function renderAppHtml(): string {
       const duration = event.durationMs !== undefined ? event.durationMs + 'ms' : event.elapsedMs !== undefined ? event.elapsedMs + 'ms' : null;
       const safePaths = Array.isArray(event.paths) && event.paths.length > 0 ? 'paths=' + event.paths.join(',') : event.path ? 'path=' + event.path : null;
       switch (event.type) {
+        case 'control_plane.action':
+          return safeAgentEventRow('control', event.payload?.summary || event.auditEvent?.summary || 'Control-plane action', [
+            event.actor ? 'actor=' + event.actor.type + ':' + event.actor.id : null,
+            ...eventScopeMeta(event),
+            event.createdAt,
+          ]);
+        case 'room.message.sent':
+          return safeAgentEventRow('control', 'Room message', [
+            event.payload?.kind ? 'kind=' + event.payload.kind : null,
+            event.payload?.messageId ? 'message=' + event.payload.messageId : null,
+            event.payload?.senderType && event.payload?.senderId ? 'sender=' + event.payload.senderType + ':' + event.payload.senderId : null,
+            event.payload?.bodyLength !== undefined ? 'bodyLength=' + event.payload.bodyLength : null,
+            ...eventScopeMeta(event),
+            event.createdAt,
+          ]);
+        case 'room.delivery.acknowledged':
+          return safeAgentEventRow('control', 'Room delivery ack', [
+            event.payload?.messageId ? 'message=' + event.payload.messageId : null,
+            event.payload?.agentId ? 'agent=' + event.payload.agentId : null,
+            event.payload?.signedAck !== undefined ? 'signed=' + event.payload.signedAck : null,
+            ...eventScopeMeta(event),
+            event.createdAt,
+          ]);
         case 'tool_started':
           return safeAgentEventRow('tool', event.title || event.toolName || 'Tool started', [step, event.toolName, safePaths, 'details hidden', session]);
         case 'tool_finished':
@@ -1808,9 +2166,19 @@ export function renderAppHtml(): string {
           return safeAgentEventRow('reasoning', event.publicSummary || 'Thinking', [step, event.deltaCount !== undefined ? 'parts=' + event.deltaCount : null, duration, session]);
         case 'model_finished':
           return safeAgentEventRow('status', 'Model ' + event.responseType, [step, 'tools=' + event.toolCallCount, duration, session]);
+        case 'goal_updated':
+          return safeAgentEventRow('status', 'Goal ' + event.status, [
+            event.modelCalls !== undefined ? 'modelCalls=' + event.modelCalls : null,
+            event.repeatedBlockers ? 'blockers=' + event.repeatedBlockers : null,
+            session,
+          ]);
         case 'model_failed':
         case 'run_failed':
           return safeAgentEventRow('error', event.type === 'run_failed' ? 'Run failed' : 'Model failed', [step, duration, session]);
+        case 'run_budget_checkpoint':
+          return safeAgentEventRow('status', 'Budget checkpoint', ['steps=' + event.steps, 'modelCalls=' + event.modelCalls, duration, session]);
+        case 'guardrail_tripped':
+          return safeAgentEventRow('error', 'Guardrail: ' + event.guardrail, [event.toolName, event.count !== undefined ? 'count=' + event.count : null, session]);
         case 'step_limit_reached':
           return safeAgentEventRow('error', 'Step budget reached', ['max=' + event.maxSteps, session]);
         case 'session_started':
@@ -1830,6 +2198,37 @@ export function renderAppHtml(): string {
         title: String(title || 'agent.event'),
         meta: values.filter(Boolean).join(' | ') || 'safe event',
       };
+    }
+
+    function eventScopeMeta(event) {
+      const scope = event.scope || {};
+      return [
+        scope.roomId ? 'room=' + scope.roomId : null,
+        scope.agentId ? 'agent=' + scope.agentId : null,
+        scope.workerId ? 'worker=' + scope.workerId : null,
+        scope.sessionId ? 'session=' + scope.sessionId : null,
+      ];
+    }
+
+    function scheduleStateRefreshForEvent(event) {
+      if (event.type !== 'control_plane.action' && event.type !== 'room.message.sent' && event.type !== 'room.delivery.acknowledged') {
+        return;
+      }
+      const roomId = event.scope?.roomId || null;
+      if (selectedRoomId && roomId && roomId !== selectedRoomId) {
+        return;
+      }
+      if (pendingStateRefresh) {
+        return;
+      }
+      pendingStateRefresh = window.setTimeout(async () => {
+        pendingStateRefresh = null;
+        try {
+          await loadState();
+        } catch {
+          document.getElementById('agent-event-stream-status').textContent = 'refresh failed';
+        }
+      }, 300);
     }
 
     function renderOperator() {
@@ -3302,8 +3701,9 @@ export function renderAppHtml(): string {
     document.getElementById('session-dashboard-status').onchange = loadSessionDashboard;
     document.getElementById('session-dashboard-target-mode').onchange = loadSessionDashboard;
     document.getElementById('session-inspection-refresh').onclick = refreshSelectedSessionInspection;
+    document.getElementById('invite-bundle-generate').onclick = generateInviteBundle;
+    document.getElementById('invite-bundle-copy').onclick = copyInviteBundle;
     setInterval(refreshOpenSessionViews, 5000);
-    connectAgentEventStream();
     loadState();
 
     function row(left, right, className) {

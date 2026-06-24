@@ -30,9 +30,14 @@ export type RichTuiLspStatus = {
 };
 
 export type RichTuiFocus = "input" | "transcript" | "sidebar" | "commands";
-export type RichTuiRunHealth = "Ready" | "Working" | "Needs approval" | "Stopped" | "Failed" | "Done";
+export type RichTuiRunHealth = "Ready" | "Working" | "Needs approval" | "Stopped" | "Paused" | "Cancelled" | "Failed" | "Done";
 
 export type RichTuiCommandPaletteState = {
+  open: boolean;
+  cursorIndex: number;
+};
+
+export type RichTuiCommandSuggestionsState = {
   open: boolean;
   cursorIndex: number;
 };
@@ -41,6 +46,24 @@ export type RichTuiPendingPlanApproval = {
   task: string;
   plan: string;
   sessionId?: string;
+  planPath?: string;
+};
+
+export type RichTuiSessionChoice = {
+  id: string;
+  title: string;
+  workspace?: string;
+};
+
+export type RichTuiSessionPickerState = {
+  open: boolean;
+  cursorIndex: number;
+};
+
+export type RichTuiSessionTodo = {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+  priority: "high" | "medium" | "low";
 };
 
 export type RichTuiState = {
@@ -62,10 +85,30 @@ export type RichTuiState = {
   lsp?: RichTuiLspStatus;
   workspaceStatus?: RichTuiWorkspaceStatus;
   objective?: string;
+  goal?: {
+    id: string;
+    status: "active" | "complete" | "blocked" | "cancelled";
+    objective: string;
+    summary: string;
+    checkpoints: number;
+    repeatedBlockers: number;
+    modelCalls: number;
+    tokenUsed: number;
+  };
+  todos?: RichTuiSessionTodo[];
+  runBudget?: {
+    steps: number;
+    modelCalls: number;
+    elapsedMs: number;
+    maxSteps?: number;
+    maxModelCalls?: number;
+    maxDurationMs?: number;
+  };
   runHealth?: RichTuiRunHealth;
   version?: string;
   focus?: RichTuiFocus;
   commandPalette?: RichTuiCommandPaletteState;
+  commandSuggestions?: RichTuiCommandSuggestionsState;
   streamingAssistantMessageIndex?: number;
   lastAssistantMessageText?: string;
   lastRunDurationMs?: number;
@@ -73,6 +116,8 @@ export type RichTuiState = {
   stepCount?: number;
   lastEventTitle?: string;
   activeSessionId?: string;
+  sessionChoices?: RichTuiSessionChoice[];
+  sessionPicker?: RichTuiSessionPickerState;
   statusLine?: string;
   pendingPlanApproval?: RichTuiPendingPlanApproval;
   modelSetup?: RichModelSetupState;
