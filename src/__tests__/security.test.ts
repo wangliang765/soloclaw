@@ -2806,6 +2806,50 @@ test("soloclaw CLI model setup menu supports custom Anthropic-compatible base UR
   assert.equal(configText.includes(pastedSecret), false);
 });
 
+test("soloclaw TUI model setup menu supports custom OpenAI Responses API base URL", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-tui-model-setup-openai-responses-"));
+  const previousPassphrase = process.env.AGENT_SECRETS_PASSPHRASE;
+  delete process.env.AGENT_SECRETS_PASSPHRASE;
+  t.after(async () => {
+    if (previousPassphrase === undefined) {
+      delete process.env.AGENT_SECRETS_PASSPHRASE;
+    } else {
+      process.env.AGENT_SECRETS_PASSPHRASE = previousPassphrase;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "README.md"), "# OpenAI Responses Menu Project\n", "utf8");
+
+  const pastedSecret = "sk-responses-menu-secret-should-not-leak";
+  const cli = path.join(process.cwd(), "dist", "cli", "index.js");
+  const result = await runWithInput(
+    process.execPath,
+    [cli],
+    dir,
+    `/model setup\n14\nhttps://responses.example/v1\n1\n${pastedSecret}\n/config\n/exit\n`,
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(result.stdout, /OpenAI Responses API \(https:\/\/api\.openai\.com\/v1\)/);
+  assert.match(result.stdout, /Base URL \[https:\/\/api\.openai\.com\/v1\]:/);
+  assert.match(result.stdout, /openai\tlocal\topenai_responses\tmodel=gpt-4o-mini\tbaseUrl=https:\/\/responses\.example\/v1\tenv=OPENAI_API_KEY\tsecret=configured\tdefault=openai/);
+  assert.equal(result.stdout.includes(pastedSecret), false);
+  assert.equal(result.stderr.includes(pastedSecret), false);
+
+  const configText = await fs.readFile(path.join(dir, ".agent", "model-providers.json"), "utf8");
+  const config = JSON.parse(configText) as {
+    defaultProvider?: string;
+    profiles?: Record<string, { protocol?: string; defaultBaseUrl?: string; defaultModel?: string; apiKeyEnvNames?: string[]; apiKeySecretRef?: string }>;
+  };
+  assert.equal(config.defaultProvider, "openai");
+  assert.equal(config.profiles?.openai?.protocol, "openai_responses");
+  assert.equal(config.profiles?.openai?.defaultBaseUrl, "https://responses.example/v1");
+  assert.equal(config.profiles?.openai?.defaultModel, "gpt-4o-mini");
+  assert.deepEqual(config.profiles?.openai?.apiKeyEnvNames, ["OPENAI_API_KEY"]);
+  assert.match(config.profiles?.openai?.apiKeySecretRef ?? "", /^sec_[a-z0-9]+$/);
+  assert.equal(configText.includes(pastedSecret), false);
+});
+
 test("soloclaw model check validates local provider readiness without leaking keys", async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-model-check-"));
   const previousKey = process.env.LOCAL_READY_MODEL_API_KEY;
@@ -22189,15 +22233,16 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function removeTreeWithRetry(inputPath: string): Promise<void> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  const retryDelaysMs = [100, 250, 500, 750, 1000, 1500, 2000, 2500, 3000];
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
     try {
-      await fs.rm(inputPath, { recursive: true, force: true });
+      await fs.rm(inputPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
       return;
     } catch (error) {
-      if (attempt === 4 || !isBusyFsError(error)) {
+      if (attempt === retryDelaysMs.length || !isBusyFsError(error)) {
         throw error;
       }
-      await sleep(100 * (attempt + 1));
+      await sleep(retryDelaysMs[attempt]);
     }
   }
 }

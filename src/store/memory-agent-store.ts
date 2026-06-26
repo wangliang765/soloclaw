@@ -13,8 +13,12 @@ import type {
   KnowledgeEvalRun,
   KnowledgeEvalSet,
   KnowledgeSource,
+  MemoryCandidate,
   MemoryRecord,
+  MemorySnapshotRecord,
   MemoryScope,
+  MemorySource,
+  MemoryUsageEvent,
   Organization,
   PendingToolCall,
   PendingToolCallStatus,
@@ -93,6 +97,10 @@ export class MemoryAgentStore implements AgentStore {
   readonly skills = new Map<string, Skill>();
   readonly skillUsage: SkillUsageEvent[] = [];
   readonly memories = new Map<string, MemoryRecord>();
+  readonly memoryCandidates = new Map<string, MemoryCandidate>();
+  readonly memorySources = new Map<string, MemorySource[]>();
+  readonly memoryUsageEvents = new Map<string, MemoryUsageEvent[]>();
+  readonly memorySnapshots = new Map<string, MemorySnapshotRecord>();
   readonly sessionSummaries = new Map<string, SessionSummary[]>();
 
   async createSession(input: CreateSessionInput): Promise<Session> {
@@ -853,6 +861,73 @@ export class MemoryAgentStore implements AgentStore {
     return this.memories.delete(memoryId);
   }
 
+  async createMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    this.memoryCandidates.set(candidate.id, cloneMemoryCandidate(candidate));
+  }
+
+  async updateMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    this.memoryCandidates.set(candidate.id, cloneMemoryCandidate(candidate));
+  }
+
+  async getMemoryCandidate(candidateId: string): Promise<MemoryCandidate | undefined> {
+    const candidate = this.memoryCandidates.get(candidateId);
+    return candidate ? cloneMemoryCandidate(candidate) : undefined;
+  }
+
+  async listMemoryCandidates(input: import("./agent-store.js").ListMemoryCandidatesInput = {}): Promise<MemoryCandidate[]> {
+    return [...this.memoryCandidates.values()]
+      .filter((candidate) => !input.scopeType || candidate.scopeType === input.scopeType)
+      .filter((candidate) => !input.scopeId || candidate.scopeId === input.scopeId)
+      .filter((candidate) => !input.status || candidate.status === input.status)
+      .filter((candidate) => !input.sourceSessionId || candidate.sourceSessionId === input.sourceSessionId)
+      .filter((candidate) => !input.sourceSummaryId || candidate.sourceSummaryId === input.sourceSummaryId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id))
+      .slice(0, input.limit ?? 100)
+      .map(cloneMemoryCandidate);
+  }
+
+  async createMemorySource(source: MemorySource): Promise<void> {
+    const sources = this.memorySources.get(source.memoryId) ?? [];
+    sources.push({ ...source });
+    this.memorySources.set(source.memoryId, sources);
+  }
+
+  async listMemorySources(memoryId: string): Promise<MemorySource[]> {
+    return [...(this.memorySources.get(memoryId) ?? [])]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map((source) => ({ ...source }));
+  }
+
+  async recordMemoryUsage(event: MemoryUsageEvent): Promise<void> {
+    const events = this.memoryUsageEvents.get(event.memoryId) ?? [];
+    events.push({ ...event, actor: { ...event.actor } });
+    this.memoryUsageEvents.set(event.memoryId, events);
+  }
+
+  async listMemoryUsageEvents(memoryId: string): Promise<MemoryUsageEvent[]> {
+    return [...(this.memoryUsageEvents.get(memoryId) ?? [])]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map((event) => ({ ...event, actor: { ...event.actor } }));
+  }
+
+  async touchMemory(memoryId: string, lastUsedAt: string): Promise<boolean> {
+    const memory = this.memories.get(memoryId);
+    if (!memory) {
+      return false;
+    }
+    this.memories.set(memoryId, { ...memory, lastUsedAt, updatedAt: memory.updatedAt });
+    return true;
+  }
+
+  async upsertMemorySnapshot(snapshot: MemorySnapshotRecord): Promise<void> {
+    this.memorySnapshots.set(memorySnapshotKey(snapshot.scopeType, snapshot.scopeId, snapshot.filePath), { ...snapshot });
+  }
+
+  async getMemorySnapshot(scopeType: MemoryScope, scopeId: string, filePath: string): Promise<MemorySnapshotRecord | undefined> {
+    const snapshot = this.memorySnapshots.get(memorySnapshotKey(scopeType, scopeId, filePath));
+    return snapshot ? { ...snapshot } : undefined;
+  }
+
   async addSessionSummary(summary: SessionSummary): Promise<void> {
     const summaries = this.sessionSummaries.get(summary.sessionId) ?? [];
     summaries.push(summary);
@@ -926,4 +1001,17 @@ function roomDeliveryAckNonceKey(agentId: string, nonce: string): string {
 
 function roomMessageIntentNonceKey(agentId: string, nonce: string): string {
   return `${agentId}:${nonce}`;
+}
+
+function cloneMemoryCandidate(candidate: MemoryCandidate): MemoryCandidate {
+  return {
+    ...candidate,
+    safetyFindings: candidate.safetyFindings.map((finding) => ({ ...finding })),
+    createdBy: { ...candidate.createdBy },
+    reviewedBy: candidate.reviewedBy ? { ...candidate.reviewedBy } : undefined,
+  };
+}
+
+function memorySnapshotKey(scopeType: MemoryScope, scopeId: string, filePath: string): string {
+  return `${scopeType}\0${scopeId}\0${filePath}`;
 }

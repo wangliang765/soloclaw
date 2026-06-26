@@ -19,6 +19,7 @@ export type RichModelSetupProfile = Pick<
 export type RichModelSetupPhase = "provider" | "base_url" | "model" | "custom_model" | "api_key";
 
 export type RichModelSetupProviderOption = {
+  id: string;
   provider: ModelProviderName;
   displayName: string;
   protocol: ModelProviderProfile["protocol"];
@@ -88,22 +89,12 @@ const MODEL_SETUP_PROVIDER_ORDER: ModelProviderName[] = [
 
 export function createRichModelSetupState(profiles: RichModelSetupProfile[], currentProvider?: string): RichModelSetupState {
   const byName = new Map(profiles.map((profile) => [profile.name, profile]));
-  const providerOptions = MODEL_SETUP_PROVIDER_ORDER
+  const baseProviderOptions = MODEL_SETUP_PROVIDER_ORDER
     .map((name) => byName.get(name))
     .filter((profile): profile is RichModelSetupProfile => Boolean(profile))
-    .map((profile) => ({
-      provider: profile.name,
-      displayName: profile.displayName ?? profile.name,
-      protocol: profile.protocol,
-      baseUrl: profile.defaultBaseUrl,
-      defaultModel: profile.defaultModel,
-      modelIds: modelChoices(profile),
-      apiKeyEnvNames: profile.apiKeyEnvNames,
-      docsUrl: profile.docsUrl,
-      apiKeysUrl: profile.apiKeysUrl,
-      pricingUrl: profile.pricingUrl,
-    }));
-  const providerCursor = Math.max(0, providerOptions.findIndex((option) => option.provider === currentProvider));
+    .map(modelSetupProviderOption);
+  const providerOptions = appendOpenAIResponsesModelSetupOption(baseProviderOptions);
+  const providerCursor = Math.max(0, providerOptions.findIndex((option) => option.id === currentProvider || option.provider === currentProvider));
   return {
     open: true,
     phase: "provider",
@@ -343,6 +334,38 @@ function providerLabel(option: RichModelSetupProviderOption): string {
   return `${option.displayName} (${option.baseUrl ?? "no base URL"})`;
 }
 
+function modelSetupProviderOption(profile: RichModelSetupProfile): RichModelSetupProviderOption {
+  return {
+    id: profile.name,
+    provider: profile.name,
+    displayName: profile.displayName ?? profile.name,
+    protocol: profile.protocol,
+    baseUrl: profile.defaultBaseUrl,
+    defaultModel: profile.defaultModel,
+    modelIds: modelChoices(profile),
+    apiKeyEnvNames: profile.apiKeyEnvNames,
+    docsUrl: profile.docsUrl,
+    apiKeysUrl: profile.apiKeysUrl,
+    pricingUrl: profile.pricingUrl,
+  };
+}
+
+function appendOpenAIResponsesModelSetupOption(options: RichModelSetupProviderOption[]): RichModelSetupProviderOption[] {
+  const openAIOption = options.find((option) => option.provider === "openai");
+  if (!openAIOption) {
+    return options;
+  }
+  return [
+    ...options,
+    {
+      ...openAIOption,
+      id: "openai_responses",
+      displayName: "OpenAI Responses API",
+      protocol: "openai_responses",
+    },
+  ];
+}
+
 function renderProviderLinks(provider: RichModelSetupProviderOption): string[] {
   return [
     provider.apiKeysUrl ? `API keys: ${provider.apiKeysUrl}` : undefined,
@@ -361,7 +384,7 @@ function selectedProvider(state: RichModelSetupState): RichModelSetupProviderOpt
 }
 
 function requiresCustomBaseUrl(provider: RichModelSetupProviderOption): boolean {
-  return provider.provider === "openai_compatible" || provider.provider === "anthropic_compatible";
+  return provider.protocol === "openai_responses" || provider.provider === "openai_compatible" || provider.provider === "anthropic_compatible";
 }
 
 function modelChoices(profile: RichModelSetupProfile): string[] {

@@ -209,6 +209,10 @@ Stop
   -> block final answer or feed findings back to agent
 ```
 
+## Memory Source Boundary
+
+Persistent memory is remembered evidence, not policy. Approved memories can help the agent recall user preferences, project decisions, workflows, bug patterns, and do-not-do constraints, but they cannot override system policy, project instructions, execution policy, approvals, protected paths, or secret redaction. Automatic extraction creates candidates; candidates require review before durable storage. Retrieved memory must be bounded, cited with memory ids, ACL-filtered for the actor, and audited when injected into model context.
+
 ## Configuration Roadmap
 
 Add layered configuration similar to mature agent tools:

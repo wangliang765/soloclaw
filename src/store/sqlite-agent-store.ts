@@ -16,8 +16,13 @@ import type {
   KnowledgeEvalRun,
   KnowledgeEvalSet,
   KnowledgeSource,
+  MemoryCandidate,
   MemoryRecord,
+  MemoryReviewStatus,
+  MemorySnapshotRecord,
   MemoryScope,
+  MemorySource,
+  MemoryUsageEvent,
   Organization,
   PendingToolCall,
   PendingToolCallStatus,
@@ -58,6 +63,7 @@ import type {
   ListAuditEventsInput,
   ListKnowledgeEvalRunsInput,
   ListKnowledgeEvalSetsInput,
+  ListMemoryCandidatesInput,
   ListSpecificationsInput,
   ListSpecificationClarificationsInput,
   ListSpecificationPlansInput,
@@ -1854,8 +1860,8 @@ export class SqliteAgentStore implements AgentStore {
       .prepare(
         `INSERT OR REPLACE INTO skills (
           id, scope, source_path, name, version, description, permissions_json, tools_json,
-          summary, body, checksum, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          metadata_json, summary, body, checksum, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         skill.id,
@@ -1866,6 +1872,7 @@ export class SqliteAgentStore implements AgentStore {
         skill.manifest.description,
         JSON.stringify(skill.manifest.permissions),
         JSON.stringify(skill.manifest.tools),
+        JSON.stringify(skill.manifest.metadata ?? {}),
         skill.summary,
         skill.body,
         skill.checksum ?? null,
@@ -1927,6 +1934,147 @@ export class SqliteAgentStore implements AgentStore {
   async deleteMemory(memoryId: string): Promise<boolean> {
     const result = this.db.prepare("DELETE FROM memories WHERE id = ?").run(memoryId);
     return result.changes > 0;
+  }
+
+  async createMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    await this.updateMemoryCandidate(candidate);
+  }
+
+  async updateMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_candidates (
+          id, scope_type, scope_id, kind, proposed_content, proposed_summary,
+          source_session_id, source_summary_id, confidence, status, safety_findings_json,
+          approved_memory_id, review_reason, created_by_json, reviewed_by_json,
+          created_at, updated_at, reviewed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        candidate.id,
+        candidate.scopeType,
+        candidate.scopeId,
+        candidate.kind,
+        candidate.proposedContent,
+        candidate.proposedSummary,
+        candidate.sourceSessionId ?? null,
+        candidate.sourceSummaryId ?? null,
+        candidate.confidence,
+        candidate.status,
+        JSON.stringify(candidate.safetyFindings),
+        candidate.approvedMemoryId ?? null,
+        candidate.reviewReason ?? null,
+        JSON.stringify(candidate.createdBy),
+        candidate.reviewedBy ? JSON.stringify(candidate.reviewedBy) : null,
+        candidate.createdAt,
+        candidate.updatedAt,
+        candidate.reviewedAt ?? null,
+      );
+  }
+
+  async getMemoryCandidate(candidateId: string): Promise<MemoryCandidate | undefined> {
+    const row = this.db.prepare("SELECT * FROM memory_candidates WHERE id = ?").get(candidateId) as MemoryCandidateRow | undefined;
+    return row ? memoryCandidateFromRow(row) : undefined;
+  }
+
+  async listMemoryCandidates(input: ListMemoryCandidatesInput = {}): Promise<MemoryCandidate[]> {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.scopeType) {
+      clauses.push("scope_type = ?");
+      params.push(input.scopeType);
+    }
+    if (input.scopeId) {
+      clauses.push("scope_id = ?");
+      params.push(input.scopeId);
+    }
+    if (input.status) {
+      clauses.push("status = ?");
+      params.push(input.status);
+    }
+    if (input.sourceSessionId) {
+      clauses.push("source_session_id = ?");
+      params.push(input.sourceSessionId);
+    }
+    if (input.sourceSummaryId) {
+      clauses.push("source_summary_id = ?");
+      params.push(input.sourceSummaryId);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`SELECT * FROM memory_candidates ${where} ORDER BY updated_at DESC, id ASC LIMIT ?`)
+      .all(...params, input.limit ?? 100) as MemoryCandidateRow[];
+    return rows.map(memoryCandidateFromRow);
+  }
+
+  async createMemorySource(source: MemorySource): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO memory_sources (
+          id, memory_id, source_type, source_id, citation, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(source.id, source.memoryId, source.sourceType, source.sourceId ?? null, source.citation ?? null, source.createdAt);
+  }
+
+  async listMemorySources(memoryId: string): Promise<MemorySource[]> {
+    const rows = this.db.prepare("SELECT * FROM memory_sources WHERE memory_id = ? ORDER BY created_at DESC").all(memoryId) as MemorySourceRow[];
+    return rows.map(memorySourceFromRow);
+  }
+
+  async recordMemoryUsage(event: MemoryUsageEvent): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO memory_usage_events (
+          id, memory_id, actor_json, session_id, reason, query, score, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        event.memoryId,
+        JSON.stringify(event.actor),
+        event.sessionId ?? null,
+        event.reason,
+        event.query ?? null,
+        event.score ?? null,
+        event.createdAt,
+      );
+  }
+
+  async listMemoryUsageEvents(memoryId: string): Promise<MemoryUsageEvent[]> {
+    const rows = this.db.prepare("SELECT * FROM memory_usage_events WHERE memory_id = ? ORDER BY created_at DESC").all(memoryId) as MemoryUsageEventRow[];
+    return rows.map(memoryUsageEventFromRow);
+  }
+
+  async touchMemory(memoryId: string, lastUsedAt: string): Promise<boolean> {
+    const result = this.db.prepare("UPDATE memories SET last_used_at = ? WHERE id = ?").run(lastUsedAt, memoryId);
+    return result.changes > 0;
+  }
+
+  async upsertMemorySnapshot(snapshot: MemorySnapshotRecord): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_snapshots (
+          id, scope_type, scope_id, file_path, content_hash, imported_at, exported_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        snapshot.id,
+        snapshot.scopeType,
+        snapshot.scopeId,
+        snapshot.filePath,
+        snapshot.contentHash,
+        snapshot.importedAt ?? null,
+        snapshot.exportedAt ?? null,
+        snapshot.updatedAt,
+      );
+  }
+
+  async getMemorySnapshot(scopeType: MemoryScope, scopeId: string, filePath: string): Promise<MemorySnapshotRecord | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM memory_snapshots WHERE scope_type = ? AND scope_id = ? AND file_path = ?")
+      .get(scopeType, scopeId, filePath) as MemorySnapshotRow | undefined;
+    return row ? memorySnapshotFromRow(row) : undefined;
   }
 
   async addSessionSummary(summary: SessionSummary): Promise<void> {
@@ -2478,6 +2626,7 @@ export class SqliteAgentStore implements AgentStore {
         description TEXT NOT NULL,
         permissions_json TEXT NOT NULL,
         tools_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
         summary TEXT NOT NULL,
         body TEXT NOT NULL,
         checksum TEXT,
@@ -2571,6 +2720,59 @@ export class SqliteAgentStore implements AgentStore {
         updated_at TEXT NOT NULL,
         expires_at TEXT,
         last_used_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_candidates (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        proposed_content TEXT NOT NULL,
+        proposed_summary TEXT NOT NULL,
+        source_session_id TEXT,
+        source_summary_id TEXT,
+        confidence REAL NOT NULL,
+        status TEXT NOT NULL,
+        safety_findings_json TEXT NOT NULL,
+        approved_memory_id TEXT,
+        review_reason TEXT,
+        created_by_json TEXT NOT NULL,
+        reviewed_by_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        reviewed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_sources (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT,
+        citation TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_usage_events (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        actor_json TEXT NOT NULL,
+        session_id TEXT,
+        reason TEXT NOT NULL,
+        query TEXT,
+        score REAL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_snapshots (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        imported_at TEXT,
+        exported_at TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope_type, scope_id, file_path)
       );
 
       CREATE TABLE IF NOT EXISTS session_todos (
@@ -2669,6 +2871,10 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_eval_set ON knowledge_eval_runs(eval_set_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_scope ON knowledge_eval_runs(scope_type, scope_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_candidates_scope_status ON memory_candidates(scope_type, scope_id, status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_candidates_source_summary ON memory_candidates(source_summary_id, status);
+      CREATE INDEX IF NOT EXISTS idx_memory_sources_memory_id ON memory_sources(memory_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_usage_memory_id ON memory_usage_events(memory_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_session_todos_session ON session_todos(session_id, position);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_session ON session_summaries(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_goals_status_updated ON goals(status, updated_at);
@@ -2689,6 +2895,7 @@ export class SqliteAgentStore implements AgentStore {
     this.addColumnIfMissing("agents", "last_room_id", "TEXT");
     this.addColumnIfMissing("agents", "last_error", "TEXT");
     this.addColumnIfMissing("agents", "heartbeat_metadata_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.addColumnIfMissing("skills", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_agents_heartbeat ON agents(heartbeat_status, last_heartbeat_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_subtasks_spec_task ON subtasks(spec_task_id, created_at)");
   }
@@ -3704,6 +3911,7 @@ type SkillRow = {
   description: string;
   permissions_json: string;
   tools_json: string;
+  metadata_json: string;
   summary: string;
   body: string;
   checksum: string | null;
@@ -3724,6 +3932,58 @@ type MemoryRow = {
   updated_at: string;
   expires_at: string | null;
   last_used_at: string | null;
+};
+
+type MemoryCandidateRow = {
+  id: string;
+  scope_type: MemoryCandidate["scopeType"];
+  scope_id: string;
+  kind: MemoryCandidate["kind"];
+  proposed_content: string;
+  proposed_summary: string;
+  source_session_id: string | null;
+  source_summary_id: string | null;
+  confidence: number;
+  status: MemoryReviewStatus;
+  safety_findings_json: string;
+  approved_memory_id: string | null;
+  review_reason: string | null;
+  created_by_json: string;
+  reviewed_by_json: string | null;
+  created_at: string;
+  updated_at: string;
+  reviewed_at: string | null;
+};
+
+type MemorySourceRow = {
+  id: string;
+  memory_id: string;
+  source_type: MemorySource["sourceType"];
+  source_id: string | null;
+  citation: string | null;
+  created_at: string;
+};
+
+type MemoryUsageEventRow = {
+  id: string;
+  memory_id: string;
+  actor_json: string;
+  session_id: string | null;
+  reason: MemoryUsageEvent["reason"];
+  query: string | null;
+  score: number | null;
+  created_at: string;
+};
+
+type MemorySnapshotRow = {
+  id: string;
+  scope_type: MemorySnapshotRecord["scopeType"];
+  scope_id: string;
+  file_path: string;
+  content_hash: string;
+  imported_at: string | null;
+  exported_at: string | null;
+  updated_at: string;
 };
 
 type SessionSummaryRow = {
@@ -3777,6 +4037,7 @@ function skillFromRow(row: SkillRow): Skill {
       description: row.description,
       permissions: JSON.parse(row.permissions_json) as string[],
       tools: JSON.parse(row.tools_json) as string[],
+      metadata: JSON.parse(row.metadata_json) as Record<string, string>,
     },
     summary: row.summary,
     body: row.body,
@@ -3800,6 +4061,66 @@ function memoryFromRow(row: MemoryRow): MemoryRecord {
     updatedAt: row.updated_at,
     expiresAt: row.expires_at ?? undefined,
     lastUsedAt: row.last_used_at ?? undefined,
+  };
+}
+
+function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
+  return {
+    id: row.id,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    kind: row.kind,
+    proposedContent: row.proposed_content,
+    proposedSummary: row.proposed_summary,
+    sourceSessionId: row.source_session_id ?? undefined,
+    sourceSummaryId: row.source_summary_id ?? undefined,
+    confidence: row.confidence,
+    status: row.status,
+    safetyFindings: JSON.parse(row.safety_findings_json) as MemoryCandidate["safetyFindings"],
+    approvedMemoryId: row.approved_memory_id ?? undefined,
+    reviewReason: row.review_reason ?? undefined,
+    createdBy: JSON.parse(row.created_by_json) as MemoryCandidate["createdBy"],
+    reviewedBy: row.reviewed_by_json ? JSON.parse(row.reviewed_by_json) as MemoryCandidate["reviewedBy"] : undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    reviewedAt: row.reviewed_at ?? undefined,
+  };
+}
+
+function memorySourceFromRow(row: MemorySourceRow): MemorySource {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    sourceType: row.source_type,
+    sourceId: row.source_id ?? undefined,
+    citation: row.citation ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
+function memoryUsageEventFromRow(row: MemoryUsageEventRow): MemoryUsageEvent {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    actor: JSON.parse(row.actor_json) as MemoryUsageEvent["actor"],
+    sessionId: row.session_id ?? undefined,
+    reason: row.reason,
+    query: row.query ?? undefined,
+    score: row.score ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
+function memorySnapshotFromRow(row: MemorySnapshotRow): MemorySnapshotRecord {
+  return {
+    id: row.id,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    filePath: row.file_path,
+    contentHash: row.content_hash,
+    importedAt: row.imported_at ?? undefined,
+    exportedAt: row.exported_at ?? undefined,
+    updatedAt: row.updated_at,
   };
 }
 

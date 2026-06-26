@@ -28,8 +28,13 @@ import type {
   SessionLink,
   Skill,
   SkillUsageEvent,
+  MemoryCandidate,
   MemoryRecord,
+  MemoryReviewStatus,
+  MemorySnapshotRecord,
   MemoryScope,
+  MemorySource,
+  MemoryUsageEvent,
   SessionTodo,
   PendingToolCall,
   PendingToolCallStatus,
@@ -176,6 +181,15 @@ export type ListGoalRunsInput = {
   limit?: number;
 };
 
+export type ListMemoryCandidatesInput = {
+  scopeType?: MemoryScope;
+  scopeId?: string;
+  status?: MemoryReviewStatus;
+  sourceSessionId?: string;
+  sourceSummaryId?: string;
+  limit?: number;
+};
+
 export type CompactSessionResult = {
   sessionId: string;
   messagesDeleted: number;
@@ -305,6 +319,17 @@ export interface AgentStore {
   addMemory(memory: MemoryRecord): Promise<void>;
   listMemories(scopeType?: MemoryScope, scopeId?: string): Promise<MemoryRecord[]>;
   deleteMemory(memoryId: string): Promise<boolean>;
+  createMemoryCandidate(candidate: MemoryCandidate): Promise<void>;
+  updateMemoryCandidate(candidate: MemoryCandidate): Promise<void>;
+  getMemoryCandidate(candidateId: string): Promise<MemoryCandidate | undefined>;
+  listMemoryCandidates(input?: ListMemoryCandidatesInput): Promise<MemoryCandidate[]>;
+  createMemorySource(source: MemorySource): Promise<void>;
+  listMemorySources(memoryId: string): Promise<MemorySource[]>;
+  recordMemoryUsage(event: MemoryUsageEvent): Promise<void>;
+  listMemoryUsageEvents(memoryId: string): Promise<MemoryUsageEvent[]>;
+  touchMemory(memoryId: string, lastUsedAt: string): Promise<boolean>;
+  upsertMemorySnapshot(snapshot: MemorySnapshotRecord): Promise<void>;
+  getMemorySnapshot(scopeType: MemoryScope, scopeId: string, filePath: string): Promise<MemorySnapshotRecord | undefined>;
   addSessionSummary(summary: SessionSummary): Promise<void>;
   getSessionSummaries(sessionId: string): Promise<SessionSummary[]>;
   compactSession(sessionId: string, summary: SessionSummary): Promise<CompactSessionResult>;

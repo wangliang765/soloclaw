@@ -2934,10 +2934,39 @@ test("rich model setup wizard covers known provider presets with bounded rows", 
   const screen = renderRichModelSetupScreen(wizard, { columns: 100, rows: 32 });
   const lines = screen.split("\n");
 
-  for (const label of ["OpenAI", "Anthropic Claude", "Google Gemini", "Kimi / Moonshot AI", "DeepSeek", "Z.AI GLM", "Qwen / DashScope", "MiniMax", "Custom OpenAI-compatible", "Custom Anthropic-compatible"]) {
+  for (const label of ["OpenAI", "OpenAI Responses API", "Anthropic Claude", "Google Gemini", "Kimi / Moonshot AI", "DeepSeek", "Z.AI GLM", "Qwen / DashScope", "MiniMax", "Custom OpenAI-compatible", "Custom Anthropic-compatible"]) {
     assert.match(screen, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assert.equal(lines.every((line) => visibleLength(line) <= 100), true);
+});
+
+test("rich model setup wizard can select OpenAI Responses API protocol", async () => {
+  const { createRichModelSetupState, handleRichModelSetupKey, renderRichModelSetupScreen } = await import("../cli/tui/model-setup.js");
+  const wizard = createRichModelSetupState(Object.values(MODEL_PROVIDER_PROFILES), "openai_responses");
+  const screen = renderRichModelSetupScreen(wizard, { columns: 120, rows: 32 });
+
+  assert.match(screen, /> \[ \] OpenAI Responses API \(https:\/\/api\.openai\.com\/v1\)/);
+  assert.equal(handleRichModelSetupKey(wizard, { key: { name: "return" } }).type, "redraw");
+  assert.equal(wizard.phase, "base_url");
+  assert.match(renderRichModelSetupScreen(wizard, { columns: 120, rows: 32 }), /Base URL \[https:\/\/api\.openai\.com\/v1\]:/);
+
+  for (const char of "https://responses.example/v1") {
+    assert.equal(handleRichModelSetupKey(wizard, { value: char }).type, "redraw");
+  }
+  assert.equal(handleRichModelSetupKey(wizard, { key: { name: "return" } }).type, "redraw");
+  assert.equal(wizard.phase, "model");
+  assert.equal(handleRichModelSetupKey(wizard, { key: { name: "return" } }).type, "redraw");
+
+  for (const char of "sk-test-secret-123456") {
+    assert.equal(handleRichModelSetupKey(wizard, { value: char }).type, "redraw");
+  }
+  const complete = handleRichModelSetupKey(wizard, { key: { name: "return" } });
+
+  assert.equal(complete.type, "complete");
+  assert.equal(complete.request?.provider, "openai");
+  assert.equal(complete.request?.protocol, "openai_responses");
+  assert.equal(complete.request?.baseUrl, "https://responses.example/v1");
+  assert.equal(complete.request?.apiKey, "sk-test-secret-123456");
 });
 
 test("rich model setup wizard selects provider model and masked api key", async () => {

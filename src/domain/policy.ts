@@ -29,6 +29,7 @@ export type PolicyAction =
   | "git.push"
   | "git.pr.create"
   | "secret.read"
+  | "skill.load"
   | "plugin.execute"
   | "mcp.connect"
   | "mcp.tool.call"

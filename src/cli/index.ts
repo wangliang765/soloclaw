@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
@@ -15,14 +15,9 @@ import type {
   ApprovalStatus,
   ArtifactKind,
   AuditEvent,
-  AuditExportBundle,
   CapabilityGrant,
   ExecutionMode,
   FileChange,
-  KnowledgeSourceKind,
-  KnowledgeTrustLevel,
-  McpServerRegistration,
-  MemoryScope,
   PolicyAction,
   RetentionPolicy,
   RoomMessageKind,
@@ -41,6 +36,10 @@ import type {
 } from "../domain/index.js";
 import { ControlPlaneService } from "../control-plane/control-plane-service.js";
 import { AgentLoop, type AgentLoopProgressEvent } from "../core/agent-loop.js";
+import { evaluateCompletionGate } from "../core/completion-gate.js";
+import { parseAgentWorkProfile } from "../core/agent-work-profile.js";
+import { AgentCommandLoader } from "../commands/agent-command-loader.js";
+import { AgentCommandService } from "../commands/agent-command-service.js";
 import { AgentRunSupervisor } from "../core/agent-run-supervisor.js";
 import { DaemonLifecycleController, type DaemonLifecycleSnapshot } from "../daemon/daemon-lifecycle.js";
 import { DEFAULT_ROOM_AGENT_RESPONSE_MODE, DEFAULT_ROOM_WIDE_MENTION_POLICY, roomMessageIntentEnvelopeSigningPayload } from "../domain/index.js";
@@ -61,27 +60,29 @@ import type { ModelClient, ModelProviderName, ModelRequest } from "../model/mode
 import { ModelUsageService } from "../model/model-usage-service.js";
 import type { ModelUsageSummaryEntry } from "../model/model-usage-service.js";
 import { McpConnectionPlanner } from "../mcp/mcp-connection-planner.js";
-import type { McpConnectionPlan } from "../mcp/mcp-connection-planner.js";
 import { McpExecutionService } from "../mcp/mcp-execution-service.js";
-import type { McpExecutionResult } from "../mcp/mcp-execution-service.js";
 import { McpHealthService } from "../mcp/mcp-health-service.js";
-import type { McpHealthCheckResult } from "../mcp/mcp-health-service.js";
-import { LocalMcpRegistry, parseMcpCapabilities } from "../mcp/local-mcp-registry.js";
+import { LocalMcpRegistry } from "../mcp/local-mcp-registry.js";
 import { LocalMcpRuntime } from "../mcp/local-mcp-runtime.js";
 import { createLocalPlatform } from "../platform/local-platform.js";
 import { LocalEventBus } from "../events/local-event-bus.js";
+import { MemoryRetrievalService } from "../memory/memory-retrieval-service.js";
+import { MemorySnapshotService } from "../memory/memory-snapshot-service.js";
 import { detectPlatformCapabilities, resolveSoloclawPaths, type SoloclawPlatformCapabilities } from "../platform/soloclaw-platform.js";
 import { RemoteRoomRunner, type RemoteRoomPollResult, type RemoteRoomRunResult } from "../remote/remote-room-runner.js";
 import type { SchedulerRunResult, SchedulerTickResult } from "../scheduler/local-scheduler-service.js";
-import type { PutSecretInput } from "../secrets/secret-store.js";
+import type { PutSecretInput, SecretRef } from "../secrets/secret-store.js";
 import { EncryptedFileSecretStore } from "../secrets/encrypted-file-secret-store.js";
+import { AuditExportService } from "../audit/audit-export-service.js";
 import { buildSessionInspectView, buildSessionNextView, buildSessionReportView, buildSessionVerificationView, type SessionVerificationOptions, type SessionVerificationPreset } from "../sessions/session-inspection-view.js";
-import type { KnowledgeEvalCase, KnowledgeEvalThresholds, KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
+import type { KnowledgeSafetyMode } from "../knowledge/knowledge-service.js";
 import { parseSpecificationClarificationStatus, parseSpecificationStatus, parseSpecificationTaskStatus } from "../specifications/specification-service.js";
 import type { SpecificationEvidenceConclusion, SpecificationEvidenceProvider, SpecificationVerificationStatus } from "../specifications/specification-service.js";
 import type { AgentStore, ListAuditEventsInput } from "../store/agent-store.js";
 import { MemoryAgentStore } from "../store/memory-agent-store.js";
 import type { RegisteredTool, ToolResult } from "../protocol/types.js";
+import { replayApprovedTool } from "../tools/tool-replay.js";
+import { createWorkspaceTools } from "../tools/workspace-tools.js";
 import { LocalWorkerRunner, type WorkerPollResult, type WorkerRunOnceResult } from "../workers/local-worker-runner.js";
 import { WorkerHealthService, type WorkerHealthSummary } from "../workers/worker-health-service.js";
 import { WorkerRegistryService } from "../workers/worker-registry-service.js";
@@ -93,6 +94,26 @@ import { parseWorkspaceRuntimeMode, type WorkspaceRuntimeMode } from "../workspa
 import { renderAppHtml, startLocalRoomWebServer } from "../web/local-room-web-server.js";
 import { formatPhaseThreeReadOnlyGoalPrompt } from "./phase3-long-task-prompts.js";
 import { parseContextCompactionCliOptions } from "./context-compaction-options.js";
+import { createAgentsCommand, createIdentityCommand } from "./commands/agents.js";
+import { createGitCommand, createOrgsCommand, createPrCommand, createRetentionCommand } from "./commands/admin.js";
+import { createConfigCommand, createSecretsCommand } from "./commands/config.js";
+import { createHelpCommand } from "./commands/help.js";
+import { createHygieneCommand } from "./commands/hygiene.js";
+import { createMemoryCommand } from "./commands/memory.js";
+import { createLegacyModelsCommand, createModelCommand, createProvidersCommand } from "./commands/model.js";
+import { createPhaseCommands } from "./commands/phases.js";
+import { createQuickstartCommand } from "./commands/quickstart.js";
+import { createRemoteCommand } from "./commands/remote.js";
+import { createRoomsCommand, normalizeRoomConvenienceCommand, printRoomConvenienceHelp } from "./commands/rooms.js";
+import { createApprovalDecisionCommand, createApprovalsCommand, createArtifactsCommand, createAuditCommand, createChangesCommand, createReplayCommand, createResumeCommand, createSessionCommand, createSessionControlCommand, createSessionsCommand, createShowSessionCommand } from "./commands/session.js";
+import { createSpecCommand } from "./commands/spec.js";
+import { createDelegateCommand, createSubtasksCommand } from "./commands/subagents.js";
+import { createAgentCommandsCommand, createKnowledgeCommand, createMcpCommand, createPluginsCommand, createSkillsCommand, createToolCommand, isMcpApprovalAction } from "./commands/tools.js";
+import { createWebCommand } from "./commands/web.js";
+import { createAssignmentsCommand, createOperatorCommand, createSchedulerCommand, createWorkersCommand } from "./commands/workers.js";
+import { createWorkspaceCommand } from "./commands/workspace.js";
+import { createDoctorCommand, createInitCommand, createInspectCommand, createLocalAgentCommand, createPlatformCommand, createSmokeCommand, createStatusCommand, createTuiCommand, createWorkbenchVerifyCommand } from "./commands/workbench.js";
+import { CommandRouter } from "./command-router.js";
 import {
   buildPhaseTwoClosureStatus,
   buildPhaseTwoEvidenceCheck,
@@ -141,6 +162,1256 @@ import { renderConversationScreen } from "./tui/layout.js";
 import type { RichTuiMode, RichTuiState, RichTuiWorkspaceStatus } from "./tui/state.js";
 import { formatRichTuiRealProviderSmokeResult, formatRichTuiSmokeResult, runRichTuiRealProviderSmoke, runRichTuiSmoke } from "./tui/rich-smoke.js";
 
+type CliCommandContext = void;
+
+function buildEarlyCliCommandRouter(): CommandRouter<CliCommandContext> {
+  return new CommandRouter([
+    createHelpCommand(printHelp),
+    createQuickstartCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      buildQuickstart: buildSoloclawQuickstart,
+      renderQuickstart: printSoloclawQuickstart,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createInitCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      initializeWorkspace: initializeSoloclawWorkspace,
+      renderInit: printSoloclawInitView,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createTuiCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      startTui,
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createLocalAgentCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      parseArgs: parseLocalAgentArgs,
+      openPlatform: async (workspace) => {
+        const { locks, store } = await createLocalPlatform(workspace);
+        return {
+          store,
+          close: () => {
+            locks.close?.();
+            store.close();
+          },
+        };
+      },
+      buildStatus: buildLocalAgentStatus,
+      buildLogs: buildLocalAgentLogs,
+      renderStatus: printLocalAgentStatus,
+      renderServicePlan: printLocalAgentServicePlan,
+      renderLogs: printLocalAgentLogs,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createIdentityCommand({
+      createPlatform: async () => {
+        const { identity, store } = await createLocalPlatform(process.cwd());
+        return {
+          identity,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      readOption,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createAgentsCommand({
+      createPlatform: async () => {
+        const platform = await createLocalPlatform(process.cwd());
+        return {
+          ...platform,
+          close: () => {
+            platform.locks.close?.();
+            platform.store.close();
+          },
+        };
+      },
+      createControlPlane: (platform) => new ControlPlaneService(platform as unknown as Awaited<ReturnType<typeof createLocalPlatform>>),
+      readOption,
+      readUtf8,
+      parseActorRef,
+      agentActor,
+      parseAgentTrustStatus,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createRoomsCommand({
+      cwd: () => process.cwd(),
+      env: process.env,
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      createControlPlane: (platform) => new ControlPlaneService(platform),
+      writeText: (message) => console.log(message),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createRemoteCommand({
+      cwd: () => process.cwd(),
+      env: process.env,
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      writeText: (message) => console.log(message),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createHygieneCommand({
+      cwd: () => process.cwd(),
+      scan: scanExecutionHygiene,
+      writeText: (message) => console.log(message),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    ...createPhaseCommands({
+      cwd: () => process.cwd(),
+      verifyPhaseOneReadiness,
+      renderPhaseOneReadiness: printPhaseOneReadiness,
+      handlePhaseTwoCommand,
+      handlePhaseThreeCommand,
+      handlePhaseFourCommand,
+      handlePhaseFiveCommand,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createProvidersCommand({
+      stripWorkspaceOption,
+      createProfiles: () => new GlobalModelProfileStore(),
+      parseProfileArgs: parseModelProfileArgs,
+      renderProfiles: printGlobalModelProfiles,
+      writeProfilesJson: printGlobalModelProfilesJson,
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createModelCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      createProfiles: () => new GlobalModelProfileStore(),
+      parseProfileArgs: parseModelProfileArgs,
+      needsInteractiveSetupProvider: (parsed) => !parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0],
+      hasSetupProviderDetails: (parsed) => Boolean(parsed.options.provider || parsed.options.providerInput || parsed.positionals[0] || parsed.options.profileId),
+      inputIsTty: () => Boolean(stdin.isTTY),
+      promptLine: (message) => promptLine(message),
+      assignPromptedProvider: (parsed, providerInput) => {
+        parsed.options.providerInput = providerInput;
+        parsed.options.provider = parseModelProviderName(providerInput);
+      },
+      setupProfile: setupGlobalModelProfile,
+      selectDefaultProfile: selectDefaultModelProfile,
+      buildEnv: buildModelEnvView,
+      renderEnv: printModelEnvView,
+      buildCheck: buildModelCheckView,
+      renderCheck: printModelCheckView,
+      renderProfiles: printGlobalModelProfiles,
+      writeProfilesJson: printGlobalModelProfilesJson,
+      renderSelectedProfile: (selected, configPath) => {
+        console.log(`default=${selected.defaultProfile}`);
+        console.log(`provider=${selected.profile.provider}`);
+        console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
+        console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
+        console.log(`config=${configPath}`);
+      },
+      renderSetupProfile: (profile, defaultProfile, configPath) => {
+        console.log(formatGlobalModelProfileLine(profile, defaultProfile, "value"));
+        console.log(`config=${configPath}`);
+      },
+      renderHelp: printHelp,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createLegacyModelsCommand({
+      cwd: () => process.cwd(),
+      createProfiles: (cwd) => new LocalProviderProfileStore(path.join(cwd, ".agent")),
+      parseProfileArgs: parseModelProfileArgs,
+      parseProviderName: parseModelProviderName,
+      inputIsTty: () => Boolean(stdin.isTTY),
+      promptLine: (message) => promptLine(message),
+      localAliasBaseUrl: localModelAliasBaseUrl,
+      resolveApiKeyEnvNames: resolveModelApiKeyEnvNames,
+      parseUsageArgs: parseModelUsageArgs,
+      createUsagePlatform: async (cwd) => {
+        const { store, locks } = await createLocalPlatform(cwd);
+        return { store, locks };
+      },
+      summarizeUsage: async (store, parsed) => new ModelUsageService(store).summarize({
+        filters: parsed.filters,
+        provider: parsed.options.provider,
+        model: parsed.options.model,
+        inputCostPerMillionTokens: parsed.options.inputCostPerMillionTokens,
+        outputCostPerMillionTokens: parsed.options.outputCostPerMillionTokens,
+      }),
+      formatUsageEntry: formatModelUsageEntry,
+      formatUsageStats: formatModelUsageStats,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createConfigCommand({
+      stripWorkspaceOption,
+      createProfiles: () => new GlobalModelProfileStore(),
+      detectCapabilities: detectPlatformCapabilities,
+      now: () => new Date(),
+      renderProfiles: printGlobalModelProfiles,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSecretsCommand<
+      PutSecretInput["class"],
+      PutSecretInput["scopeType"],
+      ExecutionMode,
+      ReturnType<typeof parseSecretArgs>,
+      SecretRef,
+      Awaited<ReturnType<typeof createLocalPlatform>>
+    >({
+      cwd: () => process.cwd(),
+      parseSecretArgs,
+      secretValueFromOptions,
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSessionsCommand<AgentStore, SessionListOptions, Awaited<ReturnType<typeof buildSessionList>>>({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      parseListArgs: parseSessionListArgs,
+      createPlatform: async (workspace) => {
+        const { store } = await createLocalPlatform(workspace);
+        return { store };
+      },
+      buildList: buildSessionList,
+      renderList: printSessionList,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createShowSessionCommand<AgentStore>({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      createPlatform: async (workspace) => {
+        const { store } = await createLocalPlatform(workspace);
+        return { store };
+      },
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createResumeCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      parseResumeArgs,
+      buildModelReadiness: buildRunModelReadinessView,
+      createPlatform: async (workspace, options) => {
+        const { agent, store } = await createLocalPlatform(workspace, options);
+        return { agent, store };
+      },
+      buildResult: buildSessionResult,
+      buildVerification: buildSessionVerification,
+      renderModelReadiness: printModelCheckView,
+      renderResult: (view) => printSessionResult(view as Awaited<ReturnType<typeof buildSessionResult>>),
+      renderVerification: (view) => printSessionVerification(view as Awaited<ReturnType<typeof buildSessionVerification>>),
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+      now: () => new Date(),
+    }),
+    createSessionCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      parseLifecycleArgs,
+      createPlatform: async (workspace) => {
+        const { store, lifecycle } = await createLocalPlatform(workspace);
+        return { store, lifecycle };
+      },
+      localUserActor,
+      buildDiff: buildSessionDiff,
+      buildReport: buildSessionReport,
+      buildStatus: buildSessionStatus,
+      buildInspect: buildSessionInspect,
+      buildTimeline: buildSessionTimeline,
+      buildReview: buildSessionReview,
+      buildBundle: buildSessionEvidenceBundle,
+      buildResult: buildSessionResult,
+      buildNext: buildSessionNext,
+      buildVerification: buildSessionVerification,
+      writeBundleOutput: writeJsonOutputInsideWorkspace,
+      renderDiff: (view) => printSessionDiff(view as Awaited<ReturnType<typeof buildSessionDiff>>),
+      renderReport: (view) => printSessionReport(view as Awaited<ReturnType<typeof buildSessionReport>>),
+      renderStatus: (view) => printSessionStatus(view as Awaited<ReturnType<typeof buildSessionStatus>>),
+      renderInspect: (view) => printSessionInspect(view as Awaited<ReturnType<typeof buildSessionInspect>>),
+      renderTimeline: (view) => printSessionTimeline(view as Awaited<ReturnType<typeof buildSessionTimeline>>),
+      renderReview: (view) => printSessionReview(view as Awaited<ReturnType<typeof buildSessionReview>>),
+      renderBundle: (view) => printSessionEvidenceBundle(view as Awaited<ReturnType<typeof buildSessionEvidenceBundle>> & { output?: { path: string; bytes: number } }),
+      renderResult: (view) => printSessionResult(view as Awaited<ReturnType<typeof buildSessionResult>>),
+      renderNext: (view) => printSessionNext(view as Awaited<ReturnType<typeof buildSessionNext>>),
+      renderVerification: (view) => printSessionVerification(view as Awaited<ReturnType<typeof buildSessionVerification>>),
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSessionControlCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      createPlatform: async (workspace) => {
+        const { store, tasks } = await createLocalPlatform(workspace);
+        return { store, tasks };
+      },
+      localUserActor,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createChangesCommand({
+      cwd: () => process.cwd(),
+      createPlatform: async (cwd) => {
+        const { store } = await createLocalPlatform(cwd);
+        return { store };
+      },
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createArtifactsCommand({
+      cwd: () => process.cwd(),
+      parseArtifactArgs,
+      createPlatform: async (cwd) => {
+        const { lifecycle, store } = await createLocalPlatform(cwd);
+        return { lifecycle, store };
+      },
+      localUserActor,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createApprovalsCommand({
+      cwd: () => process.cwd(),
+      createPlatform: async (cwd) => {
+        const { store } = await createLocalPlatform(cwd);
+        return { store };
+      },
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createAuditCommand({
+      cwd: () => process.cwd(),
+      createPlatform: async (cwd) => {
+        const { store, identity } = await createLocalPlatform(cwd);
+        return { store, identity };
+      },
+      createExportService: ({ store, identity }) => new AuditExportService({ store, identity }),
+      readUtf8,
+      writeFileOutput: async (outputPath, output) => {
+        await fs.mkdir(path.dirname(outputPath), { recursive: true });
+        await fs.writeFile(outputPath, output, "utf8");
+      },
+      writeRaw: (text) => {
+        process.stdout.write(text);
+      },
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createApprovalDecisionCommand({
+      cwd: () => process.cwd(),
+      parseApprovalArgs,
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      decideApproval: decideApprovalWithPolicy,
+      isMcpApprovalAction,
+      executeApprovedMcp: async ({ platform, approvalId, actor }) => new McpExecutionService(
+        new LocalMcpRegistry(path.join(process.cwd(), ".agent")),
+        new LocalMcpRuntime({ redactor: platform.redactor }),
+        platform.policy,
+        platform.store,
+        platform.secretBroker,
+      ).executeApproved({
+        approvalId,
+        actor,
+      }),
+      createWorkspaceTools: ({ workspace, store, locks, actor, sessionId }) => createWorkspaceTools(workspace, {
+        store,
+        locks,
+        actor,
+        sessionId,
+      }),
+      createPluginTools: ({ plugins, store, actor, sessionId }) => plugins.createTools({
+        store,
+        actor,
+        sessionId,
+      }),
+      replayApprovedTool,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createReplayCommand({
+      cwd: () => process.cwd(),
+      createPlatform: async (cwd) => {
+        const { workspace, store, locks, plugins } = await createLocalPlatform(cwd);
+        return { workspace, store, locks, plugins };
+      },
+      localUserActor,
+      createWorkspaceTools: ({ workspace, store, locks, actor }) => createWorkspaceTools(workspace, {
+        store,
+        locks,
+        actor,
+      }),
+      createPluginTools: ({ plugins, store, actor }) => plugins.createTools({
+        store,
+        actor,
+      }),
+      replayApprovedTool,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSkillsCommand({
+      cwd: () => process.cwd(),
+      skillsDirectory: (cwd) => path.join(cwd, ".agent", "skills"),
+      createPlatform: async (cwd) => {
+        const { skills, store } = await createLocalPlatform(cwd);
+        return { skills, store };
+      },
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createAgentCommandsCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      commandDirectory: (workspace) => path.join(workspace, ".agent", "commands"),
+      loadCommands: async (directory) => new AgentCommandLoader().loadDirectory(directory),
+      createCommandService: (workspace) => new AgentCommandService({ workspaceRoot: workspace }),
+      defaultModelProfileForWorkspace: defaultSoloclawModelProfileForWorkspace,
+      createPlatform: (workspace, options) => createLocalPlatform(workspace, options as RunPlatformOptions),
+      makeAuditId: () => makeId<"ArtifactId">("audit"),
+      now: () => new Date(),
+      splitCliWords,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createToolCommand<RunPlatformOptions, Awaited<ReturnType<typeof createLocalPlatform>>, ReturnType<typeof parseRunArgs>>({
+      cwd: () => process.cwd(),
+      parseRunArgs,
+      createPlatform: (cwd, options) => createLocalPlatform(cwd, options),
+      createTools: async (platform, parsed) => {
+        const { withPolicy } = await import("../tools/policy-tools.js");
+        const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
+        const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
+        return withPolicy(createWorkspaceTools(platform.workspace, {
+          store: platform.store,
+          locks: platform.locks,
+          actor,
+        }), {
+          actor,
+          mode: parsed.options.executionMode ?? "trusted",
+          risk: "medium",
+          policy: platform.policy,
+          store: platform.store,
+          scope: {
+            orgId: parsed.options.orgId,
+            projectId: parsed.options.projectId,
+            roomId: parsed.options.roomId,
+          },
+          roomId: parsed.options.roomId,
+        });
+      },
+      parseToolInput,
+      inputFile: (options) => options.inputFile,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createKnowledgeCommand({
+      cwd: () => process.cwd(),
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      actor: localUserActor,
+      readUtf8,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createMemoryCommand({
+      cwd: () => process.cwd(),
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      createRetrievalService: (store) => new MemoryRetrievalService(store),
+      createSnapshotService: (store) => new MemorySnapshotService(store),
+      actor: localUserActor,
+      readUtf8,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createWebCommand({
+      cwd: () => process.cwd(),
+      startServer: startLocalRoomWebServer,
+      onSignal: (signal, handler) => {
+        process.on(signal, handler);
+      },
+      exit: (code) => {
+        process.exit(code);
+      },
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createWorkspaceCommand({
+      cwd: () => process.cwd(),
+      readHistory: readWorkspaceHistory,
+      historyPath: workspaceHistoryPath,
+      resolvePath: (historyRoot, workspacePath) => path.resolve(historyRoot, workspacePath),
+      recordHistoryEntry: recordWorkspaceHistoryEntry,
+      resolveWorkspaceSelector,
+      renderHistory: printWorkspaceHistory,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createOrgsCommand({
+      createPlatform: async () => {
+        const { organizations, store } = await createLocalPlatform(process.cwd());
+        return {
+          organizations,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      actor: localUserActor,
+      parseArgs: parseOrgArgs,
+      parseCapabilitySubject,
+      parseCapabilityScope,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createRetentionCommand({
+      createPlatform: async () => {
+        const { lifecycle, store } = await createLocalPlatform(process.cwd());
+        return {
+          lifecycle,
+          store,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      actor: localUserActor,
+      parseArgs: parseRetentionArgs,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createGitCommand({
+      createPlatform: async () => {
+        const { git, store } = await createLocalPlatform(process.cwd());
+        return {
+          git,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      readOption,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createPrCommand({
+      createPlatform: async () => {
+        const { git, policy, store } = await createLocalPlatform(process.cwd());
+        return {
+          git,
+          policy,
+          store,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      actor: () => ({ type: "user" as const, id: "local-user", displayName: "Local User" }),
+      parseArgs: parsePrArgs,
+      ensureGitPolicyAllowed,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createWorkersCommand({
+      createPlatform: async () => {
+        const { workers, workerRunner, workerHealth, store, localAgent, identity } = await createLocalPlatform(process.cwd());
+        return {
+          workers,
+          workerRunner,
+          workerHealth,
+          store,
+          localAgent,
+          identity,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      parseArgs: parseWorkerArgs,
+      parseActorRef,
+      agentActor,
+      isWorkerHeartbeatEnvelope,
+      renderWorker: printWorker,
+      renderRunOnce: printWorkerRunOnce,
+      renderPoll: printWorkerPoll,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSchedulerCommand({
+      createPlatform: async () => {
+        const { scheduler, store, localAgent } = await createLocalPlatform(process.cwd());
+        return {
+          scheduler,
+          localAgent,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      parseArgs: parseSchedulerArgs,
+      parseActorRef,
+      agentActor,
+      onSignal: (signal, handler) => {
+        process.once(signal, handler);
+      },
+      offSignal: (signal, handler) => {
+        process.off(signal, handler);
+      },
+      renderTick: printSchedulerTick,
+      renderRun: printSchedulerRun,
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createAssignmentsCommand({
+      createPlatform: async () => {
+        const { assignments, store } = await createLocalPlatform(process.cwd());
+        return {
+          assignments,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      parseArgs: parseAssignmentArgs,
+      parseActorRef,
+      renderAssignment: printAssignment,
+      renderRecovery: printAssignmentRecovery,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createOperatorCommand({
+      createControl: async () => {
+        const platform = await createLocalPlatform(process.cwd());
+        const control = new ControlPlaneService(platform);
+        return {
+          control,
+          close: () => {
+            platform.locks.close?.();
+            platform.store.close?.();
+          },
+        };
+      },
+      parseArgs: parseOperatorArgs,
+      selectItem: selectOperatorItem,
+      jsonView: operatorJsonView,
+      renderView: printOperatorView,
+      renderDetail: printOperatorDetail,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSpecCommand({
+      createPlatform: async () => {
+        const { specifications, store } = await createLocalPlatform(process.cwd());
+        return {
+          specifications,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      actor: localUserActor,
+      parseArgs: parseSpecArgs,
+      parseSpecificationStatus,
+      parseSpecificationPlanStatus,
+      parseSpecificationClarificationStatus,
+      parseAnswerClarificationStatus,
+      parseSpecificationTaskStatus,
+      parseSpecificationVerificationStatus,
+      parseSpecificationEvidenceProvider,
+      parseSpecificationEvidenceConclusion,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createDelegateCommand({
+      cwd: () => process.cwd(),
+      parseRunArgs,
+      createPlatform: async (cwd, options) => {
+        const { subagents, store } = await createLocalPlatform(cwd, options);
+        return { subagents, store };
+      },
+      actor: localUserActor,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSubtasksCommand({
+      cwd: () => process.cwd(),
+      createPlatform: async (cwd) => {
+        const { store } = await createLocalPlatform(cwd);
+        return { store };
+      },
+      writeText: (text) => console.log(text),
+    }),
+    createPluginsCommand<RunPlatformOptions, ReturnType<typeof parseRunArgs>, Awaited<ReturnType<typeof createLocalPlatform>>>({
+      cwd: () => process.cwd(),
+      parseRunArgs,
+      createPlatform: (cwd, options) => createLocalPlatform(cwd, options),
+      withPolicy: async (tools, options) => {
+        const { withPolicy } = await import("../tools/policy-tools.js");
+        return withPolicy(tools, options as Parameters<typeof withPolicy>[1]);
+      },
+      actor: localUserActor,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createMcpCommand({
+      cwd: () => process.cwd(),
+      createPlatform: (cwd) => createLocalPlatform(cwd),
+      createRegistry: (cwd) => new LocalMcpRegistry(path.join(cwd, ".agent")),
+      createConnectionPlanner: (registry, platform) => new McpConnectionPlanner(registry, platform.policy, platform.store),
+      createExecutionService: (registry, platform) => new McpExecutionService(
+        registry,
+        new LocalMcpRuntime({ redactor: platform.redactor }),
+        platform.policy,
+        platform.store,
+        platform.secretBroker,
+      ),
+      createHealthService: (registry, platform) => new McpHealthService(
+        registry,
+        new LocalMcpRuntime({ redactor: platform.redactor }),
+        platform.policy,
+        platform.store,
+        platform.secretBroker,
+      ),
+      actor: localUserActor,
+      makeAuditId: () => makeId<"ArtifactId">("audit"),
+      now: () => new Date(),
+      readUtf8,
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createDoctorCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      verifyReadiness: verifyPhaseOneReadiness,
+      renderReadiness: printPhaseOneReadiness,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createStatusCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      buildStatus: buildSoloclawStatus,
+      renderStatus: printSoloclawStatus,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createPlatformCommand({
+      detectCapabilities: detectPlatformCapabilities,
+      usesLegacyConfig: async () => new GlobalModelProfileStore().usesLegacyConfig(),
+      buildDoctorView: buildPlatformDoctorView,
+      renderDoctor: printPlatformDoctor,
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createInspectCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      parseInspectArgs,
+      collectSnapshot: collectWorkspaceSnapshot,
+      collectKeyFilePreviews: collectWorkspaceKeyFilePreviews,
+      renderSnapshot: renderWorkspaceSnapshot,
+      renderFilePreviews: renderWorkspaceFilePreviews,
+      now: () => new Date(),
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createSmokeCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      runDefaultSmoke: runSoloclawSmoke,
+      runRichTuiSmoke: (workspace) => runRichTuiSmoke({ workspace, version: "0.1.0" }),
+      runRichTuiRealProviderSmoke: (workspace, options) => runRichTuiRealProviderSmoke({ workspace, version: "0.1.0", longTask: options?.longTask }),
+      formatRichTuiSmoke: formatRichTuiSmokeResult,
+      formatRichTuiRealProviderSmoke: formatRichTuiRealProviderSmokeResult,
+      writeText: (text) => console.log(text),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+    createWorkbenchVerifyCommand({
+      cwd: () => process.cwd(),
+      resolveWorkspace: resolveInitialWorkspace,
+      stripWorkspaceOption,
+      openStore: async (workspace) => {
+        const { store } = await createLocalPlatform(workspace);
+        return {
+          store,
+          close: () => {
+            store.close();
+          },
+        };
+      },
+      buildReport: buildSessionReport,
+      evaluateGate: evaluateCompletionGate,
+      now: () => new Date(),
+      writeText: (text) => console.log(text),
+      writeJson: (value) => console.log(JSON.stringify(value, null, 2)),
+      writeError: (message) => console.error(message),
+      setExitCode: (code) => {
+        process.exitCode = code;
+      },
+    }),
+  ]);
+}
+
+async function handlePhaseTwoCommand(rest: string[], cwd: string): Promise<void> {
+  const subcommand = rest[0] ?? "verify";
+  if (subcommand === "checklist" || subcommand === "manual-checklist") {
+    printPhaseTwoManualChecklist();
+    return;
+  }
+  if (subcommand === "closeout-guide" || subcommand === "guide") {
+    console.log(renderPhaseTwoCloseoutGuide());
+    return;
+  }
+  if (subcommand === "operator-runbook" || subcommand === "runbook") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const summary = await buildPhaseTwoGateSummary(workspace);
+      const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
+      console.log(renderPhaseTwoOperatorRunbook(summary, launch));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "closeout-wizard" || subcommand === "evidence-wizard") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      await runPhaseTwoCloseoutWizard(workspace, parsePhaseTwoCloseoutWizardArgs(cleanArgs));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "next" || subcommand === "next-action") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const next = await buildPhaseTwoNextAction(workspace);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(next, null, 2));
+      } else {
+        console.log(renderPhaseTwoNextAction(next));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "review" || subcommand === "review-board") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const board = await buildPhaseTwoReviewBoard(workspace);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(board, null, 2));
+      } else {
+        console.log(renderPhaseTwoReviewBoard(board));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "final-gate" || subcommand === "c3-gate") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
+        console.log(renderPhaseTwoFinalGatePlan(workspace));
+        return;
+      }
+      const result = await runPhaseTwoFinalGate(workspace);
+      console.log(renderPhaseTwoFinalGateResult(result));
+      if (result.status !== "pass") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-template" || subcommand === "evidence") {
+    printPhaseTwoEvidenceTemplate();
+    return;
+  }
+  if (subcommand === "evidence-record" || subcommand === "record-evidence") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const parsed = parsePhaseTwoEvidenceRecordArgs(cleanArgs);
+      const result = await recordPhaseTwoEvidence(workspace, {
+        section: parsed.section,
+        filePath: parsed.filePath,
+        date: parsed.date,
+        fields: parsed.fields,
+      });
+      console.log(renderPhaseTwoEvidenceRecord(result));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-show" || subcommand === "show-evidence" || subcommand === "evidence-review") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const parsed = parsePhaseTwoEvidenceShowArgs(cleanArgs);
+      const review = await buildPhaseTwoEvidenceReview(workspace, parsed);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(review, null, 2));
+      } else {
+        console.log(renderPhaseTwoEvidenceReview(review));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "closure-task" || subcommand === "check-closure-task") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const parsed = parsePhaseTwoClosureTaskArgs(cleanArgs);
+      const result = await checkPhaseTwoClosureTask(workspace, parsed);
+      console.log(renderPhaseTwoClosureTask(result));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "gate" || subcommand === "summary") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const summary = await buildPhaseTwoGateSummary(workspace);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(summary, null, 2));
+      } else {
+        console.log(renderPhaseTwoGateSummary(summary));
+      }
+      if (summary.status !== "ready_for_completion") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "evidence-check" || subcommand === "check-evidence") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const evidence = await buildPhaseTwoEvidenceCheck(workspace, {
+        filePath: parsePhaseTwoEvidenceFileOption(cleanArgs),
+        strict: cleanArgs.includes("--strict"),
+      });
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(evidence, null, 2));
+      } else {
+        console.log(renderPhaseTwoEvidenceCheck(evidence));
+      }
+      if (evidence.status !== "paste_safe_pending_manual_review") {
+        process.exitCode = 1;
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "launch-terminal" || subcommand === "terminal") {
+    const args = rest.slice(1);
+    const workspace = await resolveInitialWorkspace(cwd, args);
+    const cleanArgs = stripWorkspaceOption(args);
+    const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
+    if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
+      console.log(renderPhaseTwoExternalTerminalLaunch(launch, false));
+      return;
+    }
+    try {
+      const result = await launchPhaseTwoExternalTerminal(launch);
+      console.log(renderPhaseTwoExternalTerminalLaunch(launch, true, result));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      console.error("Use `soloclaw phase2 launch-terminal --print` to copy the command manually.");
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "readiness" || subcommand === "real-provider-readiness") {
+    try {
+      const args = rest.slice(1);
+      const workspace = await resolveInitialWorkspace(cwd, args);
+      const cleanArgs = stripWorkspaceOption(args);
+      const readiness = await buildPhaseTwoRealProviderReadiness(workspace);
+      if (cleanArgs.includes("--json")) {
+        console.log(JSON.stringify(readiness, null, 2));
+      } else {
+        console.log(renderPhaseTwoRealProviderReadiness(readiness));
+      }
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (subcommand === "status") {
+    const status = buildPhaseTwoClosureStatus();
+    if (rest.slice(1).includes("--json")) {
+      console.log(JSON.stringify(status, null, 2));
+    } else {
+      console.log(renderPhaseTwoClosureStatus(status));
+    }
+    return;
+  }
+  if (subcommand !== "verify" && subcommand !== "smoke") {
+    console.error(
+        "Usage: soloclaw phase2 verify [--workspace path] [--json] [--cleanup]\n" +
+        "       soloclaw phase2 status [--json]\n" +
+        "       soloclaw phase2 gate [--workspace path] [--json]\n" +
+        "       soloclaw phase2 next [--workspace path] [--json]\n" +
+        "       soloclaw phase2 review [--workspace path] [--json]\n" +
+        "       soloclaw phase2 final-gate [--workspace path] [--print]\n" +
+        "       soloclaw phase2 readiness [--workspace path] [--json]\n" +
+        "       soloclaw phase2 launch-terminal [--workspace path] [--print]\n" +
+        "       soloclaw phase2 checklist\n" +
+        "       soloclaw phase2 closeout-guide\n" +
+        "       soloclaw phase2 operator-runbook [--workspace path]\n" +
+        "       soloclaw phase2 closeout-wizard --section C1|C2|C3 [--workspace path]\n" +
+        "       soloclaw phase2 evidence-template\n" +
+        "       soloclaw phase2 evidence-show --section C1|C2|C3 [--workspace path] [--json]\n" +
+        "       soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]\n" +
+        "       soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed\n" +
+        "       soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]\n" +
+        "       soloclaw phase3 long-task-gate [--workspace path] [--json]\n" +
+        "       soloclaw phase3 long-task-real-provider [--workspace path] [--json]\n" +
+        "       soloclaw smoke --rich-tui-real-provider\n" +
+        "       agent phase2 checklist",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const args = rest.slice(1);
+    const workspace = await resolveInitialWorkspace(cwd, args);
+    const cleanArgs = stripWorkspaceOption(args);
+    const result = await verifyPhaseTwoEngineeringSmoke(workspace, {
+      cleanup: cleanArgs.includes("--cleanup"),
+    });
+    if (cleanArgs.includes("--json")) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      printPhaseTwoEngineeringSmoke(result);
+    }
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+  return;
+}
+
 async function main() {
   let [, , command, ...rest] = process.argv;
 
@@ -154,5034 +1425,37 @@ async function main() {
     return;
   }
 
-  if (command === "help" || command === "--help" || command === "-h") {
-    printHelp(rest);
-    return;
-  }
-
   if (command === "room" && (!rest[0] || rest[0] === "help" || rest[0] === "--help" || rest[0] === "-h")) {
-    printRoomConvenienceHelp();
+    printRoomConvenienceHelp((message) => console.log(message));
     return;
   }
 
   ({ command, rest } = normalizeRoomConvenienceCommand(command, rest));
 
-  if (command === "quickstart") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      const args = stripWorkspaceOption(rest);
-      const view = await buildSoloclawQuickstart(process.cwd(), workspace);
-      if (args.includes("--json")) {
-        console.log(JSON.stringify(view, null, 2));
-      } else {
-        printSoloclawQuickstart(view);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
+  const earlyCommandResult = await buildEarlyCliCommandRouter().execute({ command, args: rest, context: undefined });
+  if (earlyCommandResult.matched) {
+    if (typeof earlyCommandResult.exitCode === "number") {
+      process.exitCode = earlyCommandResult.exitCode;
     }
-    return;
-  }
-
-  if (command === "init" || command === "setup") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      const result = await initializeSoloclawWorkspace(process.cwd(), workspace, stripWorkspaceOption(rest));
-      if (result.json) {
-        console.log(JSON.stringify(result.view, null, 2));
-      } else {
-        printSoloclawInitView(result.view);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "tui") {
-    await startTui(await resolveInitialWorkspace(process.cwd(), rest), process.cwd());
-    return;
-  }
-
-  if (command === "doctor" || command === "check") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      const args = stripWorkspaceOption(rest);
-      const result = await verifyPhaseOneReadiness(workspace);
-      if (args.includes("--json")) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        printPhaseOneReadiness(result);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "status") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      const status = await buildSoloclawStatus(process.cwd(), workspace);
-      if (rest.includes("--json")) {
-        console.log(JSON.stringify(status, null, 2));
-      } else {
-        printSoloclawStatus(status);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "platform") {
-    const subcommand = rest[0] ?? "doctor";
-    if (subcommand !== "doctor" && subcommand !== "check") {
-      console.error("Usage: soloclaw platform doctor [--json]");
-      process.exitCode = 1;
-      return;
-    }
-    try {
-      const capabilities = await detectPlatformCapabilities();
-      if (rest.slice(1).includes("--json")) {
-        const profiles = new GlobalModelProfileStore();
-        console.log(JSON.stringify(buildPlatformDoctorView(capabilities, await profiles.usesLegacyConfig()), null, 2));
-      } else {
-        printPlatformDoctor(capabilities);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "local" || command === "agent") {
-    const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-    const args = stripWorkspaceOption(rest);
-    const subcommand = args[0] ?? "status";
-    const parsed = parseLocalAgentArgs(args.slice(1));
-    const { locks, store } = await createLocalPlatform(workspace);
-    try {
-      if (subcommand === "status") {
-        const status = await buildLocalAgentStatus(store, workspace, parsed.options);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(status, null, 2));
-        } else {
-          printLocalAgentStatus(status);
-        }
-        return;
-      }
-      if (subcommand === "service" || subcommand === "daemon") {
-        const status = await buildLocalAgentStatus(store, workspace, parsed.options);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(status.servicePlan, null, 2));
-        } else {
-          printLocalAgentServicePlan(status.servicePlan);
-        }
-        return;
-      }
-      if (subcommand === "logs" || subcommand === "timeline") {
-        const logs = await buildLocalAgentLogs(store, workspace, parsed.options);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(logs, null, 2));
-        } else {
-          printLocalAgentLogs(logs);
-        }
-        return;
-      }
-      console.error(`Unknown local agent command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      locks.close?.();
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "smoke") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      if (rest.includes("--rich-tui-real-provider-long-task") || rest.includes("rich-tui-real-provider-long-task")) {
-        const result = await runRichTuiRealProviderSmoke({ workspace, version: "0.1.0", longTask: true });
-        console.log(formatRichTuiRealProviderSmokeResult(result));
-        if (!result.ok) {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (rest.includes("--rich-tui-real-provider") || rest.includes("rich-tui-real-provider")) {
-        const result = await runRichTuiRealProviderSmoke({ workspace, version: "0.1.0" });
-        console.log(formatRichTuiRealProviderSmokeResult(result));
-        if (!result.ok) {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (rest.includes("--rich-tui") || rest.includes("rich-tui")) {
-        console.log(formatRichTuiSmokeResult(await runRichTuiSmoke({ workspace, version: "0.1.0" })));
-        return;
-      }
-      const answer = await runSoloclawSmoke(workspace);
-      console.log(answer);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "providers") {
-    try {
-      const args = stripWorkspaceOption(rest);
-      const profiles = new GlobalModelProfileStore();
-      const parsed = parseModelProfileArgs(args);
-      const listed = await profiles.list();
-      const defaultProfile = await profiles.getDefaultProfile();
-      if (parsed.options.json) {
-        printGlobalModelProfilesJson(listed, defaultProfile, profiles.filePath);
-      } else {
-        printGlobalModelProfiles(listed, defaultProfile);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "workspace") {
-    const subcommand = rest[0] ?? "list";
-    const historyRoot = process.cwd();
-    try {
-      if (subcommand === "list" || subcommand === "ls" || subcommand === "recent") {
-        const json = rest.slice(1).includes("--json");
-        const history = await readWorkspaceHistory(historyRoot);
-        if (json) {
-          console.log(JSON.stringify({ configPath: workspaceHistoryPath(historyRoot), activeWorkspace: history.activeWorkspace, entries: history.entries }, null, 2));
-        } else {
-          printWorkspaceHistory(history);
-        }
-        return;
-      }
-      if (subcommand === "add") {
-        const workspacePath = rest[1];
-        if (!workspacePath) {
-          console.error("Usage: soloclaw workspace add <path>");
-          process.exitCode = 1;
-          return;
-        }
-        const workspace = await recordWorkspaceHistoryEntry(historyRoot, path.resolve(historyRoot, workspacePath));
-        console.log(`workspace=${workspace}`);
-        console.log(`config=${workspaceHistoryPath(historyRoot)}`);
-        return;
-      }
-      if (subcommand === "use" || subcommand === "select") {
-        const selector = rest[1];
-        if (!selector) {
-          console.error("Usage: soloclaw workspace use <number|path>");
-          process.exitCode = 1;
-          return;
-        }
-        const workspace = await resolveWorkspaceSelector(historyRoot, selector, historyRoot);
-        await recordWorkspaceHistoryEntry(historyRoot, workspace);
-        console.log(`workspace=${workspace}`);
-        console.log(`active=${workspace}`);
-        console.log(`config=${workspaceHistoryPath(historyRoot)}`);
-        console.log(`next=soloclaw tui --workspace "${workspace}"`);
-        return;
-      }
-      console.error(`Unknown workspace command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "model") {
-    try {
-      const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-      const args = stripWorkspaceOption(rest);
-      const subcommand = args[0] ?? "list";
-      const profiles = new GlobalModelProfileStore();
-      if (subcommand === "list" || subcommand === "ls") {
-        const parsed = parseModelProfileArgs(args.slice(1));
-        const listed = await profiles.list();
-        const defaultProfile = await profiles.getDefaultProfile();
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ profiles: listed, providers: listed, defaultProfile, defaultProvider: defaultProfile, configPath: profiles.filePath }, null, 2));
-        } else {
-          printGlobalModelProfiles(listed, defaultProfile);
-        }
-        return;
-      }
-      if (subcommand === "providers" || subcommand === "presets") {
-        const parsed = parseModelProfileArgs(args.slice(1));
-        const listed = await profiles.list();
-        const defaultProfile = await profiles.getDefaultProfile();
-        if (parsed.options.json) {
-          printGlobalModelProfilesJson(listed, defaultProfile, profiles.filePath);
-        } else {
-          printGlobalModelProfiles(listed, defaultProfile);
-        }
-        return;
-      }
-      if (subcommand === "env") {
-        const result = await buildModelEnvView(workspace, args.slice(1));
-        if (result.json) {
-          console.log(JSON.stringify(result.view, null, 2));
-        } else {
-          printModelEnvView(result.view);
-        }
-        return;
-      }
-      if (subcommand === "check" || subcommand === "doctor") {
-        const result = await buildModelCheckView(workspace, args.slice(1));
-        if (result.json) {
-          console.log(JSON.stringify(result.view, null, 2));
-        } else {
-          printModelCheckView(result.view);
-        }
-        if (!result.view.ready) {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (subcommand === "use" || subcommand === "default") {
-        const profileId = args[1];
-        if (!profileId) {
-          console.error("Usage: soloclaw model use <profile-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const selected = await selectDefaultModelProfile(profiles, profileId);
-        console.log(`default=${selected.defaultProfile}`);
-        console.log(`provider=${selected.profile.provider}`);
-        console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
-        console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
-        console.log(`config=${profiles.filePath}`);
-        return;
-      }
-      if (subcommand === "setup") {
-        const parsed = parseModelProfileArgs(args.slice(1));
-        if (!parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0] && stdin.isTTY) {
-          const promptedProvider = (await promptLine("Provider [openai_compatible]: ")) || "openai_compatible";
-          parsed.options.providerInput = promptedProvider;
-          parsed.options.provider = parseModelProviderName(promptedProvider);
-        }
-        if (!parsed.options.provider && !parsed.options.providerInput && !parsed.positionals[0] && !parsed.options.profileId) {
-          console.error("Usage: soloclaw model setup <provider> [--profile id] [--protocol openai_chat|openai_responses|anthropic_messages|mock] [--base-url url] [--model name] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
-          process.exitCode = 1;
-          return;
-        }
-        const profile = await setupGlobalModelProfile(profiles, parsed);
-        const defaultProfile = await profiles.getDefaultProfile();
-        console.log(formatGlobalModelProfileLine(profile, defaultProfile, "value"));
-        console.log(`config=${profiles.filePath}`);
-        return;
-      }
-      if (args.length > 1) {
-        console.error("Usage: soloclaw model <profile-id>");
-        process.exitCode = 1;
-        return;
-      }
-      const selected = await selectDefaultModelProfile(profiles, subcommand);
-      console.log(`default=${selected.defaultProfile}`);
-      console.log(`provider=${selected.profile.provider}`);
-      console.log(`baseUrl=${selected.profile.defaultBaseUrl ?? "-"}`);
-      console.log(`env=${selected.profile.apiKeyEnvNames.join(",") || "-"}`);
-      console.log(`config=${profiles.filePath}`);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "config") {
-    try {
-      const args = stripWorkspaceOption(rest);
-      const subcommand = args[0] ?? "show";
-      const profiles = new GlobalModelProfileStore();
-      if (subcommand === "path") {
-        if (args.slice(1).includes("--json")) {
-          const capabilities = await detectPlatformCapabilities();
-          console.log(JSON.stringify({
-            generatedAt: new Date().toISOString(),
-            configPath: profiles.filePath,
-            legacyConfig: await profiles.usesLegacyConfig(),
-            platform: capabilities.platform,
-            paths: capabilities.paths,
-            capabilities,
-          }, null, 2));
-        } else {
-          console.log(profiles.filePath);
-        }
-        return;
-      }
-      if (subcommand === "show") {
-        const json = args.slice(1).includes("--json");
-        const listed = await profiles.list();
-        const defaultProfile = await profiles.getDefaultProfile();
-        const capabilities = json ? await detectPlatformCapabilities() : undefined;
-        const view = {
-          defaultProfile,
-          defaultProvider: defaultProfile,
-          configPath: profiles.filePath,
-          legacyConfig: await profiles.usesLegacyConfig(),
-          profiles: listed,
-          providers: listed,
-          platform: capabilities?.platform,
-          paths: capabilities?.paths,
-          capabilities,
-        };
-        if (json) {
-          console.log(JSON.stringify(view, null, 2));
-        } else {
-          console.log(`config=${profiles.filePath}`);
-          console.log(`default=${defaultProfile ?? "-"}`);
-          printGlobalModelProfiles(listed, defaultProfile);
-        }
-        return;
-      }
-      console.error(`Unknown config command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "inspect") {
-    const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-    const inspectArgs = stripWorkspaceOption(rest);
-    const options = parseInspectArgs(inspectArgs);
-    const snapshot = await collectWorkspaceSnapshot(workspace);
-    const keyFilePreviews = options.includeKeyFiles ? await collectWorkspaceKeyFilePreviews(workspace, snapshot, {
-      maxFiles: options.maxKeyFiles,
-      maxLines: options.maxPreviewLines,
-      maxChars: options.maxPreviewChars,
-    }) : undefined;
-    const previewText = keyFilePreviews ? renderWorkspaceFilePreviews(keyFilePreviews) : "";
-    const text = [renderWorkspaceSnapshot(snapshot), previewText].filter(Boolean).join("\n\n");
-    if (options.json) {
-      console.log(JSON.stringify({ generatedAt: new Date().toISOString(), root: workspace, snapshot, keyFilePreviews, text }, null, 2));
-    } else {
-      console.log(text);
-    }
-    return;
-  }
-
-  if (command === "sessions") {
-    const workspace = await resolveInitialWorkspace(process.cwd(), rest);
-    const parsed = parseSessionListArgs(stripWorkspaceOption(rest));
-    const { store } = await createLocalPlatform(workspace);
-    try {
-      const list = await buildSessionList(store, parsed.options);
-      if (parsed.options.json) {
-        console.log(JSON.stringify(list, null, 2));
-      } else {
-        printSessionList(list);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "show-session") {
-    const sessionId = rest[0];
-    if (!sessionId) {
-      console.error("Missing session id.");
-      process.exitCode = 1;
-      return;
-    }
-    const workspace = await resolveInitialWorkspace(process.cwd(), rest.slice(1));
-    const { store } = await createLocalPlatform(workspace);
-    const session = await store.getSession(sessionId);
-    if (!session) {
-      console.error(`Session not found: ${sessionId}`);
-      store.close();
-      process.exitCode = 1;
-      return;
-    }
-    const messages = await store.getMessages(sessionId);
-    const toolResults = await store.getToolResults(sessionId);
-    console.log(JSON.stringify({ session, messages, toolResults }, null, 2));
-    store.close();
-    return;
-  }
-
-  if (command === "resume") {
-    const sessionId = rest[0];
-    if (!sessionId) {
-      console.error("Missing session id.");
-      process.exitCode = 1;
-      return;
-    }
-    let workspace: string;
-    let parsed: { options: RunPlatformOptions; cli: RunCliOptions };
-    try {
-      const resumeArgs = rest.slice(1);
-      workspace = await resolveInitialWorkspace(process.cwd(), resumeArgs);
-      parsed = parseResumeArgs(stripWorkspaceOption(resumeArgs));
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-      return;
-    }
-    if (parsed.cli.requireModelReady) {
-      const modelReadiness = await buildRunModelReadinessView(workspace, parsed.options);
-      if (!modelReadiness.ready) {
-        if (parsed.cli.json) {
-          console.log(JSON.stringify({
-            generatedAt: new Date().toISOString(),
-            status: "blocked",
-            workspace,
-            sessionId,
-            modelReadiness,
-          }, null, 2));
-        } else {
-          console.log("Model readiness gate failed.");
-          printModelCheckView(modelReadiness);
-        }
-        process.exitCode = 1;
-        return;
-      }
-    }
-    const { agent, store } = await createLocalPlatform(workspace, parsed.options);
-    try {
-      const finalAnswer = await agent.resume(sessionId);
-      const session = (await store.getSession(sessionId)) ?? undefined;
-      let sessionResult: Awaited<ReturnType<typeof buildSessionResult>> | undefined;
-      let verification: Awaited<ReturnType<typeof buildSessionVerification>> | undefined;
-      if (session && (parsed.cli.json || parsed.cli.sessionResult || parsed.cli.verifySession)) {
-        sessionResult = await buildSessionResult(store, session.id);
-      }
-      if (session && parsed.cli.verifySession) {
-        verification = await buildSessionVerification(store, session.id, {
-          requireChange: parsed.cli.requireChange,
-          requirePatch: parsed.cli.requirePatch,
-          requireRecovery: parsed.cli.requireRecovery,
-          requireTimeout: parsed.cli.requireTimeout,
-          requireDiffStat: parsed.cli.requireDiffStat,
-          requireReviewProfile: parsed.cli.requireReviewProfile,
-          requireModelCall: parsed.cli.requireModelCall,
-          requireNoPendingApprovals: parsed.cli.requireNoPendingApprovals,
-          requiredExecutionProfiles: parsed.cli.requiredExecutionProfiles,
-          requiredApprovalActions: parsed.cli.requiredApprovalActions,
-          requireCommand: parsed.cli.allowNoCommand !== true,
-        });
-      }
-      if (parsed.cli.json) {
-        console.log(JSON.stringify({
-          generatedAt: new Date().toISOString(),
-          workspace,
-          session,
-          finalAnswer,
-          result: sessionResult,
-          verification,
-          reviewCommands: session
-            ? {
-                review: `agent session review ${session.id}`,
-                result: `agent session result ${session.id}`,
-                verify: `agent session verify ${session.id}`,
-                diff: `agent session diff ${session.id}`,
-                report: `agent session report ${session.id} --json`,
-              }
-            : undefined,
-        }, null, 2));
-      } else {
-        console.log(finalAnswer);
-        if (session) {
-          console.log("");
-          console.log(`session: ${session.id}`);
-          console.log(`review: agent session review ${session.id}`);
-        }
-        if (sessionResult && parsed.cli.sessionResult) {
-          console.log("");
-          printSessionResult(sessionResult);
-        }
-        if (verification) {
-          console.log("");
-          printSessionVerification(verification);
-        }
-      }
-      if (verification?.status === "fail") {
-        process.exitCode = 1;
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "pause" || command === "cancel") {
-    const sessionId = rest[0];
-    const sessionArgs = rest.slice(1);
-    const workspace = await resolveInitialWorkspace(process.cwd(), sessionArgs);
-    const reason = stripWorkspaceOption(sessionArgs).join(" ").trim() || undefined;
-    if (!sessionId) {
-      console.error("Missing session id.");
-      process.exitCode = 1;
-      return;
-    }
-    const { tasks, store } = await createLocalPlatform(workspace);
-    const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
-    try {
-      const session =
-        command === "pause"
-          ? await tasks.pause({ sessionId, actor, reason })
-          : await tasks.cancel({ sessionId, actor, reason });
-      console.log(`${session.id}\t${session.status}\t${session.updatedAt}\t${session.objective}`);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "identity") {
-    const subcommand = rest[0] ?? "show";
-    const { identity, store } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "show" || subcommand === "init") {
-        const displayName = readOption(rest.slice(1), "--display-name");
-        const result = await identity.show();
-        const agent = displayName ? await identity.getOrCreate(displayName) : result.identity;
-        console.log(
-          JSON.stringify(
-            {
-              id: agent.id,
-              machineId: agent.machineId,
-              displayName: agent.displayName,
-              fingerprint: agent.fingerprint,
-              trustStatus: agent.trustStatus,
-              capabilities: agent.capabilities,
-              privateKeyPath: result.privateKeyPath,
-            },
-            null,
-            2,
-          ),
-        );
-        return;
-      }
-      console.error(`Unknown identity command: ${subcommand}`);
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "agents") {
-    const platform = await createLocalPlatform(process.cwd());
-    const { store, agentHealth } = platform;
-    try {
-      if (rest[0] === "health") {
-        const args = rest.slice(1);
-        const limit = Number(readOption(args, "--limit") ?? "1000");
-        const summary = await agentHealth.getSummary({
-          now: readOption(args, "--now"),
-          limit: Number.isFinite(limit) ? limit : 1000,
-        });
-        if (args.includes("--json")) {
-          console.log(JSON.stringify(summary, null, 2));
-        } else {
-          console.log(
-            `agents total=${summary.agents.total} responsive=${summary.agents.responsive} stale=${summary.agents.stale} failing=${summary.agents.failing}`,
-          );
-          for (const agent of summary.perAgent) {
-            console.log(
-              `${agent.agentId}\t${agent.healthState}\t${agent.trustStatus}\t${agent.machineId}\troom=${agent.lastRoomId ?? "-"}\theartbeat=${agent.lastHeartbeatAt ?? "-"}\t${agent.displayName}`,
-            );
-          }
-        }
-        return;
-      }
-      if (rest[0] === "recover-stale") {
-        const args = rest.slice(1);
-        const limit = Number(readOption(args, "--limit") ?? "1000");
-        const actor = args.includes("--local-agent")
-          ? agentActor(platform.localAgent)
-          : parseActorRef(readOption(args, "--actor"));
-        const result = await new ControlPlaneService(platform).recoverStaleAgents({
-          actor,
-          now: readOption(args, "--now"),
-          limit: Number.isFinite(limit) ? limit : 1000,
-        });
-        if (args.includes("--json")) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(
-            `stale recovery recovered=${result.summary.recovered} stale=${result.summary.stale} skipped=${result.summary.skipped}`,
-          );
-          for (const recovered of result.recovered) {
-            console.log(`${recovered.agentId}\troom=${recovered.roomId}\tmember=${recovered.memberStatusAfter}\theartbeat=${recovered.heartbeatStatusAfter}`);
-          }
-          for (const skipped of result.skipped) {
-            console.log(`${skipped.agentId}\tskipped=${skipped.reason}\troom=${skipped.roomId ?? "-"}`);
-          }
-        }
-        return;
-      }
-      if (rest[0] === "trust" || rest[0] === "set-trust") {
-        const args = rest.slice(1);
-        const agentId = args[0];
-        const trustStatus = args[1] ? parseAgentTrustStatus(args[1]) : undefined;
-        if (!agentId || !trustStatus) {
-          console.error("Usage: agent agents trust <agent-id> pending|trusted|suspended|revoked|expired [--reason text] [--local-agent|--actor user:id|agent:id] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const actor = args.includes("--local-agent")
-          ? agentActor(platform.localAgent)
-          : parseActorRef(readOption(args, "--actor"));
-        const result = await new ControlPlaneService(platform).updateAgentTrustStatus({
-          actor,
-          agentId,
-          trustStatus,
-          reason: readOption(args, "--reason"),
-        });
-        if (args.includes("--json")) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`${result.agent.id}\t${result.previousTrustStatus}->${result.agent.trustStatus}\t${result.agent.fingerprint}\t${result.agent.displayName}`);
-        }
-        return;
-      }
-      if (rest[0] === "rotate-key") {
-        const args = rest.slice(1);
-        const agentId = args[0];
-        const publicKeyFile = readOption(args, "--public-key-file");
-        if (!agentId || !publicKeyFile) {
-          console.error("Usage: agent agents rotate-key <agent-id> --public-key-file path [--fingerprint fingerprint] [--reason text] [--local-agent|--actor user:id|agent:id] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const actor = args.includes("--local-agent")
-          ? agentActor(platform.localAgent)
-          : parseActorRef(readOption(args, "--actor"));
-        const result = await new ControlPlaneService(platform).rotateAgentIdentityKey({
-          actor,
-          agentId,
-          publicKeyPem: await readUtf8(publicKeyFile),
-          fingerprint: readOption(args, "--fingerprint"),
-          reason: readOption(args, "--reason"),
-        });
-        if (args.includes("--json")) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`${result.agent.id}\t${result.previousFingerprint}->${result.agent.fingerprint}\ttrust=${result.agent.trustStatus}\t${result.agent.displayName}`);
-        }
-        return;
-      }
-      const limit = Number(readOption(rest, "--limit") ?? "20");
-      const agents = await store.listAgents(Number.isFinite(limit) ? limit : 20);
-      for (const agent of agents) {
-        console.log(`${agent.id}\t${agent.trustStatus}\t${agent.fingerprint}\t${agent.displayName}`);
-      }
-    } finally {
-      platform.locks.close();
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "operator") {
-    const subcommand = rest[0] ?? "status";
-    const args = subcommand === "status" || subcommand === "view" || subcommand === "show" ? rest.slice(1) : rest;
-    if (subcommand !== "status" && subcommand !== "view" && subcommand !== "show") {
-      console.error(`Unknown operator command: ${subcommand}`);
-      process.exitCode = 1;
-      return;
-    }
-    const options = parseOperatorArgs(args);
-    const platform = await createLocalPlatform(process.cwd());
-    const control = new ControlPlaneService(platform);
-    try {
-      const projectionRequest = { operatorProjection: options.publicView ? "public" as const : "diagnostic" as const, operatorActor: options.actor };
-      const state = await control.getState(projectionRequest);
-      const operatorView = state.operator;
-      if (subcommand === "show") {
-        const selectedItem = options.select === undefined ? undefined : selectOperatorItem(operatorView, options);
-        const itemId = selectedItem?.id ?? options.id ?? options.positionals[0];
-        if (!itemId) {
-          console.error("Usage: agent operator show <item-id-or-ref-id> [--select n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const detail = await control.getOperatorDetail(itemId, projectionRequest);
-        if (!detail.item) {
-          console.error(`Operator item not found: ${itemId}`);
-          process.exitCode = 1;
-          return;
-        }
-        if (options.json) {
-          console.log(JSON.stringify(detail, null, 2));
-        } else {
-          printOperatorDetail(detail);
-        }
-      } else if (options.json) {
-        console.log(JSON.stringify(operatorJsonView(operatorView, options), null, 2));
-      } else {
-        printOperatorView(operatorView, options);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      platform.locks.close?.();
-      platform.store.close?.();
-    }
-    return;
-  }
-
-  if (command === "remote") {
-    const subcommand = rest[0] ?? "help";
-    const args = rest.slice(1);
-    if (subcommand === "register") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl) {
-        console.error("Usage: agent remote register --control-url url [--control-token token] [--display-name name] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const shown = await identity.show();
-        const displayName = parsed.options.displayName ?? localAgent.displayName;
-        const actor = `agent:${localAgent.id}`;
-        const registration = await controlPlaneJson<{ agent: typeof localAgent }>(parsed.options.controlUrl, "/api/agents/register", controlToken, {
-          actor,
-          agentId: localAgent.id,
-          machineId: localAgent.machineId,
-          orgId: localAgent.orgId,
-          displayName,
-          publicKeyPem: localAgent.publicKeyPem,
-          fingerprint: localAgent.fingerprint,
-          capabilities: localAgent.capabilities,
-          allowedProjects: localAgent.allowedProjects,
-        });
-        const result = {
-          agent: registration.agent,
-          privateKeyPath: shown.privateKeyPath,
-        };
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`agent\t${registration.agent.id}\t${registration.agent.trustStatus}\t${registration.agent.fingerprint}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "enroll") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId || !parsed.options.inviteToken) {
-        console.error("Usage: agent remote enroll --control-url url [--control-token token] --room room-id --invite-token token [--alias alias] [--display-name name] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const shown = await identity.show();
-        const displayName = parsed.options.displayName ?? localAgent.displayName;
-        const actor = `agent:${localAgent.id}`;
-        const registration = await controlPlaneJson<{ agent: typeof localAgent }>(parsed.options.controlUrl, "/api/agents/register", controlToken, {
-          actor,
-          agentId: localAgent.id,
-          machineId: localAgent.machineId,
-          orgId: localAgent.orgId,
-          displayName,
-          publicKeyPem: localAgent.publicKeyPem,
-          fingerprint: localAgent.fingerprint,
-          capabilities: localAgent.capabilities,
-          allowedProjects: localAgent.allowedProjects,
-        });
-        const join = await controlPlaneJson<{ member: { actor: ActorRef; role: string; status: string; aliases?: string[] } }>(
-          parsed.options.controlUrl,
-          `/api/rooms/${encodeURIComponent(parsed.options.roomId)}/join-invite`,
-          controlToken,
-          {
-            actor,
-            token: parsed.options.inviteToken,
-            aliases: parsed.options.aliases,
-          },
-        );
-        const result = {
-          agent: registration.agent,
-          member: join.member,
-          privateKeyPath: shown.privateKeyPath,
-        };
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`agent\t${registration.agent.id}\t${registration.agent.trustStatus}\t${registration.agent.fingerprint}`);
-          console.log(`member\t${join.member.actor.type}:${join.member.actor.id}\t${join.member.role}\t${join.member.status}\t${(join.member.aliases ?? []).join(",")}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "join-bundle") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.inviteBundlePath) {
-        console.error("Usage: agent remote join-bundle --invite-bundle path [--control-token token] [--alias alias] [--display-name name] [--run] [--status-file path] [--stop-file path] [run options] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      let platform: Awaited<ReturnType<typeof createLocalPlatform>> | undefined;
-      try {
-        const bundle = await readRemoteInviteBundle(parsed.options.inviteBundlePath);
-        const controlUrl = parsed.options.controlUrl ?? bundle.controlUrl;
-        const controlToken = parsed.options.controlToken ?? bundle.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-        const roomId = parsed.options.roomId ?? bundle.roomId;
-        const inviteToken = parsed.options.inviteToken ?? bundle.inviteToken;
-        if (!controlUrl || !roomId || !inviteToken) {
-          throw new Error("Invite bundle is missing controlUrl, roomId, or inviteToken.");
-        }
-        if (!controlToken) {
-          throw new Error("Missing control token. Use --control-token, AGENT_CONTROL_TOKEN, or a bundle with controlToken.");
-        }
-        const stopFileLifecycle = parsed.options.stopFilePath
-          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
-          : undefined;
-        platform = await createLocalPlatform(process.cwd());
-        const { identity, localAgent } = platform;
-        const displayName = parsed.options.displayName ?? bundle.displayName ?? localAgent.displayName;
-        const aliases = parsed.options.aliases?.length ? parsed.options.aliases : bundle.aliases ?? [];
-        const actor = `agent:${localAgent.id}`;
-        const registration = await controlPlaneJson<{ agent: typeof localAgent }>(controlUrl, "/api/agents/register", controlToken, {
-          actor,
-          agentId: localAgent.id,
-          machineId: localAgent.machineId,
-          orgId: localAgent.orgId,
-          displayName,
-          publicKeyPem: localAgent.publicKeyPem,
-          fingerprint: localAgent.fingerprint,
-          capabilities: localAgent.capabilities,
-          allowedProjects: localAgent.allowedProjects,
-        });
-        const join = await controlPlaneJson<{ member: { actor: ActorRef; role: string; status: string; aliases?: string[] } }>(
-          controlUrl,
-          `/api/rooms/${encodeURIComponent(roomId)}/join-invite`,
-          controlToken,
-          {
-            actor,
-            token: inviteToken,
-            aliases,
-          },
-        );
-        const runner = new RemoteRoomRunner({
-          controlUrl,
-          token: controlToken,
-          roomId,
-          identity,
-          localAgent,
-        });
-        const heartbeat = await runner.heartbeat({
-          status: parsed.options.heartbeatStatus ?? "online",
-          ttlSeconds: parsed.options.ttlSeconds ?? bundle.defaultRun?.heartbeatTtlSeconds ?? 60,
-        });
-        const statusReporter = parsed.options.statusFilePath
-          ? createRemoteRunnerStatusReporter({
-              cwd: process.cwd(),
-              statusFilePath: parsed.options.statusFilePath,
-              roomId,
-              agentId: localAgent.id,
-              machineId: localAgent.machineId,
-            })
-          : undefined;
-        await statusReporter?.write({ status: parsed.options.runAfterJoin ? "starting" : "joined", messagesProcessed: 0, errorCount: 0 });
-        let runResult: RemoteRoomRunResult | undefined;
-        if (parsed.options.runAfterJoin) {
-          await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-          runResult = await runner.run({
-            maxCycles: parsed.options.maxCycles ?? bundle.defaultRun?.cycles ?? 10,
-            maxMessagesPerPoll: parsed.options.limit ?? bundle.defaultRun?.limit ?? 10,
-            maxIdlePolls: parsed.options.maxIdlePolls ?? bundle.defaultRun?.idleLimit ?? 1,
-            idleIntervalMs: parsed.options.idleIntervalMs ?? bundle.defaultRun?.intervalMs ?? 1000,
-            intervalMs: parsed.options.loopIntervalMs ?? bundle.defaultRun?.loopIntervalMs ?? 1000,
-            stopWhenIdle: parsed.options.stopWhenIdle ?? bundle.defaultRun?.stopWhenIdle ?? true,
-            maxIdleCycles: parsed.options.maxIdleCycles ?? bundle.defaultRun?.idleCycles ?? 1,
-            baseBackoffMs: parsed.options.baseBackoffMs ?? bundle.defaultRun?.backoffMs ?? 1000,
-            maxBackoffMs: parsed.options.maxBackoffMs ?? bundle.defaultRun?.maxBackoffMs ?? 30000,
-            maxErrors: parsed.options.maxErrors ?? bundle.defaultRun?.maxErrors ?? 3,
-            heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? bundle.defaultRun?.heartbeatTtlSeconds ?? 60,
-            lifecycle: stopFileLifecycle?.lifecycle,
-            onMessage: parsed.options.replyTemplate
-              ? async (message) => {
-                  await runner.say({
-                    kind: "chat",
-                    body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
-                      roomId,
-                      agentId: localAgent.id,
-                    }),
-                  });
-                }
-              : undefined,
-            onPoll: async (poll) => {
-              await statusReporter?.recordPoll(poll);
-              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            },
-            onError: async (error, cycle) => {
-              await statusReporter?.recordError(error, cycle);
-              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            },
-          });
-          await statusReporter?.recordStop(runResult);
-        }
-        const bootstrapEvidence = {
-          inviteBundleKind: bundle.kind,
-          inviteSignatureStatus: bundle.inviteSignatureStatus ?? "unknown",
-          joinedFromInviteBundle: join.member.actor.id === localAgent.id && join.member.status === "active",
-          ranFromInviteBundle: Boolean(runResult),
-        };
-        const result = {
-          agent: registration.agent,
-          member: join.member,
-          heartbeat,
-          run: runResult,
-          bootstrapEvidence,
-        };
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`agent\t${registration.agent.id}\t${registration.agent.trustStatus}\t${registration.agent.fingerprint}`);
-          console.log(`member\t${join.member.actor.type}:${join.member.actor.id}\t${join.member.role}\t${join.member.status}\t${(join.member.aliases ?? []).join(",")}`);
-          console.log(`heartbeat\t${heartbeat.agent.id}\t${heartbeat.agent.heartbeatStatus ?? "-"}\texpires=${heartbeat.agent.heartbeatExpiresAt ?? "-"}`);
-          console.log(`bootstrap\tbundle=${bootstrapEvidence.inviteBundleKind}\tsignature=${bootstrapEvidence.inviteSignatureStatus}\tjoined=${bootstrapEvidence.joinedFromInviteBundle}\tran=${bootstrapEvidence.ranFromInviteBundle}`);
-          if (runResult) {
-            console.log(`run\t${runResult.agentId}\t${runResult.stopReason}\tcycles=${runResult.cycles}\tprocessed=${runResult.messagesProcessed}\terrors=${runResult.errors.length}`);
-          }
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        platform?.locks.close();
-        platform?.store.close();
-      }
-      return;
-    }
-    if (subcommand === "invitations" || subcommand === "invites") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl) {
-        console.error("Usage: agent remote invitations --control-url url [--control-token token] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { localAgent, store, locks } = platform;
-      try {
-        const result = await controlPlaneGetJson<{
-          generatedAt: string;
-          agent: typeof localAgent;
-          invitations: Array<{ room: { id: string; name: string }; member: { role: string; status: string; aliases?: string[] } }>;
-        }>(parsed.options.controlUrl, `/api/agents/${encodeURIComponent(localAgent.id)}/room-invitations`, controlToken);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          for (const invitation of result.invitations) {
-            console.log(`${invitation.room.id}\t${invitation.member.role}\t${invitation.member.status}\taliases=${invitation.member.aliases?.join(",") ?? ""}\t${invitation.room.name}`);
-          }
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "accept-room") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote accept-room --control-url url [--control-token token] --room room-id [--alias alias] [--run] [--status-file path] [--stop-file path] [run options] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      let platform: Awaited<ReturnType<typeof createLocalPlatform>> | undefined;
-      try {
-        const stopFileLifecycle = parsed.options.stopFilePath
-          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
-          : undefined;
-        platform = await createLocalPlatform(process.cwd());
-        const { identity, localAgent } = platform;
-        const accept = await controlPlaneJson<{ member: { actor: ActorRef; role: string; status: string; aliases?: string[] } }>(
-          parsed.options.controlUrl,
-          `/api/rooms/${encodeURIComponent(parsed.options.roomId)}/members/${encodeURIComponent(localAgent.id)}/accept-invitation`,
-          controlToken,
-          {
-            actor: `agent:${localAgent.id}`,
-            aliases: parsed.options.aliases,
-          },
-        );
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const heartbeat = await runner.heartbeat({
-          status: parsed.options.heartbeatStatus ?? "online",
-          ttlSeconds: parsed.options.ttlSeconds ?? parsed.options.heartbeatTtlSeconds ?? 60,
-        });
-        const statusReporter = parsed.options.statusFilePath
-          ? createRemoteRunnerStatusReporter({
-              cwd: process.cwd(),
-              statusFilePath: parsed.options.statusFilePath,
-              roomId: parsed.options.roomId,
-              agentId: localAgent.id,
-              machineId: localAgent.machineId,
-            })
-          : undefined;
-        await statusReporter?.write({ status: parsed.options.runAfterJoin ? "starting" : "joined", messagesProcessed: 0, errorCount: 0 });
-        let runResult: RemoteRoomRunResult | undefined;
-        if (parsed.options.runAfterJoin) {
-          await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-          runResult = await runner.run({
-            maxCycles: parsed.options.maxCycles ?? 10,
-            maxMessagesPerPoll: parsed.options.limit ?? 10,
-            maxIdlePolls: parsed.options.maxIdlePolls ?? 1,
-            idleIntervalMs: parsed.options.idleIntervalMs ?? 1000,
-            intervalMs: parsed.options.loopIntervalMs ?? 1000,
-            stopWhenIdle: parsed.options.stopWhenIdle ?? true,
-            maxIdleCycles: parsed.options.maxIdleCycles ?? 1,
-            baseBackoffMs: parsed.options.baseBackoffMs ?? 1000,
-            maxBackoffMs: parsed.options.maxBackoffMs ?? 30000,
-            maxErrors: parsed.options.maxErrors ?? 3,
-            heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? 60,
-            lifecycle: stopFileLifecycle?.lifecycle,
-            onMessage: parsed.options.replyTemplate
-              ? async (message) => {
-                  await runner.say({
-                    kind: "chat",
-                    body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
-                      roomId: parsed.options.roomId!,
-                      agentId: localAgent.id,
-                    }),
-                  });
-                }
-              : undefined,
-            onPoll: async (poll) => {
-              await statusReporter?.recordPoll(poll);
-              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            },
-            onError: async (error, cycle) => {
-              await statusReporter?.recordError(error, cycle);
-              await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            },
-          });
-          await statusReporter?.recordStop(runResult);
-        }
-        const pullEvidence = {
-          acceptedFromRoomInvitation: accept.member.actor.id === localAgent.id && accept.member.status === "active",
-          ranFromRoomInvitation: Boolean(runResult),
-        };
-        const result = {
-          agent: localAgent,
-          member: accept.member,
-          heartbeat,
-          run: runResult,
-          pullEvidence,
-        };
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`member\t${accept.member.actor.type}:${accept.member.actor.id}\t${accept.member.role}\t${accept.member.status}\t${(accept.member.aliases ?? []).join(",")}`);
-          console.log(`heartbeat\t${heartbeat.agent.id}\t${heartbeat.agent.heartbeatStatus ?? "-"}\texpires=${heartbeat.agent.heartbeatExpiresAt ?? "-"}`);
-          console.log(`pull\taccepted=${pullEvidence.acceptedFromRoomInvitation}\tran=${pullEvidence.ranFromRoomInvitation}`);
-          if (runResult) {
-            console.log(`run\t${runResult.agentId}\t${runResult.stopReason}\tcycles=${runResult.cycles}\tprocessed=${runResult.messagesProcessed}\terrors=${runResult.errors.length}`);
-          }
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        platform?.locks.close();
-        platform?.store.close();
-      }
-      return;
-    }
-    if (subcommand === "inbox") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote inbox --control-url url [--control-token token] --room room-id [--limit n] [--include-delivered] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const inbox = await runner.inbox({ limit: parsed.options.limit ?? 50, includeDelivered: parsed.options.includeDelivered });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(inbox, null, 2));
-        } else {
-          for (const message of inbox.messages) {
-            console.log(`${message.id}\t${message.kind}\t${message.signatureStatus ?? "-"}\t${message.activationContext?.reason ?? "-"}\t${message.createdAt}\t${message.body.replace(/\s+/g, " ").slice(0, 160)}`);
-          }
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "say") {
-      const parsed = parseRemoteArgs(args);
-      const body = parsed.positionals.join(" ").trim();
-      if (!parsed.options.controlUrl || !parsed.options.roomId || !body) {
-        console.error("Usage: agent remote say --control-url url [--control-token token] --room room-id [--kind chat|task|decision|tool_request|approval|artifact|system] <message>");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const result = await runner.say({ kind: parsed.options.kind ?? "chat", body });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`${result.message.id}\t${result.message.roomId}\t${result.message.sender.type}:${result.message.sender.id}\t${result.message.kind}\t${result.message.body}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "ack") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote ack --control-url url [--control-token token] --room room-id [--message-id message-id] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const messageId = parsed.options.messageId ?? (await runner.latestInboxMessageId());
-        if (!messageId) {
-          throw new Error("No routed inbox message to acknowledge.");
-        }
-        const result = await runner.ack(messageId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`ack\t${result.cursor.agentId}\t${result.cursor.lastDeliveredMessageId}\t${result.cursor.lastAckEnvelope?.signature ? "signed" : "unsigned"}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "poll") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote poll --control-url url [--control-token token] --room room-id [--limit n] [--idle-limit n] [--interval-ms n] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const result = await runner.poll({
-          maxMessages: parsed.options.limit ?? 10,
-          maxIdlePolls: parsed.options.maxIdlePolls ?? 1,
-          idleIntervalMs: parsed.options.idleIntervalMs ?? 1000,
-          onMessage: parsed.options.json
-            ? undefined
-            : (message, ack) => {
-                console.log(`${message.id}\t${message.kind}\t${message.signatureStatus ?? "-"}\t${message.activationContext?.reason ?? "-"}\t${message.createdAt}\t${message.body.replace(/\s+/g, " ").slice(0, 160)}`);
-                console.log(`ack\t${ack.cursor.agentId}\t${ack.cursor.lastDeliveredMessageId}\t${ack.cursor.lastAckEnvelope?.signature ? "signed" : "unsigned"}`);
-              },
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`poll\t${result.agentId}\t${result.stopReason}\tprocessed=${result.messagesProcessed}\tidle=${result.idlePolls}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "heartbeat") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote heartbeat --control-url url [--control-token token] --room room-id [--status online|idle|running|error|offline] [--ttl seconds] [--last-error text] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const result = await runner.heartbeat({
-          status: parsed.options.heartbeatStatus ?? "online",
-          ttlSeconds: parsed.options.ttlSeconds ?? 60,
-          lastError: parsed.options.lastError,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`heartbeat\t${result.agent.id}\t${result.agent.heartbeatStatus ?? "-"}\texpires=${result.agent.heartbeatExpiresAt ?? "-"}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    if (subcommand === "service" || subcommand === "daemon") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote service --control-url url --room room-id [--control-token token] [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--heartbeat-ttl seconds] [--status-file path] [--stop-file path] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      try {
-        const plan = buildRemoteRoomServicePlan({
-          workspace: process.cwd(),
-          controlUrl: parsed.options.controlUrl,
-          roomId: parsed.options.roomId,
-          options: parsed.options,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(plan, null, 2));
-        } else {
-          printRemoteRoomServicePlan(plan);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "run") {
-      const parsed = parseRemoteArgs(args);
-      if (!parsed.options.controlUrl || !parsed.options.roomId) {
-        console.error("Usage: agent remote run --control-url url [--control-token token] --room room-id [--cycles n] [--limit n] [--idle-limit n] [--interval-ms n] [--loop-interval-ms n] [--stop-when-idle] [--idle-cycles n] [--backoff-ms n] [--max-backoff-ms n] [--max-errors n] [--heartbeat-ttl seconds] [--reply-template text] [--status-file path] [--stop-file path] [--json]");
-        process.exitCode = 1;
-        return;
-      }
-      const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-      if (!controlToken) {
-        console.error("Missing control token. Use --control-token or AGENT_CONTROL_TOKEN.");
-        process.exitCode = 1;
-        return;
-      }
-      const platform = await createLocalPlatform(process.cwd());
-      const { identity, localAgent, store, locks } = platform;
-      try {
-        const runner = new RemoteRoomRunner({
-          controlUrl: parsed.options.controlUrl,
-          token: controlToken,
-          roomId: parsed.options.roomId,
-          identity,
-          localAgent,
-        });
-        const statusReporter = parsed.options.statusFilePath
-          ? createRemoteRunnerStatusReporter({
-              cwd: process.cwd(),
-              statusFilePath: parsed.options.statusFilePath,
-              roomId: parsed.options.roomId,
-              agentId: localAgent.id,
-              machineId: localAgent.machineId,
-            })
-          : undefined;
-        await statusReporter?.write({ status: "starting", messagesProcessed: 0, errorCount: 0 });
-        const stopFileLifecycle = parsed.options.stopFilePath
-          ? createRemoteRunnerStopFileLifecycle(process.cwd(), parsed.options.stopFilePath)
-          : undefined;
-        await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-        const result = await runner.run({
-          maxCycles: parsed.options.maxCycles ?? 10,
-          maxMessagesPerPoll: parsed.options.limit ?? 10,
-          maxIdlePolls: parsed.options.maxIdlePolls ?? 1,
-          idleIntervalMs: parsed.options.idleIntervalMs ?? 1000,
-          intervalMs: parsed.options.loopIntervalMs ?? 1000,
-          stopWhenIdle: parsed.options.stopWhenIdle,
-          maxIdleCycles: parsed.options.maxIdleCycles ?? 1,
-          baseBackoffMs: parsed.options.baseBackoffMs ?? 1000,
-          maxBackoffMs: parsed.options.maxBackoffMs ?? 30000,
-          maxErrors: parsed.options.maxErrors ?? 3,
-          heartbeatTtlSeconds: parsed.options.heartbeatTtlSeconds ?? 60,
-          lifecycle: stopFileLifecycle?.lifecycle,
-          onMessage: parsed.options.replyTemplate
-            ? async (message) => {
-                const reply = await runner.say({
-                  kind: "chat",
-                  body: formatRemoteReplyTemplate(parsed.options.replyTemplate!, message, {
-                    roomId: parsed.options.roomId!,
-                    agentId: localAgent.id,
-                  }),
-                });
-                if (!parsed.options.json) {
-                  console.log(`reply\t${reply.message.id}\t${reply.message.kind}\t${reply.message.body}`);
-                }
-              }
-            : undefined,
-          onPoll: async (poll) => {
-            await statusReporter?.recordPoll(poll);
-            await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            if (!parsed.options.json) {
-                console.log(`cycle\t${poll.agentId}\t${poll.stopReason}\tprocessed=${poll.messagesProcessed}\tidle=${poll.idlePolls}`);
-                for (const ack of poll.acknowledgements) {
-                  console.log(`ack\t${poll.agentId}\t${ack.messageId}\t${ack.ackSignature ? "signed" : "unsigned"}`);
-                }
-            }
-          },
-          onError: async (error, cycle) => {
-            await statusReporter?.recordError(error, cycle);
-            await stopFileLifecycle?.requestShutdownIfStopFilePresent();
-            if (!parsed.options.json) {
-                console.error(`cycle-error\t${cycle}\t${error.message}`);
-            }
-          },
-        });
-        await statusReporter?.recordStop(result);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`run\t${result.agentId}\t${result.stopReason}\tcycles=${result.cycles}\tprocessed=${result.messagesProcessed}\terrors=${result.errors.length}`);
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        locks.close();
-        store.close();
-      }
-      return;
-    }
-    console.error(`Unknown remote command: ${subcommand}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  if (command === "workers") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { workers, workerRunner, workerHealth, store, localAgent, identity } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "register") {
-        const parsed = parseWorkerArgs(args);
-        const worker = await workers.register({
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          agentId: parsed.options.agentId ?? localAgent.id,
-          machineId: parsed.options.machineId ?? localAgent.machineId,
-          orgId: parsed.options.orgId ?? localAgent.orgId,
-          displayName: parsed.options.displayName ?? localAgent.displayName,
-          endpoint: parsed.options.endpoint,
-          capabilities: parsed.options.capabilities,
-          allowedProjects: parsed.options.allowedProjects,
-          maxConcurrentTasks: parsed.options.maxConcurrentTasks,
-          metadata: parsed.options.metadataJson ? (JSON.parse(parsed.options.metadataJson) as Record<string, unknown>) : undefined,
-          ttlSeconds: parsed.options.ttlSeconds,
-        });
-        printWorker(worker);
-        return;
-      }
-      if (subcommand === "heartbeat") {
-        const parsed = parseWorkerArgs(args);
-        const workerId = parsed.positionals[0];
-        if (!workerId) {
-          console.error("Usage: agent workers heartbeat <worker-id> [--status online|offline|draining|suspended] [--load n] [--max-tasks n] [--ttl seconds]");
-          process.exitCode = 1;
-          return;
-        }
-        const worker = await workers.heartbeat({
-          workerId,
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          status: parsed.options.status,
-          currentLoad: parsed.options.currentLoad,
-          maxConcurrentTasks: parsed.options.maxConcurrentTasks,
-          metadata: parsed.options.metadataJson ? (JSON.parse(parsed.options.metadataJson) as Record<string, unknown>) : undefined,
-          ttlSeconds: parsed.options.ttlSeconds,
-        });
-        printWorker(worker);
-        return;
-      }
-      if (subcommand === "drain") {
-        const parsed = parseWorkerArgs(args);
-        const workerId = parsed.positionals[0];
-        const reason = parsed.positionals.slice(1).join(" ").trim() || undefined;
-        if (!workerId) {
-          console.error("Usage: agent workers drain <worker-id> [reason] [--ttl seconds] [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const worker = await workers.drain({
-          workerId,
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          reason,
-          ttlSeconds: parsed.options.ttlSeconds,
-        });
-        printWorker(worker);
-        return;
-      }
-      if (subcommand === "complete-drain") {
-        const parsed = parseWorkerArgs(args);
-        const workerId = parsed.positionals[0];
-        const reason = parsed.positionals.slice(1).join(" ").trim() || undefined;
-        if (!workerId) {
-          console.error("Usage: agent workers complete-drain <worker-id> [reason] [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const worker = await workers.completeDrain({
-          workerId,
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          reason,
-        });
-        printWorker(worker);
-        return;
-      }
-      if (subcommand === "verify-heartbeat") {
-        const workerId = args[0];
-        if (!workerId) {
-          console.error("Usage: agent workers verify-heartbeat <worker-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const worker = await workers.get(workerId);
-        if (!worker) {
-          console.error(`Worker not found: ${workerId}`);
-          process.exitCode = 1;
-          return;
-        }
-        const envelope = worker.metadata?.heartbeatEnvelope;
-        if (!isWorkerHeartbeatEnvelope(envelope)) {
-          console.log("unsigned");
-          return;
-        }
-        const status = await identity.verifyWorkerHeartbeatEnvelope(envelope);
-        console.log(status);
-        if (status !== "valid") {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      if (subcommand === "recover-expired") {
-        const parsed = parseWorkerArgs(args);
-        const result = await workers.recoverExpired({
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          limit: parsed.options.limit,
-        });
-        for (const worker of result.expired) {
-          console.log(`${worker.id}\t${worker.status}\texpiredAt=${worker.metadata?.expiredAt ?? "-"}\t${worker.displayName}`);
-        }
-        if (result.expired.length === 0) {
-          console.log("no expired workers");
-        }
-        return;
-      }
-      if (subcommand === "cleanup-nonces") {
-        const parsed = parseWorkerArgs(args);
-        const result = await workers.cleanupHeartbeatNonces({
-          actor: parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor),
-          before: parsed.options.before,
-          limit: parsed.options.limit,
-        });
-        console.log(`deleted=${result.deleted}\tbefore=${result.before}`);
-        return;
-      }
-      if (subcommand === "health") {
-        const parsed = parseWorkerArgs(args);
-        const summary = await workerHealth.getSummary({
-          now: parsed.options.now,
-          limit: parsed.options.limit,
-        });
-        console.log(JSON.stringify(summary, null, 2));
-        return;
-      }
-      if (subcommand === "run-once") {
-        const parsed = parseWorkerArgs(args);
-        const workerId = parsed.positionals[0];
-        if (!workerId) {
-          console.error("Usage: agent workers run-once <worker-id> [--ttl seconds] [--require-signed-lease] [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await workerRunner.runOnce({
-          workerId,
-          leaseTtlSeconds: parsed.options.ttlSeconds,
-          actor: parsed.options.actor ? parseActorRef(parsed.options.actor) : agentActor(localAgent),
-          requireSignedLeaseEnvelope: parsed.options.requireSignedLeaseEnvelope,
-        });
-        printWorkerRunOnce(result);
-        return;
-      }
-      if (subcommand === "poll") {
-        const parsed = parseWorkerArgs(args);
-        const workerId = parsed.positionals[0];
-        if (!workerId) {
-          console.error("Usage: agent workers poll <worker-id> [--limit n] [--idle-limit n] [--interval-ms n] [--ttl seconds] [--require-signed-lease] [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await workerRunner.poll({
-          workerId,
-          leaseTtlSeconds: parsed.options.ttlSeconds,
-          actor: parsed.options.actor ? parseActorRef(parsed.options.actor) : agentActor(localAgent),
-          maxRuns: parsed.options.limit,
-          maxIdlePolls: parsed.options.maxIdlePolls,
-          idleIntervalMs: parsed.options.idleIntervalMs,
-          requireSignedLeaseEnvelope: parsed.options.requireSignedLeaseEnvelope,
-        });
-        printWorkerPoll(result);
-        return;
-      }
-      if (subcommand === "list") {
-        const parsed = parseWorkerArgs(args);
-        const all = await workers.list({
-          status: parsed.options.status,
-          agentId: parsed.options.agentId,
-          machineId: parsed.options.machineId,
-          orgId: parsed.options.orgId,
-          projectId: parsed.options.projectId,
-          limit: parsed.options.limit,
-        });
-        for (const worker of all) {
-          printWorker(worker);
-        }
-        return;
-      }
-      console.error(`Unknown workers command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "scheduler") {
-    const subcommand = rest[0] ?? "tick";
-    const args = rest.slice(1);
-    const { scheduler, store, localAgent } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "tick") {
-        const parsed = parseSchedulerArgs(args);
-        const result = await scheduler.tick({
-          actor: parsed.options.actor ? parseActorRef(parsed.options.actor) : agentActor(localAgent),
-          workerId: parsed.options.workerId,
-          requireSignedWorkerHeartbeat: parsed.options.requireSignedWorkerHeartbeat,
-          requireSignedLeaseEnvelope: parsed.options.requireSignedLeaseEnvelope,
-          leaseTtlSeconds: parsed.options.leaseTtlSeconds,
-          maxAttempts: parsed.options.maxAttempts,
-          baseBackoffMs: parsed.options.baseBackoffMs,
-          maxBackoffMs: parsed.options.maxBackoffMs,
-          jitterMs: parsed.options.jitterMs,
-          recoverLimit: parsed.options.recoverLimit,
-          maxRunsPerWorker: parsed.options.maxRunsPerWorker,
-          maxIdlePolls: parsed.options.maxIdlePolls,
-          idleIntervalMs: parsed.options.idleIntervalMs,
-          dispatchSpecId: parsed.options.dispatchSpecId,
-          dispatchLimit: parsed.options.dispatchLimit,
-          dispatchWorkerId: parsed.options.dispatchWorkerId,
-          dispatchAutoSelectWorker: parsed.options.dispatchAutoSelectWorker,
-          dispatchPriority: parsed.options.dispatchPriority,
-          dispatchMaxLoadRatio: parsed.options.dispatchMaxLoadRatio,
-          dispatchMaxQueuedAssignmentsPerWorker: parsed.options.dispatchMaxQueuedAssignmentsPerWorker,
-          completeDrainedWorkers: parsed.options.completeDrainedWorkers,
-          warnLoadRatio: parsed.options.warnLoadRatio,
-          warnQueueRatio: parsed.options.warnQueueRatio,
-        });
-        printSchedulerTick(result);
-        return;
-      }
-      if (subcommand === "run") {
-        const parsed = parseSchedulerArgs(args);
-        const controller = new AbortController();
-        const stop = () => controller.abort();
-        process.once("SIGINT", stop);
-        process.once("SIGTERM", stop);
-        try {
-          const result = await scheduler.run({
-            actor: parsed.options.actor ? parseActorRef(parsed.options.actor) : agentActor(localAgent),
-            workerId: parsed.options.workerId,
-            requireSignedWorkerHeartbeat: parsed.options.requireSignedWorkerHeartbeat,
-            requireSignedLeaseEnvelope: parsed.options.requireSignedLeaseEnvelope,
-            leaseTtlSeconds: parsed.options.leaseTtlSeconds,
-            maxAttempts: parsed.options.maxAttempts,
-            baseBackoffMs: parsed.options.baseBackoffMs,
-            maxBackoffMs: parsed.options.maxBackoffMs,
-            jitterMs: parsed.options.jitterMs,
-            recoverLimit: parsed.options.recoverLimit,
-            maxRunsPerWorker: parsed.options.maxRunsPerWorker,
-            maxIdlePolls: parsed.options.maxIdlePolls,
-            idleIntervalMs: parsed.options.idleIntervalMs,
-            dispatchSpecId: parsed.options.dispatchSpecId,
-            dispatchLimit: parsed.options.dispatchLimit,
-            dispatchWorkerId: parsed.options.dispatchWorkerId,
-            dispatchAutoSelectWorker: parsed.options.dispatchAutoSelectWorker,
-            dispatchPriority: parsed.options.dispatchPriority,
-            dispatchMaxLoadRatio: parsed.options.dispatchMaxLoadRatio,
-            dispatchMaxQueuedAssignmentsPerWorker: parsed.options.dispatchMaxQueuedAssignmentsPerWorker,
-            completeDrainedWorkers: parsed.options.completeDrainedWorkers,
-            warnLoadRatio: parsed.options.warnLoadRatio,
-            warnQueueRatio: parsed.options.warnQueueRatio,
-            intervalMs: parsed.options.intervalMs,
-            maxTicks: parsed.options.maxTicks,
-            stopWhenIdle: parsed.options.stopWhenIdle,
-            idleTickLimit: parsed.options.idleTickLimit,
-            signal: controller.signal,
-          });
-          printSchedulerRun(result);
-        } finally {
-          process.off("SIGINT", stop);
-          process.off("SIGTERM", stop);
-        }
-        return;
-      }
-      console.error(`Unknown scheduler command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "assignments") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { assignments, store } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "assign-session" || subcommand === "assign-subtask") {
-        const parsed = parseAssignmentArgs(args);
-        const targetId = parsed.positionals[0];
-        if (!targetId || !parsed.options.workerId) {
-          console.error(`Usage: agent assignments ${subcommand} <${subcommand === "assign-session" ? "session" : "subtask"}-id> --worker worker-id [--ttl seconds] [--priority n]`);
-          process.exitCode = 1;
-          return;
-        }
-        const assignment = await assignments.assign({
-          actor: parseActorRef(parsed.options.actor),
-          workerId: parsed.options.workerId,
-          sessionId: subcommand === "assign-session" ? targetId : undefined,
-          subtaskId: subcommand === "assign-subtask" ? targetId : undefined,
-          leaseTtlSeconds: parsed.options.leaseTtlSeconds,
-          priority: parsed.options.priority,
-          metadata: parsed.options.metadataJson ? (JSON.parse(parsed.options.metadataJson) as Record<string, unknown>) : undefined,
-        });
-        printAssignment(assignment);
-        return;
-      }
-      if (subcommand === "heartbeat") {
-        const parsed = parseAssignmentArgs(args);
-        const assignmentId = parsed.positionals[0];
-        if (!assignmentId || !parsed.options.workerId) {
-          console.error("Usage: agent assignments heartbeat <assignment-id> --worker worker-id [--ttl seconds]");
-          process.exitCode = 1;
-          return;
-        }
-        const assignment = await assignments.heartbeat({
-          actor: parseActorRef(parsed.options.actor),
-          assignmentId,
-          workerId: parsed.options.workerId,
-          leaseTtlSeconds: parsed.options.leaseTtlSeconds,
-          metadata: parsed.options.metadataJson ? (JSON.parse(parsed.options.metadataJson) as Record<string, unknown>) : undefined,
-        });
-        printAssignment(assignment);
-        return;
-      }
-      if (subcommand === "complete" || subcommand === "fail" || subcommand === "cancel") {
-        const parsed = parseAssignmentArgs(args);
-        const assignmentId = parsed.positionals[0];
-        const resultSummary = parsed.positionals.slice(1).join(" ").trim() || undefined;
-        if (!assignmentId || !parsed.options.workerId) {
-          console.error(`Usage: agent assignments ${subcommand} <assignment-id> --worker worker-id [summary]`);
-          process.exitCode = 1;
-          return;
-        }
-        const assignment = await assignments.complete({
-          actor: parseActorRef(parsed.options.actor),
-          assignmentId,
-          workerId: parsed.options.workerId,
-          status: subcommand === "complete" ? "completed" : subcommand === "fail" ? "failed" : "cancelled",
-          resultSummary,
-        });
-        printAssignment(assignment);
-        return;
-      }
-      if (subcommand === "list") {
-        const parsed = parseAssignmentArgs(args);
-        const all = await assignments.list({
-          status: parsed.options.status,
-          workerId: parsed.options.workerId,
-          sessionId: parsed.options.sessionId,
-          subtaskId: parsed.options.subtaskId,
-          projectId: parsed.options.projectId,
-          roomId: parsed.options.roomId,
-          limit: parsed.options.limit,
-        });
-        for (const assignment of all) {
-          printAssignment(assignment);
-        }
-        return;
-      }
-      if (subcommand === "recover-expired") {
-        const parsed = parseAssignmentArgs(args);
-        const result = await assignments.recoverExpired({
-          actor: parseActorRef(parsed.options.actor),
-          retryWorkerId: parsed.options.retryWorkerId,
-          autoSelectRetryWorker: parsed.options.autoSelectRetryWorker,
-          leaseTtlSeconds: parsed.options.leaseTtlSeconds,
-          maxAttempts: parsed.options.maxAttempts,
-          baseBackoffMs: parsed.options.baseBackoffMs,
-          maxBackoffMs: parsed.options.maxBackoffMs,
-          jitterMs: parsed.options.jitterMs,
-          limit: parsed.options.limit,
-          exhaustedTargetStatus: parsed.options.exhaustedTargetStatus,
-          metadata: parsed.options.metadataJson ? (JSON.parse(parsed.options.metadataJson) as Record<string, unknown>) : undefined,
-        });
-        printAssignmentRecovery(result);
-        return;
-      }
-      if (subcommand === "cleanup-nonces") {
-        const parsed = parseAssignmentArgs(args);
-        const result = await assignments.cleanupLeaseNonces({
-          actor: parseActorRef(parsed.options.actor),
-          before: parsed.options.before,
-          limit: parsed.options.limit,
-        });
-        console.log(`deleted=${result.deleted}\tbefore=${result.before}`);
-        return;
-      }
-      console.error(`Unknown assignments command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "orgs") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { organizations, store } = await createLocalPlatform(process.cwd());
-    const actor = localUserActor();
-    try {
-      if (subcommand === "create") {
-        const name = args.join(" ").trim();
-        if (!name) {
-          console.error("Usage: agent orgs create <name>");
-          process.exitCode = 1;
-          return;
-        }
-        const org = await organizations.createOrganization({ name, createdBy: actor });
-        console.log(`${org.id}\t${org.status}\t${org.name}`);
-        return;
-      }
-      if (subcommand === "list") {
-        for (const org of await organizations.listOrganizations()) {
-          console.log(`${org.id}\t${org.status}\t${org.createdAt}\t${org.name}`);
-        }
-        return;
-      }
-      if (subcommand === "project-create") {
-        const orgId = args[0];
-        const parsed = parseOrgArgs(args.slice(1));
-        const name = parsed.positionals.join(" ").trim();
-        if (!orgId || !name) {
-          console.error("Usage: agent orgs project-create <org-id> [--default-role viewer|member|admin] <name>");
-          process.exitCode = 1;
-          return;
-        }
-        const project = await organizations.createProject({
-          orgId,
-          name,
-          defaultRole: parsed.options.defaultRole,
-          retentionPolicyId: parsed.options.retentionPolicyId,
-          createdBy: actor,
-        });
-        console.log(`${project.id}\t${project.orgId}\t${project.status}\t${project.name}`);
-        return;
-      }
-      if (subcommand === "projects") {
-        const orgId = args[0];
-        for (const project of await organizations.listProjects(orgId)) {
-          console.log(`${project.id}\t${project.orgId}\t${project.status}\t${project.createdAt}\t${project.name}`);
-        }
-        return;
-      }
-      if (subcommand === "grant") {
-        const [scopeType, scopeId, subject, capability] = args;
-        const parsed = parseOrgArgs(args.slice(4));
-        if (!scopeType || !scopeId || !subject || !capability) {
-          console.error("Usage: agent orgs grant <organization|project|room|session|operator> <scope-id> <user:id|agent:id|service_account:id> <capability> [--expires-at iso]");
-          process.exitCode = 1;
-          return;
-        }
-        const subjectRef = parseCapabilitySubject(subject);
-        const scope = parseCapabilityScope(scopeType);
-        const grant = await organizations.grantCapability({
-          subjectType: subjectRef.subjectType,
-          subjectId: subjectRef.subjectId,
-          scopeType: scope,
-          scopeId,
-          capability,
-          expiresAt: parsed.options.expiresAt,
-          grantedBy: actor,
-        });
-        console.log(`${grant.scopeType}:${grant.scopeId}\t${grant.subjectType}:${grant.subjectId}\t${grant.capability}\texpires=${grant.expiresAt ?? "-"}`);
-        return;
-      }
-      if (subcommand === "grants") {
-        const parsed = parseOrgArgs(args);
-        const subjectRef = parsed.options.subject ? parseCapabilitySubject(parsed.options.subject) : undefined;
-        const grants = await organizations.listCapabilityGrants({
-          subjectType: subjectRef?.subjectType,
-          subjectId: subjectRef?.subjectId,
-          scopeType: parsed.options.scopeType,
-          scopeId: parsed.options.scopeId,
-        });
-        for (const grant of grants) {
-          console.log(`${grant.scopeType}:${grant.scopeId}\t${grant.subjectType}:${grant.subjectId}\t${grant.capability}\tby=${grant.grantedBy}\texpires=${grant.expiresAt ?? "-"}`);
-        }
-        return;
-      }
-      if (subcommand === "can") {
-        const [scopeType, scopeId, subject, capability] = args;
-        if (!scopeType || !scopeId || !subject || !capability) {
-          console.error("Usage: agent orgs can <organization|project|room|session|operator> <scope-id> <user:id|agent:id|service_account:id> <capability>");
-          process.exitCode = 1;
-          return;
-        }
-        const subjectRef = parseCapabilitySubject(subject);
-        const scope = parseCapabilityScope(scopeType);
-        const ok = await organizations.hasCapability({
-          subjectType: subjectRef.subjectType,
-          subjectId: subjectRef.subjectId,
-          scopeType: scope,
-          scopeId,
-          capability,
-        });
-        console.log(ok ? "allow" : "deny");
-        return;
-      }
-      console.error(`Unknown orgs command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "retention") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { lifecycle, store } = await createLocalPlatform(process.cwd());
-    const actor = localUserActor();
-    try {
-      if (subcommand === "create") {
-        const parsed = parseRetentionArgs(args);
-        const name = parsed.positionals.join(" ").trim();
-        if (!name) {
-          console.error("Usage: agent retention create <name> [--hot-days n] [--artifact-days n] [--audit-days n] [--no-auto-summaries] [--no-user-delete] [--no-audit-export]");
-          process.exitCode = 1;
-          return;
-        }
-        const policy = await lifecycle.createRetentionPolicy({
-          name,
-          hotTranscriptDays: parsed.options.hotTranscriptDays ?? 30,
-          artifactRetentionDays: parsed.options.artifactRetentionDays ?? 90,
-          auditRetentionDays: parsed.options.auditRetentionDays ?? 365,
-          enableAutoSummaries: parsed.options.enableAutoSummaries ?? true,
-          allowUserDeletion: parsed.options.allowUserDeletion ?? true,
-          allowAuditExport: parsed.options.allowAuditExport ?? true,
-        }, actor);
-        console.log(`${policy.id}\t${policy.name}\thot=${policy.hotTranscriptDays}\tartifacts=${policy.artifactRetentionDays}\taudit=${policy.auditRetentionDays}`);
-        return;
-      }
-      if (subcommand === "list") {
-        for (const policy of await store.listRetentionPolicies()) {
-          console.log(
-            `${policy.id}\t${policy.name}\thot=${policy.hotTranscriptDays}\tartifacts=${policy.artifactRetentionDays}\taudit=${policy.auditRetentionDays}\tauto=${policy.enableAutoSummaries}\tdelete=${policy.allowUserDeletion}`,
-          );
-        }
-        return;
-      }
-      if (subcommand === "assign") {
-        const [projectId, policyId] = args;
-        if (!projectId || !policyId) {
-          console.error("Usage: agent retention assign <project-id> <policy-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const project = await lifecycle.assignProjectPolicy(projectId, policyId, actor);
-        console.log(`${project.id}\tretention=${project.retentionPolicyId ?? "-"}`);
-        return;
-      }
-      if (subcommand === "apply") {
-        const projectId = args[0];
-        if (!projectId) {
-          console.error("Usage: agent retention apply <project-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await lifecycle.applyProjectRetention(projectId, actor);
-        console.log(
-          `${result.projectId}\tpolicy=${result.policy.id}\tsessions_compacted=${result.sessionsCompacted}\tartifacts_deleted=${result.artifactsDeleted}\taudit_deleted=${result.auditEventsDeleted}`,
-        );
-        return;
-      }
-      console.error(`Unknown retention command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "git") {
-    const subcommand = rest[0] ?? "status";
-    const { git, store } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "status") {
-        console.log(JSON.stringify(await git.status(readOption(rest.slice(1), "--remote") ?? "origin"), null, 2));
-        return;
-      }
-      console.error(`Unknown git command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "pr") {
-    const subcommand = rest[0] ?? "prepare";
-    if (subcommand !== "prepare") {
-      console.error(`Unknown pr command: ${subcommand}`);
-      process.exitCode = 1;
-      return;
-    }
-    const parsed = await parsePrArgs(rest.slice(1));
-    const { git, policy, store } = await createLocalPlatform(process.cwd());
-    const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
-    try {
-      if (!parsed.input.dryRun) {
-        await ensureGitPolicyAllowed({
-          action: "git.branch.create",
-          mode: parsed.executionMode,
-          actor,
-          policy,
-          store,
-          summary: `Create or switch PR branch ${parsed.input.branch ?? "(auto)"}`,
-        });
-        if (parsed.input.commit) {
-          await ensureGitPolicyAllowed({
-            action: "git.commit.create",
-            mode: parsed.executionMode,
-            actor,
-            policy,
-            store,
-            summary: `Create PR commit for ${parsed.input.title}`,
-          });
-        }
-        if (parsed.input.push) {
-          await ensureGitPolicyAllowed({
-            action: "git.push",
-            mode: parsed.executionMode,
-            actor,
-            policy,
-            store,
-            summary: `Push PR branch ${parsed.input.branch ?? "(auto)"}`,
-          });
-        }
-      }
-      const result = await git.preparePullRequest(parsed.input);
-      console.log(JSON.stringify(result, null, 2));
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "secrets") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { secrets, secretBroker, redactor, store } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "put") {
-        const parsed = parseSecretArgs(args);
-        const name = parsed.positionals[0];
-        if (!name) {
-          console.error("Usage: agent secrets put <name> --class model_api_key --scope-type workspace --scope-id local --value-env ENV_NAME");
-          process.exitCode = 1;
-          return;
-        }
-        const value = await secretValueFromOptions(parsed.options);
-        const ref = await secrets.putSecret({
-          name,
-          class: parsed.options.class ?? "environment_secret",
-          scopeType: parsed.options.scopeType ?? "workspace",
-          scopeId: parsed.options.scopeId ?? "local",
-          value,
-        });
-        await redactor.registerKnownSecret(ref.name, value);
-        console.log(`${ref.id}\t${ref.class}\t${ref.scopeType}:${ref.scopeId}\t${ref.name}`);
-        return;
-      }
-      if (subcommand === "get") {
-        const parsed = parseSecretArgs(args);
-        const id = parsed.positionals[0];
-        if (!id) {
-          console.error("Usage: agent secrets get <secret-id> [--purpose text] [--reveal] [--execution-mode strict|balanced|trusted|full_access]");
-          process.exitCode = 1;
-          return;
-        }
-        const lease = await secretBroker.getSecret({
-          id,
-          purpose: parsed.options.purpose ?? "manual_cli_access",
-          actor: { type: "user", id: "local-user", displayName: "Local User" },
-          mode: parsed.options.executionMode ?? "full_access",
-          scope: {},
-          metadata: {
-            consumer: "cli.secrets.get",
-            reveal: Boolean(parsed.options.reveal),
-          },
-        });
-        try {
-          if (parsed.options.reveal) {
-            console.log(lease.value);
-          } else {
-            console.log(`${lease.ref.id}\t${lease.ref.class}\t${lease.ref.scopeType}:${lease.ref.scopeId}\t${lease.ref.name}\tlease=${lease.leaseId}\texpires=${lease.expiresAt}`);
-          }
-        } finally {
-          await secretBroker.revokeLease(lease.leaseId);
-        }
-        return;
-      }
-      if (subcommand === "delete") {
-        const id = args[0];
-        if (!id) {
-          console.error("Usage: agent secrets delete <secret-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const deleted = secrets.deleteSecret ? await secrets.deleteSecret(id) : false;
-        console.log(deleted ? "deleted" : "not found");
-        return;
-      }
-      if (subcommand === "list") {
-        const refs = secrets.listSecrets ? await secrets.listSecrets() : [];
-        for (const ref of refs) {
-          console.log(`${ref.id}\t${ref.class}\t${ref.scopeType}:${ref.scopeId}\t${ref.name}`);
-        }
-        return;
-      }
-      console.error(`Unknown secrets command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "models") {
-    const area = rest[0] ?? "profiles";
-    try {
-      if (area === "usage") {
-        const parsed = parseModelUsageArgs(rest.slice(1));
-        const { store, locks } = await createLocalPlatform(process.cwd());
-        try {
-          const summary = await new ModelUsageService(store).summarize({
-            filters: parsed.filters,
-            provider: parsed.options.provider,
-            model: parsed.options.model,
-            inputCostPerMillionTokens: parsed.options.inputCostPerMillionTokens,
-            outputCostPerMillionTokens: parsed.options.outputCostPerMillionTokens,
-          });
-          if (parsed.options.json) {
-            console.log(JSON.stringify(summary, null, 2));
-          } else {
-            for (const entry of summary.entries) {
-              console.log(formatModelUsageEntry(entry));
-            }
-            console.log(`total\t*\t${formatModelUsageStats(summary.totals)}`);
-          }
-        } finally {
-          locks.close();
-          store.close();
-        }
-        return;
-      }
-      if (area === "setup") {
-        const parsed = parseModelProfileArgs(rest.slice(1));
-        const providerInput = parsed.options.providerInput ?? parsed.positionals[0];
-        let providerName = parsed.options.provider ?? (providerInput ? parseModelProviderName(providerInput) : undefined);
-        if (!providerName && stdin.isTTY) {
-          const promptedProvider = (await promptLine("Provider [openai]: ")) || "openai";
-          parsed.options.providerInput = promptedProvider;
-          providerName = parseModelProviderName(promptedProvider);
-        }
-        if (!providerName) {
-          console.error("Usage: soloclaw models setup --provider <provider> [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]");
-          process.exitCode = 1;
-          return;
-        }
-        const current = (await new LocalProviderProfileStore(`${process.cwd()}/.agent`).list()).find((profile) => profile.name === providerName);
-        if (!current) {
-          throw new Error(`Unknown model provider: ${providerName}`);
-        }
-        const profiles = new LocalProviderProfileStore(`${process.cwd()}/.agent`);
-        const profile = await profiles.set({
-          name: providerName,
-          protocol: parsed.options.protocol ?? current.protocol,
-          defaultBaseUrl: parsed.options.baseUrl ?? localModelAliasBaseUrl(parsed.options.providerInput ?? providerInput) ?? current.defaultBaseUrl,
-          defaultModel: parsed.options.model ?? current.defaultModel,
-          apiKeyEnvNames: resolveModelApiKeyEnvNames(parsed.options, parsed.options.providerInput ?? providerInput, current.apiKeyEnvNames),
-          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
-        });
-        if (parsed.options.setDefault || parsed.options.setDefault === undefined) {
-          await profiles.setDefaultProvider(providerName);
-        }
-        const defaultProvider = await profiles.getDefaultProvider();
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}\tdefault=${defaultProvider ?? "-"}`);
-        console.log(`config=${profiles.filePath}`);
-        return;
-      }
-      if (area !== "profiles") {
-        console.error(`Unknown models command: ${area}`);
-        process.exitCode = 1;
-        return;
-      }
-      const subcommand = rest[1] ?? "list";
-      const parsed = parseModelProfileArgs(rest.slice(2));
-      const profiles = new LocalProviderProfileStore(`${process.cwd()}/.agent`);
-      if (subcommand === "list") {
-        const listed = await profiles.list();
-        const defaultProvider = await profiles.getDefaultProvider();
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ profiles: listed, defaultProvider, configPath: profiles.filePath }, null, 2));
-        } else {
-          for (const profile of listed) {
-            console.log(
-              `${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}${profile.name === defaultProvider ? "\tdefault" : ""}`,
-            );
-          }
-        }
-        return;
-      }
-      if (subcommand === "set") {
-        const providerName = parsed.positionals[0];
-        if (!providerName) {
-          console.error("Usage: agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id]");
-          process.exitCode = 1;
-          return;
-        }
-        const name = parseModelProviderName(providerName);
-        const current = (await profiles.list()).find((profile) => profile.name === name);
-        if (!current) {
-          throw new Error(`Unknown model provider: ${name}`);
-        }
-        const profile = await profiles.set({
-          name,
-          protocol: parsed.options.protocol ?? current.protocol,
-          defaultBaseUrl: parsed.options.baseUrl ?? current.defaultBaseUrl,
-          defaultModel: parsed.options.model ?? current.defaultModel,
-          apiKeyEnvNames: parsed.options.clearApiKeyEnvNames ? [] : parsed.options.apiKeyEnvNames ?? current.apiKeyEnvNames,
-          apiKeySecretRef: parsed.options.apiKeySecretRef ?? current.apiKeySecretRef,
-        });
-        if (parsed.options.setDefault) {
-          await profiles.setDefaultProvider(name);
-        }
-        console.log(`${profile.name}\t${profile.source}\t${profile.protocol}\tmodel=${profile.defaultModel}\tbaseUrl=${profile.defaultBaseUrl ?? "-"}\tenv=${profile.apiKeyEnvNames.join(",") || "-"}\tsecret=${profile.apiKeySecretRef ? "configured" : "-"}`);
-        return;
-      }
-      if (subcommand === "remove" || subcommand === "delete") {
-        const providerName = parsed.positionals[0];
-        if (!providerName) {
-          console.error("Usage: agent models profiles remove <provider>");
-          process.exitCode = 1;
-          return;
-        }
-        const removed = await profiles.remove(parseModelProviderName(providerName));
-        console.log(removed ? `removed\t${providerName}` : `not-found\t${providerName}`);
-        return;
-      }
-      console.error(`Unknown models profiles command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "mcp") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const platform = await createLocalPlatform(process.cwd());
-    const registry = new LocalMcpRegistry(path.join(process.cwd(), ".agent"));
-    const actor = localUserActor();
-    try {
-      if (subcommand === "list") {
-        const parsed = parseMcpArgs(args);
-        const servers = await registry.list();
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ servers, configPath: registry.filePath }, null, 2));
-          return;
-        }
-        for (const server of servers) {
-          console.log(formatMcpServer(server));
-        }
-        return;
-      }
-      if (subcommand === "show") {
-        const id = args[0];
-        if (!id) {
-          console.error("Usage: agent mcp show <server-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const server = await registry.get(id);
-        if (!server) {
-          console.error(`MCP server not found: ${id}`);
-          process.exitCode = 1;
-          return;
-        }
-        console.log(JSON.stringify(server, null, 2));
-        return;
-      }
-      if (subcommand === "plan" || subcommand === "plan-connection") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        if (!id) {
-          console.error("Usage: agent mcp plan <server-id> [--execution-mode strict|balanced|trusted|full_access] [--project id] [--room id] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const plan = await new McpConnectionPlanner(registry, platform.policy, platform.store).plan({
-          serverId: id,
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          scope: {
-            projectId: parsed.options.scopeProjectId,
-            roomId: parsed.options.scopeRoomId,
-          },
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(plan, null, 2));
-        } else {
-          console.log(formatMcpConnectionPlan(plan));
-        }
-        if (plan.status === "deny") {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (subcommand === "capabilities" || subcommand === "list-capabilities") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        if (!id) {
-          console.error("Usage: agent mcp capabilities <server-id> [--execution-mode trusted|full_access] [--project id] [--room id] [--secret-env NAME=sec_xxxxxxxx] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await createMcpExecutionService(registry, platform).execute({
-          serverId: id,
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          scope: {
-            projectId: parsed.options.scopeProjectId,
-            roomId: parsed.options.scopeRoomId,
-          },
-          operation: { type: "list_capabilities" },
-          timeoutMs: parsed.options.timeoutMs,
-          secretEnvMap: parsed.options.secretEnvMap,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(formatMcpExecutionResult(result));
-        }
-        return;
-      }
-      if (subcommand === "health" || subcommand === "diagnose") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        if (!id) {
-          console.error("Usage: agent mcp health <server-id> [--execution-mode trusted|full_access] [--project id] [--room id] [--timeout-ms n] [--secret-env NAME=sec_xxxxxxxx] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await createMcpHealthService(registry, platform).check({
-          serverId: id,
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          scope: {
-            projectId: parsed.options.scopeProjectId,
-            roomId: parsed.options.scopeRoomId,
-          },
-          timeoutMs: parsed.options.timeoutMs,
-          secretEnvMap: parsed.options.secretEnvMap,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(formatMcpHealthResult(result));
-        }
-        if (result.status !== "healthy") {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      if (subcommand === "call-tool") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        const toolName = parsed.positionals[1];
-        if (!id || !toolName) {
-          console.error("Usage: agent mcp call-tool <server-id> <tool-name> [--input-json '{...}'|--input-file file.json] [--execution-mode trusted|full_access] [--project id] [--room id] [--secret-env NAME=sec_xxxxxxxx] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const input = await readJsonObjectInput(parsed.options.inputJson, parsed.options.inputFile);
-        const result = await createMcpExecutionService(registry, platform).execute({
-          serverId: id,
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          scope: {
-            projectId: parsed.options.scopeProjectId,
-            roomId: parsed.options.scopeRoomId,
-          },
-          operation: { type: "call_tool", name: toolName, input },
-          timeoutMs: parsed.options.timeoutMs,
-          secretEnvMap: parsed.options.secretEnvMap,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(formatMcpExecutionResult(result));
-        }
-        if (result.tool && !result.tool.ok) {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      if (subcommand === "read-resource") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        const uri = parsed.positionals[1];
-        if (!id || !uri) {
-          console.error("Usage: agent mcp read-resource <server-id> <uri> [--execution-mode trusted|full_access] [--project id] [--room id] [--secret-env NAME=sec_xxxxxxxx] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await createMcpExecutionService(registry, platform).execute({
-          serverId: id,
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          scope: {
-            projectId: parsed.options.scopeProjectId,
-            roomId: parsed.options.scopeRoomId,
-          },
-          operation: { type: "read_resource", uri },
-          timeoutMs: parsed.options.timeoutMs,
-          secretEnvMap: parsed.options.secretEnvMap,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(formatMcpExecutionResult(result));
-        }
-        return;
-      }
-      if (subcommand === "register") {
-        const parsed = parseMcpArgs(args);
-        const id = parsed.positionals[0];
-        if (!id || !parsed.options.transport) {
-          console.error("Usage: agent mcp register <server-id> --transport stdio|http [--name name] [--command cmd|--url url] [--arg value] [--env-var NAME] [--cap tools|resources|prompts|sampling] [--risk low|medium|high|critical] [--no-approval] [--disabled] [--project id] [--room id]");
-          process.exitCode = 1;
-          return;
-        }
-        const server = await registry.register({
-          id,
-          name: parsed.options.name,
-          transport: parsed.options.transport,
-          command: parsed.options.command,
-          args: parsed.options.args,
-          url: parsed.options.url,
-          envVarNames: parsed.options.envVarNames,
-          capabilities: parseMcpCapabilities(parsed.options.capabilities),
-          enabled: parsed.options.enabled,
-          risk: parsed.options.risk,
-          requireApproval: parsed.options.requireApproval,
-          allowedProjects: parsed.options.allowedProjects,
-          allowedRooms: parsed.options.allowedRooms,
-        });
-        await platform.store.recordAuditEvent({
-          id: makeId<"ArtifactId">("audit"),
-          type: "mcp.server_registered",
-          actor,
-          summary: "MCP server registered locally",
-          metadata: safeMcpAuditMetadata(server),
-          artifactRefs: [],
-          createdAt: new Date().toISOString(),
-        });
-        console.log(formatMcpServer(server));
-        return;
-      }
-      if (subcommand === "remove" || subcommand === "delete") {
-        const id = args[0];
-        if (!id) {
-          console.error("Usage: agent mcp remove <server-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const existing = await registry.get(id);
-        const removed = await registry.remove(id);
-        if (removed && existing) {
-          await platform.store.recordAuditEvent({
-            id: makeId<"ArtifactId">("audit"),
-            type: "mcp.server_removed",
-            actor,
-            summary: "MCP server removed locally",
-            metadata: safeMcpAuditMetadata(existing),
-            artifactRefs: [],
-            createdAt: new Date().toISOString(),
-          });
-        }
-        console.log(removed ? `removed\t${id}` : `not-found\t${id}`);
-        return;
-      }
-      console.error(`Unknown mcp command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      platform.locks.close();
-      platform.store.close();
-    }
-    return;
-  }
-
-  if (command === "rooms") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const platform = await createLocalPlatform(process.cwd());
-    const { rooms, store, localAgent, locks } = platform;
-    try {
-      if (subcommand === "create") {
-        const parsed = parseRoomArgs(args);
-        const name = parsed.positionals.join(" ").trim();
-        if (!name) {
-          console.error("Usage: agent rooms create [--local-agent] [--alias alias] [--agent-response broadcast|mentions_only] [--wide-mention-policy disabled|moderators|members] [--max-routed-agent-targets n] [--require-signed-invites] <name>");
-          process.exitCode = 1;
-          return;
-        }
-        const createdBy = parsed.options.localAgent ? agentActor(localAgent) : localUserActor();
-        const room = await rooms.createRoom({
-          name,
-          projectId: parsed.options.projectId,
-          createdBy,
-          memberAliases: parsed.options.aliases,
-          policy: {
-            joinPolicy: parsed.options.joinPolicy ?? "manual",
-            defaultCapabilities: ["room.message.send", "task.delegate", "tool.request"],
-            agentResponseMode: parsed.options.agentResponseMode ?? DEFAULT_ROOM_AGENT_RESPONSE_MODE,
-            wideMentionPolicy: parsed.options.wideMentionPolicy ?? DEFAULT_ROOM_WIDE_MENTION_POLICY,
-            maxRoutedAgentTargets: parsed.options.maxRoutedAgentTargets,
-            requireSignedInvites: parsed.options.requireSignedInvites,
-            requiredApprovals: parsed.options.requiredApprovals,
-            allowedFingerprints: parsed.options.allowLocalAgent
-              ? [...(parsed.options.allowedFingerprints ?? []), localAgent.fingerprint]
-              : parsed.options.allowedFingerprints,
-            maxMembers: parsed.options.maxMembers,
-            transcriptRetentionDays: parsed.options.transcriptRetentionDays,
-          },
-        });
-        console.log(`${room.id}\t${room.name}\t${room.policy.joinPolicy}\t${room.createdAt}`);
-        return;
-      }
-
-      if (subcommand === "list") {
-        const parsed = parseRoomArgs(args);
-        const all = await rooms.listRooms(parsed.options.limit);
-        for (const room of all) {
-          console.log(`${room.id}\t${room.name}\t${room.policy.joinPolicy}\t${room.createdAt}`);
-        }
-        return;
-      }
-
-      if (subcommand === "show") {
-        const roomId = args[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms show <room-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const room = await rooms.getRoom(roomId);
-        if (!room) {
-          console.error(`Room not found: ${roomId}`);
-          process.exitCode = 1;
-          return;
-        }
-        const members = await rooms.listMembers(roomId);
-        const messages = await rooms.listMessages(roomId, 50);
-        const verifiedMessages = await Promise.all(
-          messages.map(async (message) => ({
-            ...message,
-            signatureStatus: await rooms.verifyMessage(message),
-          })),
-        );
-        console.log(JSON.stringify({ room, members, messages: verifiedMessages }, null, 2));
-        return;
-      }
-
-      if (subcommand === "handles" || subcommand === "roster") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms handles <room-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const control = new ControlPlaneService(platform);
-        const roster = await control.getRoomRoster(roomId);
-        if (!roster) {
-          console.error(`Room not found: ${roomId}`);
-          process.exitCode = 1;
-          return;
-        }
-        if (parsed.options.json) {
-          console.log(JSON.stringify(roster, null, 2));
-          return;
-        }
-        console.log(`${roster.room.id}\t${roster.room.name}\tagentResponse=${roster.room.policy.agentResponseMode ?? DEFAULT_ROOM_AGENT_RESPONSE_MODE}\twide=${roster.room.policy.wideMentionPolicy ?? DEFAULT_ROOM_WIDE_MENTION_POLICY}`);
-        for (const entry of roster.entries) {
-          const wake = entry.canWakeAgent ? "wakeable" : entry.wakeStatus;
-          const aliases = entry.aliases.length > 0 ? entry.aliases.map((alias) => `@${alias}`).join(",") : "-";
-          const stable = entry.mentionHandles.filter((handle) => handle.stable).map((handle) => handle.value).join(",");
-          const agent = entry.agent ? `fingerprint=${entry.agent.fingerprint}\tmachine=${entry.agent.machineId}\ttrust=${entry.agent.trustStatus}\theartbeat=${entry.agent.heartbeatStatus ?? "-"}` : "";
-          console.log(`${entry.actor.type}:${entry.actor.id}\t${entry.role}\t${entry.status}\t${wake}\tstable=${stable}\taliases=${aliases}${agent ? `\t${agent}` : ""}`);
-        }
-        if (roster.wideHandles.length > 0) {
-          console.log(`wide\t${roster.wideHandles.map((handle) => `${handle.value}:${handle.wakesAgent ? "enabled" : "disabled"}`).join(",")}`);
-        }
-        return;
-      }
-
-      if (subcommand === "inbox") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms inbox <room-id> [--agent-id agent-id|--local-agent] [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const control = new ControlPlaneService(platform);
-        const inbox = await control.getRoomAgentInbox({
-          roomId,
-          agentId: parsed.options.agentId ?? localAgent.id,
-          limit: parsed.options.limit,
-          includeDelivered: parsed.options.includeDelivered,
-        });
-        if (!inbox) {
-          console.error(`Room or agent member not found: ${roomId} / ${parsed.options.agentId ?? localAgent.id}`);
-          process.exitCode = 1;
-          return;
-        }
-        if (parsed.options.json) {
-          console.log(JSON.stringify(inbox, null, 2));
-          return;
-        }
-        console.log(`${inbox.room.id}\tagent=${inbox.member.actor.id}\tconsidered=${inbox.consideredMessages}\twakeMessages=${inbox.messages.length}`);
-        for (const message of inbox.messages) {
-          console.log(`${message.id}\t${message.signatureStatus}\t${message.activationContext.reason}\t${message.kind}\t${message.sender.type}:${message.sender.id}\t${message.body}`);
-        }
-        return;
-      }
-
-      if (subcommand === "inbox-ack") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms inbox-ack <room-id> [--agent-id agent-id|--local-agent] [--message-id message-id] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const control = new ControlPlaneService(platform);
-        const cursor = await control.ackRoomAgentInbox({
-          roomId,
-          agentId: parsed.options.agentId ?? localAgent.id,
-          messageId: parsed.options.messageId,
-          actor: parsed.options.localAgent ? agentActor(localAgent) : localUserActor(),
-        });
-        if (!cursor) {
-          console.error(`Room or agent member not found: ${roomId} / ${parsed.options.agentId ?? localAgent.id}`);
-          process.exitCode = 1;
-          return;
-        }
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ cursor }, null, 2));
-          return;
-        }
-        console.log(`${cursor.roomId}\tagent=${cursor.agentId}\tlast=${cursor.lastDeliveredMessageId ?? "-"}\tupdated=${cursor.updatedAt}`);
-        return;
-      }
-
-      if (subcommand === "verify") {
-        const roomId = args[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms verify <room-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const messages = await rooms.listMessages(roomId, 500);
-        let invalid = 0;
-        for (const message of messages) {
-          const status = await rooms.verifyMessage(message);
-          if (status === "invalid" || status === "unknown_agent") {
-            invalid += 1;
-          }
-          console.log(`${message.id}\t${status}\t${message.sender.type}:${message.sender.id}\t${message.kind}`);
-        }
-        if (invalid > 0) {
-          process.exitCode = 1;
-        }
-        return;
-      }
-
-      if (subcommand === "invite") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms invite <room-id> [--role participant|observer|executor|reviewer|approver] [--ttl-hours n] [--max-uses n]");
-          process.exitCode = 1;
-          return;
-        }
-        const actor = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const created = await rooms.createInvite({
-          roomId,
-          createdBy: actor,
-          role: parsed.options.role ?? "participant",
-          ttlHours: parsed.options.ttlHours,
-          maxUses: parsed.options.maxUses,
-        });
-        const signatureStatus = await rooms.verifyInvite(created.invite);
-        console.log(
-          JSON.stringify(
-            {
-              inviteId: created.invite.id,
-              roomId: created.invite.roomId,
-              role: created.invite.role,
-              status: created.invite.status,
-              signatureStatus,
-              maxUses: created.invite.maxUses,
-              expiresAt: created.invite.expiresAt,
-              token: created.token,
-            },
-            null,
-            2,
-          ),
-        );
-        return;
-      }
-
-      if (subcommand === "invite-bundle") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const controlToken = parsed.options.controlToken ?? process.env.AGENT_CONTROL_TOKEN ?? process.env.AGENT_WEB_TOKEN;
-        if (!roomId || !parsed.options.controlUrl || !controlToken) {
-          console.error("Usage: agent rooms invite-bundle <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--role role] [--ttl-hours n] [--max-uses n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const actor = parsed.options.localAgent === false ? await resolveActor(store, parseActorRef(parsed.options.actor)) : agentActor(localAgent);
-        const created = await rooms.createInvite({
-          roomId,
-          createdBy: actor,
-          role: parsed.options.role ?? "participant",
-          ttlHours: parsed.options.ttlHours,
-          maxUses: parsed.options.maxUses,
-        });
-        const signatureStatus = await rooms.verifyInvite(created.invite);
-        const bundle = buildRemoteInviteBundle({
-          controlUrl: parsed.options.controlUrl,
-          controlToken,
-          roomId,
-          inviteToken: created.token,
-          inviteId: created.invite.id,
-          inviteSignatureStatus: signatureStatus,
-          role: created.invite.role,
-          aliases: parsed.options.aliases ?? [],
-          displayName: parsed.options.displayName,
-          expiresAt: created.invite.expiresAt,
-          maxUses: created.invite.maxUses,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(bundle, null, 2));
-        } else {
-          console.log(formatRemoteInviteBundle(bundle));
-        }
-        return;
-      }
-
-      if (subcommand === "invites") {
-        const roomId = args[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms invites <room-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const invites = await rooms.listInvites(roomId);
-        for (const invite of invites) {
-          const signatureStatus = await rooms.verifyInvite(invite);
-          console.log(`${invite.id}\t${invite.status}\t${invite.role}\tsignature=${signatureStatus}\tuses=${invite.uses}/${invite.maxUses}\texpires=${invite.expiresAt}`);
-        }
-        return;
-      }
-
-      if (subcommand === "revoke-invite") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const inviteId = parsed.positionals[1];
-        if (!roomId || !inviteId) {
-          console.error("Usage: agent rooms revoke-invite <room-id> <invite-id> [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const revokedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const invite = await rooms.revokeInvite(roomId, inviteId, revokedBy);
-        const signatureStatus = await rooms.verifyInvite(invite);
-        console.log(`${invite.id}\t${invite.status}\t${invite.role}\tsignature=${signatureStatus}\tuses=${invite.uses}/${invite.maxUses}\texpires=${invite.expiresAt}`);
-        return;
-      }
-
-      if (subcommand === "pull-agent" || subcommand === "invite-agent-member") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const agentId = parsed.positionals[1] ?? parsed.options.agentId;
-        if (!roomId || !agentId) {
-          console.error("Usage: agent rooms pull-agent <room-id> <agent-id> [--alias alias] [--role participant|executor|reviewer|approver|observer] [--local-agent|--actor user:id|agent:id] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const invitedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const result = await new ControlPlaneService(platform).inviteRoomAgent({
-          roomId,
-          agentId,
-          invitedBy,
-          role: parsed.options.role ?? "participant",
-          aliases: parsed.options.aliases ?? [],
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          console.log(`${result.member.roomId}\t${result.member.actor.type}:${result.member.actor.id}\t${result.member.role}\t${result.member.status}\taliases=${result.member.aliases?.join(",") ?? ""}`);
-        }
-        return;
-      }
-
-      if (subcommand === "join") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        if (!roomId) {
-          console.error("Usage: agent rooms join <room-id> [--invite-token token] [--alias alias] [--local-agent|--actor user:id|agent:id] [--role participant|observer|executor|reviewer|approver]");
-          process.exitCode = 1;
-          return;
-        }
-        const actor = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const member = parsed.options.inviteToken
-          ? await rooms.joinWithInvite(roomId, parsed.options.inviteToken, actor, parsed.options.aliases)
-          : await rooms.requestJoin(roomId, actor, parsed.options.role ?? "participant", parsed.options.aliases);
-        console.log(`${member.roomId}\t${member.actor.type}:${member.actor.id}\t${member.role}\t${member.status}\taliases=${member.aliases?.join(",") ?? ""}`);
-        return;
-      }
-
-      if (subcommand === "approve") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const actorId = parsed.positionals[1];
-        if (!roomId || !actorId) {
-          console.error("Usage: agent rooms approve <room-id> <actor-id> [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const approver = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const member = await rooms.approveJoin(roomId, actorId, approver);
-        console.log(`${member.roomId}\t${member.actor.type}:${member.actor.id}\t${member.role}\t${member.status}`);
-        return;
-      }
-
-      if (subcommand === "alias") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const actorId = parsed.positionals[1];
-        if (!roomId || !actorId) {
-          console.error("Usage: agent rooms alias <room-id> <actor-id> [--alias alias] [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const updatedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const member = await rooms.updateMemberAliases(roomId, actorId, parsed.options.aliases ?? [], updatedBy);
-        console.log(`${member.roomId}\t${member.actor.type}:${member.actor.id}\taliases=${member.aliases?.join(",") ?? ""}`);
-        return;
-      }
-
-      if (subcommand === "role") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const actorId = parsed.positionals[1];
-        const role = parsed.positionals[2] ? parseRoomRole(parsed.positionals[2]) : parsed.options.role;
-        if (!roomId || !actorId || !role) {
-          console.error("Usage: agent rooms role <room-id> <actor-id> <owner|moderator|participant|observer|executor|reviewer|approver> [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const updatedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const member = await rooms.updateMemberRole(roomId, actorId, role, updatedBy);
-        console.log(`${member.roomId}\t${member.actor.type}:${member.actor.id}\trole=${member.role}\tstatus=${member.status}`);
-        return;
-      }
-
-      if (subcommand === "status") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const actorId = parsed.positionals[1];
-        const status = parsed.positionals[2] ? parseRoomMemberStatus(parsed.positionals[2]) : parsed.options.status;
-        if (!roomId || !actorId || !status) {
-          console.error("Usage: agent rooms status <room-id> <actor-id> <invited|pending|active|suspended|left|removed|expired> [--local-agent|--actor user:id|agent:id]");
-          process.exitCode = 1;
-          return;
-        }
-        const updatedBy = parsed.options.localAgent ? agentActor(localAgent) : await resolveActor(store, parseActorRef(parsed.options.actor));
-        const member = await rooms.updateMemberStatus(roomId, actorId, status, updatedBy);
-        console.log(`${member.roomId}\t${member.actor.type}:${member.actor.id}\trole=${member.role}\tstatus=${member.status}`);
-        return;
-      }
-
-      if (subcommand === "say") {
-        const parsed = parseRoomArgs(args);
-        const roomId = parsed.positionals[0];
-        const body = parsed.positionals.slice(1).join(" ").trim();
-        if (!roomId || !body) {
-          console.error("Usage: agent rooms say <room-id> [--local-agent|--actor user:id|agent:id] [--kind chat|task|decision|tool_request|approval|artifact|system] <message with optional @alias|@agent:id|@role:role|@all>");
-          process.exitCode = 1;
-          return;
-        }
-        const sender = parsed.options.localAgent ? agentActor(localAgent) : parseActorRef(parsed.options.actor);
-        const message = await rooms.sendMessage({
-          roomId: roomId as Parameters<typeof rooms.sendMessage>[0]["roomId"],
-          sender,
-          kind: parsed.options.kind ?? "chat",
-          body,
-        });
-        console.log(`${message.id}\t${message.roomId}\t${message.sender.type}:${message.sender.id}\t${message.kind}\t${message.body}`);
-        for (const diagnostic of roomRoutingDiagnostics(message.metadata)) {
-          console.log(`routing-warning\t${diagnostic.code}\t${diagnostic.raw}\t${diagnostic.message}`);
-        }
-        return;
-      }
-
-      console.error(`Unknown rooms command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      locks.close();
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "tool") {
-    const [toolName, ...toolArgs] = rest;
-    if (!toolName) {
-      console.error("Missing tool name.");
-      process.exitCode = 1;
-      return;
-    }
-    const parsed = parseRunArgs(toolArgs);
-    const { workspace, policy, store, locks } = await createLocalPlatform(process.cwd(), parsed.options);
-    const { withPolicy } = await import("../tools/policy-tools.js");
-    const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
-    const tools = withPolicy(createWorkspaceTools(workspace, {
-      store,
-      locks,
-      actor: { type: "user", id: "local-user", displayName: "Local User" },
-    }), {
-      actor: { type: "user", id: "local-user", displayName: "Local User" },
-      mode: parsed.options.executionMode ?? "trusted",
-      risk: "medium",
-      policy,
-      store,
-      scope: {
-        orgId: parsed.options.orgId,
-        projectId: parsed.options.projectId,
-        roomId: parsed.options.roomId,
-      },
-      roomId: parsed.options.roomId,
-    });
-    const tool = tools.find((candidate) => candidate.name === toolName);
-    if (!tool) {
-      console.error(`Unknown tool: ${toolName}`);
-      store.close();
-      process.exitCode = 1;
-      return;
-    }
-    const input = await parseToolInput(toolName, parsed.task, parsed.options.inputFile);
-    const result = await tool.handler(input);
-    console.log(JSON.stringify(result, null, 2));
-    store.close();
-    return;
-  }
-
-  if (command === "approvals") {
-    const status = rest[0] as "pending" | "approved" | "denied" | "expired" | "cancelled" | undefined;
-    const { store } = await createLocalPlatform(process.cwd());
-    printApprovalRequests(await store.listApprovalRequests(status));
-    store.close();
-    return;
-  }
-
-  if (command === "approve" || command === "deny") {
-    const parsedApproval = parseApprovalArgs(rest);
-    const approvalId = parsedApproval.positionals[0];
-    const reason = parsedApproval.positionals.slice(1).join(" ").trim() || undefined;
-    if (!approvalId) {
-      console.error("Missing approval id.");
-      process.exitCode = 1;
-      return;
-    }
-    const { agent, workspace, store, rooms, locks, localAgent, plugins, organizations, policy, secretBroker, redactor, taskBroker } = await createLocalPlatform(process.cwd());
-    try {
-      if (parsedApproval.options.autoResume && parsedApproval.options.queueResumeWorkerId) {
-        throw new Error("--auto-resume and --queue-resume are mutually exclusive.");
-      }
-      const existingApproval = (await store.listApprovalRequests()).find((candidate) => candidate.id === approvalId);
-      if (existingApproval && parsedApproval.options.queueResumeWorkerId) {
-        if (parsedApproval.options.queueResumeWorkerId && isMcpApprovalAction(existingApproval.action)) {
-          throw new Error("--queue-resume is only supported for session-scoped workspace/plugin tool approvals.");
-        }
-      }
-      const { approval, decidedBy } = await decideApprovalWithPolicy({
-        store,
-        rooms,
-        organizations,
-        localAgent,
-        approvalId,
-        status: command === "approve" ? "approved" : "denied",
-        options: parsedApproval.options,
-        reason,
-      });
-      if (!approval) {
-        console.error(`Approval not found: ${approvalId}`);
-        process.exitCode = 1;
-        return;
-      }
-      console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.decisionReason ?? ""}`);
-      if (command === "approve" && (parsedApproval.options.autoReplay || parsedApproval.options.autoResume || parsedApproval.options.queueResumeWorkerId)) {
-        if (isMcpApprovalAction(approval.action)) {
-          if (parsedApproval.options.queueResumeWorkerId) {
-            throw new Error("--queue-resume is only supported for session-scoped workspace/plugin tool approvals.");
-          }
-          const mcpResult = await new McpExecutionService(
-            new LocalMcpRegistry(path.join(process.cwd(), ".agent")),
-            new LocalMcpRuntime({ redactor }),
-            policy,
-            store,
-            secretBroker,
-          ).executeApproved({
-            approvalId,
-            actor: decidedBy,
-          });
-          console.log(JSON.stringify({ mcp: mcpResult }, null, 2));
-        } else {
-          const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
-          const { replayApprovedTool } = await import("../tools/tool-replay.js");
-          const pending = await store.getPendingToolCallByApproval(approvalId);
-          const pluginTools = await plugins.createTools({
-            store,
-            actor: decidedBy,
-            sessionId: pending?.sessionId,
-          });
-          const replayResult = await replayApprovedTool({
-            approvalId,
-            store,
-            actor: decidedBy,
-            tools: createWorkspaceTools(workspace, {
-              store,
-              locks,
-              actor: decidedBy,
-              sessionId: pending?.sessionId,
-            }).concat(pluginTools),
-          });
-          console.log(JSON.stringify({ replay: replayResult }, null, 2));
-          if (parsedApproval.options.queueResumeWorkerId) {
-            if (!pending?.sessionId) {
-              throw new Error(`Approval ${approvalId} has no session to queue for resume.`);
-            }
-            if (!replayResult.ok) {
-              throw new Error(`Approved tool replay failed; session was not queued for resume.`);
-            }
-            const assignment = await taskBroker.enqueue({
-              actor: decidedBy,
-              workerId: parsedApproval.options.queueResumeWorkerId,
-              sessionId: pending.sessionId,
-              metadata: {
-                continuation: "approval_resume",
-                approvalId,
-                pendingToolCallId: pending.id,
-                toolName: pending.toolName,
-              },
-            });
-            console.log(`queued_resume\t${assignment.id}\t${assignment.workerId}\t${pending.sessionId}`);
-          }
-          if (parsedApproval.options.autoResume && pending?.sessionId && replayResult.ok) {
-            const finalAnswer = await agent.resume(pending.sessionId);
-            console.log(finalAnswer);
-          }
-        }
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "replay") {
-    const approvalId = rest[0];
-    if (!approvalId) {
-      console.error("Missing approval id.");
-      process.exitCode = 1;
-      return;
-    }
-    const { workspace, store, locks, plugins } = await createLocalPlatform(process.cwd());
-    const { createWorkspaceTools } = await import("../tools/workspace-tools.js");
-    const { replayApprovedTool } = await import("../tools/tool-replay.js");
-    const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
-    const pluginTools = await plugins.createTools({
-      store,
-      actor,
-    });
-    const result = await replayApprovedTool({
-      approvalId,
-      store,
-      actor,
-      tools: createWorkspaceTools(workspace, {
-        store,
-        locks,
-        actor,
-      }).concat(pluginTools),
-    });
-    console.log(JSON.stringify(result, null, 2));
-    store.close();
-    return;
-  }
-
-  if (command === "delegate") {
-    const parsed = parseRunArgs(rest);
-    if (!parsed.task) {
-      console.error("Missing subtask objective.");
-      process.exitCode = 1;
-      return;
-    }
-    const { subagents, store } = await createLocalPlatform(process.cwd(), parsed.options);
-    const result = await subagents.delegate({
-      objective: parsed.task,
-      parentSessionId: parsed.options.parentSessionId,
-      roomId: parsed.options.roomId,
-      assignedAgentId: parsed.options.assignedAgentId,
-      createdBy: {
-        type: "user",
-        id: "local-user",
-        displayName: "Local User",
-      },
-      executionMode: parsed.options.executionMode ?? "trusted",
-    });
-    console.log(
-      JSON.stringify(
-        {
-          subtaskId: result.subtask.id,
-          status: result.subtask.status,
-          childSessionId: result.childSession?.id,
-          summary: result.summary,
-        },
-        null,
-        2,
-      ),
-    );
-    store.close();
-    return;
-  }
-
-  if (command === "subtasks") {
-    const parentSessionId = rest[0];
-    const { store } = await createLocalPlatform(process.cwd());
-    const subtasks = await store.listSubtasks(parentSessionId);
-    for (const subtask of subtasks) {
-      console.log(
-        `${subtask.id}\t${subtask.status}\t${subtask.createdAt}\tchild=${subtask.childSessionId ?? "-"}\tparent=${
-          subtask.parentSessionId ?? "-"
-        }\t${subtask.objective}`,
-      );
-    }
-    store.close();
-    return;
-  }
-
-  if (command === "skills") {
-    const subcommand = rest[0] ?? "list";
-    const { skills, store } = await createLocalPlatform(process.cwd());
-    if (subcommand === "load") {
-      const loaded = await skills.loadDirectory(`${process.cwd()}/.agent/skills`);
-      for (const skill of loaded) {
-        console.log(`${skill.manifest.name}@${skill.manifest.version}\t${skill.scope}\t${skill.manifest.description}`);
-      }
-      store.close();
-      return;
-    }
-    if (subcommand === "show") {
-      const name = rest[1];
-      if (!name) {
-        console.error("Missing skill name.");
-        store.close();
-        process.exitCode = 1;
-        return;
-      }
-      const skill = await store.getSkill(name);
-      if (!skill) {
-        console.error(`Skill not found: ${name}`);
-        store.close();
-        process.exitCode = 1;
-        return;
-      }
-      console.log(JSON.stringify(skill, null, 2));
-      store.close();
-      return;
-    }
-    const all = await store.listSkills();
-    for (const skill of all) {
-      console.log(`${skill.manifest.name}@${skill.manifest.version}\t${skill.scope}\t${skill.manifest.description}`);
-    }
-    store.close();
-    return;
-  }
-
-  if (command === "memory") {
-    const subcommand = rest[0];
-    const { memory, store } = await createLocalPlatform(process.cwd());
-    if (subcommand === "add") {
-      const [scopeType, scopeId, kind, ...contentParts] = rest.slice(1);
-      const content = contentParts.join(" ").trim();
-      if (!scopeType || !scopeId || !kind || !content) {
-        console.error("Usage: agent memory add <scope-type> <scope-id> <kind> <content>");
-        store.close();
-        process.exitCode = 1;
-        return;
-      }
-      const record = await memory.add({
-        scopeType: scopeType as Parameters<typeof memory.add>[0]["scopeType"],
-        scopeId,
-        kind: kind as Parameters<typeof memory.add>[0]["kind"],
-        content,
-      });
-      console.log(`${record.id}\t${record.scopeType}:${record.scopeId}\t${record.kind}\t${record.summary}`);
-      store.close();
-      return;
-    }
-    if (subcommand === "delete") {
-      const memoryId = rest[1];
-      if (!memoryId) {
-        console.error("Missing memory id.");
-        store.close();
-        process.exitCode = 1;
-        return;
-      }
-      console.log((await memory.delete(memoryId)) ? "deleted" : "not found");
-      store.close();
-      return;
-    }
-    if (subcommand === "summary") {
-      const sessionId = rest[1];
-      const summary = rest.slice(2).join(" ").trim();
-      if (!sessionId || !summary) {
-        console.error("Usage: agent memory summary <session-id> <summary>");
-        store.close();
-        process.exitCode = 1;
-        return;
-      }
-      const record = await memory.addSessionSummary(sessionId, summary);
-      console.log(`${record.id}\t${record.sessionId}\t${record.summary}`);
-      store.close();
-      return;
-    }
-    const scopeType = rest[1];
-    const scopeId = rest[2];
-    const records = await memory.list(scopeType as Parameters<typeof memory.list>[0], scopeId);
-    for (const record of records) {
-      console.log(`${record.id}\t${record.scopeType}:${record.scopeId}\t${record.kind}\t${record.updatedAt}\t${record.summary}`);
-    }
-    store.close();
-    return;
-  }
-
-  if (command === "spec") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { specifications, store } = await createLocalPlatform(process.cwd());
-    const actor = localUserActor();
-    try {
-      if (subcommand === "create") {
-        const parsed = parseSpecArgs(args);
-        const objective = parsed.positionals.join(" ").trim();
-        if (!objective) {
-          console.error("Usage: agent spec create [--title title] [--org org-id] [--project project-id] [--room room-id] <objective>");
-          process.exitCode = 1;
-          return;
-        }
-        const spec = await specifications.create({
-          actor,
-          objective,
-          title: parsed.options.title,
-          orgId: parsed.options.orgId,
-          projectId: parsed.options.projectId,
-          roomId: parsed.options.roomId,
-        });
-        console.log(`${spec.id}\t${spec.status}\t${spec.projectId ?? "-"}\t${spec.title}`);
-        return;
-      }
-      if (subcommand === "list") {
-        const parsed = parseSpecArgs(args);
-        const specs = await specifications.list({
-          orgId: parsed.options.orgId,
-          projectId: parsed.options.projectId,
-          roomId: parsed.options.roomId,
-          status: parsed.options.status ? parseSpecificationStatus(parsed.options.status) : undefined,
-          limit: parsed.options.limit,
-        });
-        for (const spec of specs) {
-          console.log(`${spec.id}\t${spec.status}\t${spec.updatedAt}\tproject=${spec.projectId ?? "-"}\troom=${spec.roomId ?? "-"}\t${spec.title}`);
-        }
-        return;
-      }
-      if (subcommand === "show") {
-        const specId = args[0];
-        if (!specId) {
-          console.error("Usage: agent spec show <spec-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const spec = await specifications.get(specId);
-        if (!spec) {
-          console.error(`Specification not found: ${specId}`);
-          process.exitCode = 1;
-          return;
-        }
-        const tasks = await specifications.listTasks(specId);
-        const verifications = await specifications.listTaskVerifications({ specId, limit: 500 });
-        const versions = await specifications.listVersions(specId, 50);
-        const clarifications = await specifications.listClarifications({ specId, limit: 100 });
-        const plans = await specifications.listPlans({ specId, limit: 50 });
-        console.log(JSON.stringify({ spec, tasks, verifications, versions, clarifications, plans }, null, 2));
-        return;
-      }
-      if (subcommand === "version") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec version <spec-id> [--reason text] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const version = await specifications.createVersion({
-          actor,
-          specId,
-          reason: parsed.options.reason,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(version, null, 2));
-          return;
-        }
-        console.log(`${version.id}\tv${version.version}\ttasks=${version.taskSnapshot.length}\t${version.createdAt}\t${version.reason ?? "-"}`);
-        return;
-      }
-      if (subcommand === "versions") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec versions <spec-id> [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const versions = await specifications.listVersions(specId, parsed.options.limit);
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, versions }, null, 2));
-          return;
-        }
-        for (const version of versions) {
-          console.log(`${version.id}\tv${version.version}\ttasks=${version.taskSnapshot.length}\t${version.createdAt}\t${version.reason ?? "-"}`);
-        }
-        return;
-      }
-      if (subcommand === "diff") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec diff <spec-id> [--from version-id-or-number] [--to version-id-or-number|current] [--save-artifact] [--artifact-name name] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const diffResult = parsed.options.saveArtifact
-          ? await specifications.createDiffArtifact({
-              actor,
-              specId,
-              from: parsed.options.fromVersion,
-              to: parsed.options.toVersion,
-              name: parsed.options.artifactName,
-            })
-          : { diff: await specifications.diffVersions({
-              specId,
-              from: parsed.options.fromVersion,
-              to: parsed.options.toVersion,
-            }) };
-        const { diff } = diffResult;
-        if (parsed.options.json) {
-          console.log(JSON.stringify(diffResult, null, 2));
-          return;
-        }
-        console.log(
-          `${diff.from} -> ${diff.to}\tspecChanges=${diff.specChanges.length}\tadded=${diff.summary.addedTasks}\tremoved=${diff.summary.removedTasks}\tchanged=${diff.summary.changedTasks}`,
-        );
-        if ("artifact" in diffResult) {
-          console.log(`artifact\t${diffResult.artifact.id}\tsha256=${diffResult.artifact.sha256}`);
-        }
-        for (const change of diff.specChanges) {
-          console.log(`spec.${change.field}\t${change.before}\t=>\t${change.after}`);
-        }
-        for (const change of diff.taskChanges) {
-          console.log(`${change.change}\t${change.taskId}\tfields=${change.fields.join(",")}\t${change.title}`);
-        }
-        return;
-      }
-      if (subcommand === "plan") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec plan <spec-id> [--version version-id] [--title title] [--summary text] [--status draft|active] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const plan = await specifications.generatePlan({
-          actor,
-          specId,
-          versionId: parsed.options.versionId,
-          title: parsed.options.title,
-          summary: parsed.options.summary,
-          status: parsed.options.status ? parseSpecificationPlanStatus(parsed.options.status, ["draft", "active"]) : undefined,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(plan, null, 2));
-          return;
-        }
-        console.log(`${plan.id}\t${plan.status}\tsteps=${plan.steps.length}\topenClarifications=${plan.openClarificationIds.length}\t${plan.title}`);
-        return;
-      }
-      if (subcommand === "plans") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec plans <spec-id> [--status draft|active|superseded|archived] [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const plans = await specifications.listPlans({
-          specId,
-          status: parsed.options.status ? parseSpecificationPlanStatus(parsed.options.status) : undefined,
-          limit: parsed.options.limit,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, plans }, null, 2));
-          return;
-        }
-        for (const plan of plans) {
-          console.log(`${plan.id}\t${plan.status}\tsteps=${plan.steps.length}\topenClarifications=${plan.openClarificationIds.length}\t${plan.createdAt}\t${plan.title}`);
-        }
-        return;
-      }
-      if (subcommand === "request-plan-approval") {
-        const specId = args[0];
-        const planId = args[1];
-        const parsed = parseSpecArgs(args.slice(2));
-        if (!specId || !planId) {
-          console.error("Usage: agent spec request-plan-approval <spec-id> <plan-id> [reason]");
-          process.exitCode = 1;
-          return;
-        }
-        const approval = await specifications.requestPlanApproval({
-          actor,
-          specId,
-          planId,
-          reason: parsed.positionals.join(" ").trim() || parsed.options.reason,
-        });
-        console.log(`${approval.id}\t${approval.status}\t${approval.action}\t${approval.reason}`);
-        return;
-      }
-      if (subcommand === "clarify") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        const question = parsed.positionals.join(" ").trim();
-        if (!specId || !question) {
-          console.error("Usage: agent spec clarify <spec-id> <question>");
-          process.exitCode = 1;
-          return;
-        }
-        const clarification = await specifications.createClarification({
-          actor,
-          specId,
-          question,
-        });
-        console.log(`${clarification.id}\t${clarification.status}\t${clarification.question}`);
-        return;
-      }
-      if (subcommand === "clarifications") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec clarifications <spec-id> [--status open|answered|resolved] [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const clarifications = await specifications.listClarifications({
-          specId,
-          status: parsed.options.status ? parseSpecificationClarificationStatus(parsed.options.status) : undefined,
-          limit: parsed.options.limit,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, clarifications }, null, 2));
-          return;
-        }
-        for (const clarification of clarifications) {
-          console.log(`${clarification.id}\t${clarification.status}\t${clarification.updatedAt}\t${clarification.question}`);
-        }
-        return;
-      }
-      if (subcommand === "answer") {
-        const specId = args[0];
-        const clarificationId = args[1];
-        const parsed = parseSpecArgs(args.slice(2));
-        const answer = parsed.positionals.join(" ").trim();
-        if (!specId || !clarificationId || !answer) {
-          console.error("Usage: agent spec answer <spec-id> <clarification-id> [--resolve] <answer>");
-          process.exitCode = 1;
-          return;
-        }
-        const clarification = await specifications.answerClarification({
-          actor,
-          specId,
-          clarificationId,
-          answer,
-          status: parsed.options.resolve ? "resolved" : parsed.options.status ? parseAnswerClarificationStatus(parsed.options.status) : undefined,
-        });
-        console.log(`${clarification.id}\t${clarification.status}\t${clarification.updatedAt}\t${clarification.question}`);
-        return;
-      }
-      if (subcommand === "task") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        const title = parsed.positionals.join(" ").trim();
-        if (!specId || !title) {
-          console.error("Usage: agent spec task <spec-id> [--path path] [--depends-on task-id] [--parallel] [--verify text] <title>");
-          process.exitCode = 1;
-          return;
-        }
-        const task = await specifications.addTask({
-          actor,
-          specId,
-          title,
-          description: parsed.options.description,
-          parallelizable: parsed.options.parallelizable,
-          paths: parsed.options.paths,
-          dependsOn: parsed.options.dependsOn,
-          verification: parsed.options.verification,
-          order: parsed.options.order,
-        });
-        console.log(`${task.id}\t${task.status}\torder=${task.order}\tparallel=${task.parallelizable}\t${task.title}`);
-        return;
-      }
-      if (subcommand === "tasks") {
-        const specId = args[0];
-        if (!specId) {
-          console.error("Usage: agent spec tasks <spec-id>");
-          process.exitCode = 1;
-          return;
-        }
-        const tasks = await specifications.listTasks(specId);
-        for (const task of tasks) {
-          console.log(`${task.id}\t${task.status}\torder=${task.order}\tparallel=${task.parallelizable}\tpaths=${task.paths.join(",") || "-"}\t${task.title}`);
-        }
-        return;
-      }
-      if (subcommand === "validate") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec validate <spec-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await specifications.validateDag(specId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-          return;
-        }
-        console.log(`${result.specId}\tvalid=${result.valid}\ttasks=${result.taskCount}\tissues=${result.issues.length}`);
-        for (const issue of result.issues) {
-          console.log(`${issue.type}\t${issue.taskId}\t${issue.dependencyId ?? "-"}\t${issue.message}`);
-        }
-        if (!result.valid) {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (subcommand === "next" || subcommand === "ready") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId) {
-          console.error("Usage: agent spec next <spec-id> [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const tasks = await specifications.listReadyTasks({
-          specId,
-          limit: parsed.options.limit,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, tasks }, null, 2));
-          return;
-        }
-        for (const task of tasks) {
-          console.log(`${task.id}\t${task.status}\torder=${task.order}\tparallel=${task.parallelizable}\tpaths=${task.paths.join(",") || "-"}\t${task.title}`);
-        }
-        return;
-      }
-      if (subcommand === "status") {
-        const specId = args[0];
-        const taskId = args[1];
-        const status = args[2];
-        if (!specId || !taskId || !status) {
-          console.error("Usage: agent spec status <spec-id> <task-id> pending|in_progress|completed|blocked");
-          process.exitCode = 1;
-          return;
-        }
-        const task = await specifications.updateTaskStatus({
-          actor,
-          specId,
-          taskId,
-          status: parseSpecificationTaskStatus(status),
-        });
-        console.log(`${task.id}\t${task.status}\t${task.updatedAt}\t${task.title}`);
-        return;
-      }
-      if (subcommand === "verify") {
-        const specId = args[0];
-        const taskId = args[1];
-        const status = args[2];
-        const parsed = parseSpecArgs(args.slice(3));
-        const evidence = parsed.options.evidence ?? parsed.positionals.join(" ").trim();
-        if (!specId || !taskId || !status || !evidence) {
-          console.error("Usage: agent spec verify <spec-id> <task-id> passed|failed [--artifact artifact-id] <evidence>");
-          process.exitCode = 1;
-          return;
-        }
-        const task = await specifications.recordTaskVerification({
-          actor,
-          specId,
-          taskId,
-          status: parseSpecificationVerificationStatus(status),
-          evidence,
-          artifactRefs: parsed.options.artifactRefs,
-        });
-        console.log(`${task.id}\t${task.status}\tverification=${status}\t${task.title}`);
-        return;
-      }
-      if (subcommand === "evidence") {
-        const specId = args[0];
-        const taskId = args[1];
-        const parsed = parseSpecArgs(args.slice(2));
-        if (!specId || !taskId || !parsed.options.provider || !parsed.options.conclusion) {
-          console.error("Usage: agent spec evidence <spec-id> <task-id> --provider github|gitlab|generic --conclusion success|failure|cancelled|skipped|neutral|timed_out|action_required [--check name] [--run-id id] [--url url] [--sha sha] [--branch branch] [--external-id id]");
-          process.exitCode = 1;
-          return;
-        }
-        const task = await specifications.recordProviderEvidence({
-          actor,
-          specId,
-          taskId,
-          provider: parseSpecificationEvidenceProvider(parsed.options.provider),
-          conclusion: parseSpecificationEvidenceConclusion(parsed.options.conclusion),
-          checkName: parsed.options.checkName,
-          runId: parsed.options.runId,
-          runUrl: parsed.options.url,
-          commitSha: parsed.options.sha,
-          branch: parsed.options.branch,
-          externalId: parsed.options.externalId,
-          artifactRefs: parsed.options.artifactRefs,
-        });
-        console.log(`${task.id}\t${task.status}\tprovider=${parsed.options.provider}\tconclusion=${parsed.options.conclusion}\t${task.title}`);
-        return;
-      }
-      if (subcommand === "verifications") {
-        const specId = args[0];
-        const taskId = args[1]?.startsWith("--") ? undefined : args[1];
-        const parsed = parseSpecArgs(args.slice(taskId ? 2 : 1));
-        if (!specId) {
-          console.error("Usage: agent spec verifications <spec-id> [task-id] [--verification-status passed|failed] [--limit n] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const verifications = await specifications.listTaskVerifications({
-          specId,
-          taskId,
-          status: parsed.options.verificationStatus ? parseSpecificationVerificationStatus(parsed.options.verificationStatus) : undefined,
-          limit: parsed.options.limit,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, taskId, verifications }, null, 2));
-          return;
-        }
-        for (const verification of verifications) {
-          console.log(`${verification.id}\t${verification.taskId}\t${verification.status}\t${verification.createdAt}\tartifacts=${verification.artifactRefs.join(",") || "-"}\t${verification.evidence}`);
-        }
-        return;
-      }
-      if (subcommand === "delegate") {
-        const specId = args[0];
-        const taskId = args[1];
-        const parsed = parseSpecArgs(args.slice(2));
-        if (!specId || !taskId) {
-          console.error("Usage: agent spec delegate <spec-id> <task-id> [--room room-id] [--assigned-agent agent-id] [--execution-mode trusted|balanced|strict|full_access] [--risk low|medium|high|critical]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await specifications.delegateTask({
-          actor,
-          specId,
-          taskId,
-          roomId: parsed.options.roomId,
-          assignedAgentId: parsed.options.assignedAgentId,
-          executionMode: parsed.options.executionMode,
-          risk: parsed.options.risk,
-        });
-        console.log(
-          JSON.stringify(
-            {
-              specId: result.specification.id,
-              taskId: result.task.id,
-              taskStatus: result.task.status,
-              subtaskId: result.subtask.id,
-              childSessionId: result.subtask.childSessionId,
-              next: `agent assignments assign-subtask ${result.subtask.id} --worker <worker-id>`,
-            },
-            null,
-            2,
-          ),
-        );
-        return;
-      }
-      if (subcommand === "dispatch") {
-        const specId = args[0];
-        const parsed = parseSpecArgs(args.slice(1));
-        if (!specId || (!parsed.options.workerId && !parsed.options.autoSelectWorker)) {
-          console.error("Usage: agent spec dispatch <spec-id> (--worker worker-id|--auto-select-worker) [--plan plan-id] [--require-plan-approval] [--required-plan-approvals n] [--limit n] [--max-load-ratio n] [--max-queued-per-worker n] [--ttl seconds] [--priority n] [--room room-id] [--assigned-agent agent-id]");
-          process.exitCode = 1;
-          return;
-        }
-        const results = await specifications.dispatchReadyTasks({
-          actor,
-          specId,
-          planId: parsed.options.planId,
-          requirePlanApproval: parsed.options.requirePlanApproval,
-          requiredPlanApprovals: parsed.options.requiredPlanApprovals,
-          workerId: parsed.options.workerId,
-          autoSelectWorker: parsed.options.autoSelectWorker,
-          maxDispatchLoadRatio: parsed.options.maxDispatchLoadRatio,
-          maxQueuedAssignmentsPerWorker: parsed.options.maxQueuedAssignmentsPerWorker,
-          limit: parsed.options.limit,
-          roomId: parsed.options.roomId,
-          assignedAgentId: parsed.options.assignedAgentId,
-          executionMode: parsed.options.executionMode,
-          risk: parsed.options.risk,
-          leaseTtlSeconds: parsed.options.ttlSeconds,
-          priority: parsed.options.priority,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify({ specId, dispatched: results }, null, 2));
-          return;
-        }
-        for (const result of results) {
-          console.log(
-            `${result.task.id}\t${result.task.status}\tsubtask=${result.subtask.id}\tassignment=${result.assignment.id}\tworker=${result.assignment.workerId}\t${result.task.title}`,
-          );
-        }
-        return;
-      }
-      console.error(`Unknown spec command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "knowledge") {
-    const subcommand = rest[0] ?? "search";
-    const args = rest.slice(1);
-    const { knowledge, store } = await createLocalPlatform(process.cwd());
-    const actor = localUserActor();
-    try {
-      if (subcommand === "ingest") {
-        const parsed = parseKnowledgeArgs(args);
-        const content = parsed.options.inputFile
-          ? await readUtf8(parsed.options.inputFile)
-          : parsed.positionals.join(" ").trim();
-        if (!content) {
-          console.error("Usage: agent knowledge ingest [--file path] [--name name] [--scope-type project] [--scope-id local] [--kind manual|file|url|repository|mcp|memory] <text>");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await knowledge.ingestText({
-          actor,
-          scopeType: parsed.options.scopeType ?? "project",
-          scopeId: parsed.options.scopeId ?? "local",
-          kind: parsed.options.kind ?? (parsed.options.inputFile ? "file" : "manual"),
-          name: parsed.options.name ?? parsed.options.inputFile ?? "manual knowledge",
-          uri: parsed.options.uri ?? parsed.options.inputFile,
-          description: parsed.options.description,
-          trustLevel: parsed.options.trustLevel,
-          content,
-        });
-        console.log(`${result.source.id}\tchunks=${result.chunks.length}\t${result.source.scopeType}:${result.source.scopeId}\t${result.source.name}`);
-        return;
-      }
-      if (subcommand === "list") {
-        const parsed = parseKnowledgeArgs(args);
-        const sources = await knowledge.listSources({
-          scopeType: parsed.options.scopeType,
-          scopeId: parsed.options.scopeId,
-          kind: parsed.options.kind,
-          limit: parsed.options.limit,
-        });
-        for (const source of sources) {
-          console.log(`${source.id}\t${source.kind}\t${source.trustLevel}\t${source.scopeType}:${source.scopeId}\t${source.updatedAt}\t${source.name}`);
-        }
-        return;
-      }
-      if (subcommand === "search") {
-        const parsed = parseKnowledgeArgs(args);
-        const query = parsed.positionals.join(" ").trim();
-        if (!query) {
-          console.error("Usage: agent knowledge search [--scope-type project] [--scope-id local] [--limit n] [--enforce-acl] [--safety off|annotate|exclude] <query>");
-          process.exitCode = 1;
-          return;
-        }
-        const results = await knowledge.search({
-          query,
-          scopeType: parsed.options.scopeType ?? "project",
-          scopeId: parsed.options.scopeId ?? "local",
-          sourceId: parsed.options.sourceId,
-          limit: parsed.options.limit,
-          actor,
-          enforceAccess: parsed.options.enforceAccess,
-          safetyMode: parsed.options.safetyMode,
-        });
-        for (const result of results) {
-          console.log(`${result.citationId}\tsource=${result.source?.id ?? result.chunk.sourceId}\tchunk=${result.chunk.ordinal}\tscore=${result.score.toFixed(2)}\t${result.source?.name ?? "-"}`);
-          if (result.safetyFindings.length > 0) {
-            console.log(`safety\t${result.safetyFindings.map((finding) => `${finding.severity}:${finding.rule}`).join(",")}`);
-          }
-          console.log(result.snippet);
-        }
-        return;
-      }
-      if (subcommand === "eval-set") {
-        const action = args[0] ?? "create";
-        const parsed = parseKnowledgeArgs(args.slice(1));
-        if (action !== "create") {
-          console.error("Usage: agent knowledge eval-set create --file eval.json --name name");
-          process.exitCode = 1;
-          return;
-        }
-        const input = parsed.options.inputFile ? parseKnowledgeEvalFile(await readUtf8(parsed.options.inputFile)) : parseKnowledgeEvalFile(parsed.positionals.join(" ").trim());
-        if (!parsed.options.name || input.cases.length === 0) {
-          console.error("Usage: agent knowledge eval-set create --file eval.json --name name");
-          process.exitCode = 1;
-          return;
-        }
-        const evalSet = await knowledge.createEvalSet({
-          actor,
-          name: parsed.options.name,
-          description: parsed.options.description,
-          cases: input.cases,
-          scopeType: parsed.options.scopeType ?? input.scopeType,
-          scopeId: parsed.options.scopeId ?? input.scopeId,
-          sourceId: parsed.options.sourceId ?? input.sourceId,
-          thresholds: {
-            ...input.thresholds,
-            ...knowledgeThresholdOptions(parsed.options),
-          },
-        });
-        console.log(`${evalSet.id}\tcases=${evalSet.cases.length}\t${evalSet.scopeType ?? "-"}:${evalSet.scopeId ?? "-"}\t${evalSet.name}`);
-        return;
-      }
-      if (subcommand === "eval-sets") {
-        const parsed = parseKnowledgeArgs(args);
-        const evalSets = await knowledge.listEvalSets({
-          scopeType: parsed.options.scopeType,
-          scopeId: parsed.options.scopeId,
-          sourceId: parsed.options.sourceId,
-          limit: parsed.options.limit,
-        });
-        for (const evalSet of evalSets) {
-          console.log(`${evalSet.id}\tcases=${evalSet.cases.length}\t${evalSet.scopeType ?? "-"}:${evalSet.scopeId ?? "-"}\t${evalSet.updatedAt}\t${evalSet.name}`);
-        }
-        return;
-      }
-      if (subcommand === "eval-runs") {
-        const parsed = parseKnowledgeArgs(args);
-        const runs = await knowledge.listEvalRuns({
-          evalSetId: parsed.options.evalSetId,
-          scopeType: parsed.options.scopeType,
-          scopeId: parsed.options.scopeId,
-          sourceId: parsed.options.sourceId,
-          limit: parsed.options.limit,
-        });
-        for (const run of runs) {
-          console.log(
-            `${run.id}\tset=${run.evalSetId ?? "-"}\tgate=${run.gate.passed ? "passed" : "failed"}\trecall=${run.metrics.recallAtK.toFixed(3)}\tmrr=${run.metrics.mrr.toFixed(3)}\tcreated=${run.createdAt}`,
-          );
-        }
-        return;
-      }
-      if (subcommand === "eval-trend") {
-        const parsed = parseKnowledgeArgs(args);
-        const trend = await knowledge.summarizeEvalTrend({
-          evalSetId: parsed.options.evalSetId,
-          scopeType: parsed.options.scopeType,
-          scopeId: parsed.options.scopeId,
-          sourceId: parsed.options.sourceId,
-          limit: parsed.options.limit,
-          regressionTolerance: parsed.options.regressionTolerance,
-          actor,
-          saveArtifact: parsed.options.saveArtifact,
-          artifactName: parsed.options.artifactName,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(trend, null, 2));
-          if (trend.regression.detected) {
-            process.exitCode = 2;
-          }
-          return;
-        }
-        console.log(
-          `runs=${trend.runCount}\tpassRate=${trend.passRate.toFixed(3)}\tpass=${trend.passCount}\tfail=${trend.failCount}\tregression=${trend.regression.detected ? "yes" : "no"}`,
-        );
-        if (trend.latest) {
-          console.log(
-            `latest\t${trend.latest.id}\trecall=${trend.latest.metrics.recallAtK.toFixed(3)}\tmrr=${trend.latest.metrics.mrr.toFixed(3)}\tempty=${trend.latest.metrics.emptyResultRate.toFixed(3)}\tcitation_precision=${trend.latest.metrics.citationPrecision.toFixed(3)}\tpermission_leak_rate=${trend.latest.metrics.permissionLeakRate.toFixed(3)}\tpermission_leak_count=${trend.latest.metrics.permissionLeakCount}\tgate=${trend.latest.gate.passed ? "passed" : "failed"}`,
-          );
-        }
-        if (trend.deltas) {
-          console.log(
-            `delta\trecall=${trend.deltas.recallAtK.toFixed(3)}\tmrr=${trend.deltas.mrr.toFixed(3)}\tempty=${trend.deltas.emptyResultRate.toFixed(3)}\tcitation_precision=${trend.deltas.citationPrecision.toFixed(3)}\tpermission_leak_rate=${trend.deltas.permissionLeakRate.toFixed(3)}\tpermission_leak_count=${trend.deltas.permissionLeakCount}`,
-          );
-        }
-        for (const reason of trend.regression.reasons) {
-          console.log(`regression_reason\t${reason}`);
-        }
-        if (trend.artifact) {
-          console.log(`artifact\t${trend.artifact.id}\tsha256=${trend.artifact.sha256}`);
-        }
-        if (trend.regression.detected) {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      if (subcommand === "eval") {
-        const parsed = parseKnowledgeArgs(args);
-        const input = parsed.options.inputFile || parsed.positionals.length > 0
-          ? parseKnowledgeEvalFile(parsed.options.inputFile ? await readUtf8(parsed.options.inputFile) : parsed.positionals.join(" ").trim())
-          : { cases: [] };
-        if (input.cases.length === 0 && !parsed.options.evalSetId) {
-          console.error("Usage: agent knowledge eval --file eval.json|--eval-set id [--scope-type project] [--scope-id local] [--limit n] [--min-recall n] [--min-mrr n] [--max-empty-rate n] [--min-citation-precision n] [--max-permission-leak-rate n] [--enforce-acl] [--safety off|annotate|exclude] [--save-run] [--save-artifact] [--artifact-name name] [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await knowledge.evaluate({
-          actor,
-          cases: input.cases.length > 0 ? input.cases : undefined,
-          evalSetId: parsed.options.evalSetId,
-          scopeType: parsed.options.scopeType ?? input.scopeType,
-          scopeId: parsed.options.scopeId ?? input.scopeId,
-          sourceId: parsed.options.sourceId ?? input.sourceId,
-          limit: parsed.options.limit ?? input.limit,
-          thresholds: {
-            ...input.thresholds,
-            ...knowledgeThresholdOptions(parsed.options),
-          },
-          saveArtifact: parsed.options.saveArtifact,
-          artifactName: parsed.options.artifactName,
-          enforceAccess: parsed.options.enforceAccess ?? input.enforceAccess,
-          safetyMode: parsed.options.safetyMode ?? input.safetyMode,
-          saveRun: parsed.options.saveRun,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-          if (!result.gate.passed) {
-            process.exitCode = 2;
-          }
-          return;
-        }
-        console.log(
-          `cases=${result.caseCount}\tlimit=${result.limit}\trecall@${result.limit}=${result.metrics.recallAtK.toFixed(3)}\tmrr=${result.metrics.mrr.toFixed(3)}\tempty=${result.metrics.emptyResultRate.toFixed(3)}\tcitation_precision=${result.metrics.citationPrecision.toFixed(3)}\tpermission_leak_rate=${result.metrics.permissionLeakRate.toFixed(3)}\tpermission_leak_count=${result.metrics.permissionLeakCount}\tgate=${result.gate.passed ? "passed" : "failed"}`,
-        );
-        for (const failure of result.gate.failures) {
-          console.log(`gate_failure\t${failure}`);
-        }
-        if (result.artifact) {
-          console.log(`artifact\t${result.artifact.id}\tsha256=${result.artifact.sha256}`);
-        }
-        if (result.run) {
-          console.log(`run\t${result.run.id}\tset=${result.run.evalSetId ?? "-"}`);
-        }
-        for (const item of result.cases) {
-          console.log(`${item.id}\thit=${item.hitRank ?? "-"}\trr=${item.reciprocalRank.toFixed(3)}\tcitation_precision=${item.citationPrecision.toFixed(3)}\tpermission_leaks=${item.permissionLeakCount}\t${item.query}`);
-        }
-        if (!result.gate.passed) {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      console.error(`Unknown knowledge command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "plugins") {
-    const subcommand = rest[0] ?? "list";
-
-    if (subcommand === "run") {
-      const toolName = rest[1];
-      if (!toolName) {
-        console.error("Usage: agent plugins run <plugin.tool.name> [--execution-mode strict|balanced|trusted|full_access] [--room room-id] [--input-file file] [json-input]");
-        process.exitCode = 1;
-        return;
-      }
-      const parsed = parseRunArgs(rest.slice(2));
-      const { plugins, policy, store } = await createLocalPlatform(process.cwd(), parsed.options);
-      const actor = { type: "user" as const, id: "local-user", displayName: "Local User" };
-      try {
-        const { withPolicy } = await import("../tools/policy-tools.js");
-        const tools = withPolicy(await plugins.createTools({
-          store,
-          actor,
-          roomId: parsed.options.roomId,
-        }), {
-          actor,
-          mode: parsed.options.executionMode ?? "trusted",
-          risk: "medium",
-          policy,
-          store,
-          scope: {
-            orgId: parsed.options.orgId,
-            projectId: parsed.options.projectId,
-            roomId: parsed.options.roomId,
-          },
-          roomId: parsed.options.roomId,
-        });
-        const tool = tools.find((candidate) => candidate.name === toolName);
-        if (!tool) {
-          console.error(`Unknown plugin tool: ${toolName}`);
-          process.exitCode = 1;
-          return;
-        }
-        const result = await tool.handler(await parsePluginInput(parsed.task, parsed.options.inputFile));
-        console.log(JSON.stringify(result, null, 2));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      } finally {
-        store.close();
-      }
-      return;
-    }
-
-    const { plugins, store } = await createLocalPlatform(process.cwd());
-    try {
-      const loaded = await plugins.listPlugins();
-      if (subcommand === "list") {
-        const { pluginToolName } = await import("../plugins/local-plugin-loader.js");
-        for (const plugin of loaded) {
-          for (const pluginCommand of plugin.manifest.commands ?? []) {
-            console.log(
-              `${pluginToolName(plugin.manifest.name, pluginCommand.name)}\t${plugin.manifest.version}\t${
-                pluginCommand.risk ?? "auto"
-              }\t${(plugin.manifest.permissions ?? []).join(",")}`,
-            );
-          }
-        }
-        return;
-      }
-      if (subcommand === "show") {
-        const name = rest[1];
-        if (!name) {
-          console.error("Usage: agent plugins show <plugin-name|plugin.tool.name>");
-          process.exitCode = 1;
-          return;
-        }
-        const { pluginToolName } = await import("../plugins/local-plugin-loader.js");
-        const plugin = loaded.find((candidate) => {
-          if (candidate.manifest.name === name) {
-            return true;
-          }
-          return (candidate.manifest.commands ?? []).some((pluginCommand) => pluginToolName(candidate.manifest.name, pluginCommand.name) === name);
-        });
-        if (!plugin) {
-          console.error(`Plugin not found: ${name}`);
-          process.exitCode = 1;
-          return;
-        }
-        console.log(
-          JSON.stringify(
-            {
-              ...plugin,
-              tools: (plugin.manifest.commands ?? []).map((pluginCommand) => pluginToolName(plugin.manifest.name, pluginCommand.name)),
-            },
-            null,
-            2,
-          ),
-        );
-        return;
-      }
-      console.error(`Unknown plugins command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "changes") {
-    const sessionId = rest[0];
-    const { store } = await createLocalPlatform(process.cwd());
-    const changes = await store.listFileChanges(sessionId);
-    for (const change of changes) {
-      console.log(`${change.id}\t${change.kind}\t${change.createdAt}\t${change.path}\t${change.summary}`);
-    }
-    store.close();
-    return;
-  }
-
-  if (command === "artifacts") {
-    const subcommand = rest[0] ?? "list";
-    const args = rest.slice(1);
-    const { lifecycle, store } = await createLocalPlatform(process.cwd());
-    const actor = localUserActor();
-    try {
-      if (subcommand === "add") {
-        const parsed = parseArtifactArgs(args);
-        const artifactPath = parsed.positionals[0];
-        if (!artifactPath && !parsed.options.uri) {
-          console.error("Usage: agent artifacts add <path> [--kind kind] [--name name] [--project id] [--session id] [--room id] [--uri uri]");
-          process.exitCode = 1;
-          return;
-        }
-        const artifact = await lifecycle.registerArtifact({
-          kind: parsed.options.kind ?? "other",
-          name: parsed.options.name,
-          path: artifactPath,
-          uri: parsed.options.uri,
-          mimeType: parsed.options.mimeType,
-          orgId: parsed.options.orgId,
-          projectId: parsed.options.projectId,
-          sessionId: parsed.options.sessionId,
-          roomId: parsed.options.roomId,
-          actor,
-        });
-        console.log(`${artifact.id}\t${artifact.kind}\t${artifact.status}\t${artifact.sizeBytes ?? "-"}\t${artifact.name}`);
-        return;
-      }
-      if (subcommand === "list") {
-        const parsed = parseArtifactArgs(args);
-        const artifacts = await store.listArtifacts({
-          status: parsed.options.status,
-          projectId: parsed.options.projectId,
-          sessionId: parsed.options.sessionId,
-          roomId: parsed.options.roomId,
-          kind: parsed.options.kind,
-          limit: parsed.options.limit,
-        });
-        for (const artifact of artifacts) {
-          console.log(
-            `${artifact.id}\t${artifact.status}\t${artifact.kind}\t${artifact.createdAt}\t${artifact.projectId ?? "-"}\t${artifact.sessionId ?? "-"}\t${artifact.name}`,
-          );
-        }
-        return;
-      }
-      if (subcommand === "delete") {
-        const artifactId = args[0];
-        const parsed = parseArtifactArgs(args.slice(1));
-        if (!artifactId) {
-          console.error("Usage: agent artifacts delete <artifact-id> [--delete-file] [--force]");
-          process.exitCode = 1;
-          return;
-        }
-        const artifact = await lifecycle.deleteArtifact({
-          artifactId,
-          actor,
-          deleteFile: parsed.options.deleteFile,
-          force: parsed.options.force,
-        });
-        console.log(`${artifact.id}\t${artifact.status}\tdeleted_at=${artifact.deletedAt ?? "-"}`);
-        return;
-      }
-      console.error(`Unknown artifacts command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "session") {
-    const subcommand = rest[0];
-    const sessionId = rest[1];
-    const args = rest.slice(2);
-    const workspace = await resolveInitialWorkspace(process.cwd(), args);
-    const sessionArgs = stripWorkspaceOption(args);
-    const { lifecycle, store } = await createLocalPlatform(workspace);
-    const actor = localUserActor();
-    try {
-      if (subcommand === "diff") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session diff <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const diff = await buildSessionDiff(store, sessionId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(diff, null, 2));
-        } else {
-          printSessionDiff(diff);
-        }
-        return;
-      }
-      if (subcommand === "report") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session report <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const report = await buildSessionReport(store, sessionId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(report, null, 2));
-        } else {
-          printSessionReport(report);
-        }
-        return;
-      }
-      if (subcommand === "status") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session status <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const status = await buildSessionStatus(store, sessionId, { limit: parsed.options.limit });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(status, null, 2));
-        } else {
-          printSessionStatus(status);
-        }
-        return;
-      }
-      if (subcommand === "inspect") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session inspect <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const inspection = await buildSessionInspect(store, sessionId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(inspection, null, 2));
-        } else {
-          printSessionInspect(inspection);
-        }
-        return;
-      }
-      if (subcommand === "timeline" || subcommand === "logs") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session timeline <session-id> [--json] [--limit n]");
-          process.exitCode = 1;
-          return;
-        }
-        const timeline = await buildSessionTimeline(store, sessionId, { limit: parsed.options.limit });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(timeline, null, 2));
-        } else {
-          printSessionTimeline(timeline);
-        }
-        return;
-      }
-      if (subcommand === "review") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session review <session-id> [--json] [--limit n]");
-          process.exitCode = 1;
-          return;
-        }
-        const review = await buildSessionReview(store, sessionId, { limit: parsed.options.limit });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(review, null, 2));
-        } else {
-          printSessionReview(review);
-        }
-        return;
-      }
-      if (subcommand === "bundle") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session bundle <session-id> [--json] [--output path] [--limit n] [verification options]");
-          process.exitCode = 1;
-          return;
-        }
-        const bundle = await buildSessionEvidenceBundle(store, sessionId, {
-          workspace,
-          limit: parsed.options.limit,
-          preset: parsed.options.preset,
-          requireChange: parsed.options.requireChange,
-          requirePatch: parsed.options.requirePatch,
-          requireRecovery: parsed.options.requireRecovery,
-          requireTimeout: parsed.options.requireTimeout,
-          requireDiffStat: parsed.options.requireDiffStat,
-          requireReviewProfile: parsed.options.requireReviewProfile,
-          requireModelCall: parsed.options.requireModelCall,
-          requireNoPendingApprovals: parsed.options.requireNoPendingApprovals,
-          requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
-          requiredApprovalActions: parsed.options.requiredApprovalActions,
-          requireCommand: parsed.options.allowNoCommand !== true,
-        });
-        const output = parsed.options.output ? await writeJsonOutputInsideWorkspace(workspace, parsed.options.output, bundle) : undefined;
-        const printable = output ? { ...bundle, output } : bundle;
-        if (parsed.options.json) {
-          console.log(JSON.stringify(printable, null, 2));
-        } else {
-          printSessionEvidenceBundle(printable);
-        }
-        return;
-      }
-      if (subcommand === "result") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session result <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await buildSessionResult(store, sessionId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(result, null, 2));
-        } else {
-          printSessionResult(result);
-        }
-        return;
-      }
-      if (subcommand === "next") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session next <session-id> [--json]");
-          process.exitCode = 1;
-          return;
-        }
-        const next = await buildSessionNext(store, sessionId);
-        if (parsed.options.json) {
-          console.log(JSON.stringify(next, null, 2));
-        } else {
-          printSessionNext(next);
-        }
-        return;
-      }
-      if (subcommand === "verify") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session verify <session-id> [--json] [--preset handoff] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile profile] [--require-approval-action action] [--allow-no-command]");
-          process.exitCode = 1;
-          return;
-        }
-        const verification = await buildSessionVerification(store, sessionId, {
-          preset: parsed.options.preset,
-          requireChange: parsed.options.requireChange,
-          requirePatch: parsed.options.requirePatch,
-          requireRecovery: parsed.options.requireRecovery,
-          requireTimeout: parsed.options.requireTimeout,
-          requireDiffStat: parsed.options.requireDiffStat,
-          requireReviewProfile: parsed.options.requireReviewProfile,
-          requireModelCall: parsed.options.requireModelCall,
-          requireNoPendingApprovals: parsed.options.requireNoPendingApprovals,
-          requiredExecutionProfiles: parsed.options.requiredExecutionProfiles,
-          requiredApprovalActions: parsed.options.requiredApprovalActions,
-          requireCommand: parsed.options.allowNoCommand !== true,
-        });
-        if (parsed.options.json) {
-          console.log(JSON.stringify(verification, null, 2));
-        } else {
-          printSessionVerification(verification);
-        }
-        if (verification.status !== "pass") {
-          process.exitCode = 1;
-        }
-        return;
-      }
-      if (subcommand === "compact") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session compact <session-id> [--summary text] [--force]");
-          process.exitCode = 1;
-          return;
-        }
-        const result = await lifecycle.compactSession({
-          sessionId,
-          actor,
-          summary: parsed.options.summary,
-          force: parsed.options.force,
-        });
-        console.log(`${result.sessionId}\tmessages_deleted=${result.messagesDeleted}\ttool_calls_deleted=${result.toolCallsDeleted}`);
-        return;
-      }
-      if (subcommand === "delete") {
-        const parsed = parseLifecycleArgs(sessionArgs);
-        if (!sessionId) {
-          console.error("Usage: agent session delete <session-id> [--force]");
-          process.exitCode = 1;
-          return;
-        }
-        await lifecycle.deleteSession({ sessionId, actor, force: parsed.options.force });
-        console.log(`${sessionId}\tdeleted`);
-        return;
-      }
-      console.error("Usage: agent session diff|report|status|inspect|timeline|logs|review|result|verify|compact|delete <session-id>");
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "audit") {
-    const subcommand = rest[0] ?? "list";
-    const parsed = parseAuditArgs(rest.slice(1));
-    const { store, identity } = await createLocalPlatform(process.cwd());
-    try {
-      if (subcommand === "list") {
-        const events = await store.listAuditEvents(parsed.filters);
-        for (const event of events) {
-          console.log(
-            `${event.createdAt}\t${event.type}\t${event.actor.type}:${event.actor.id}\t${event.sessionId ?? "-"}\t${event.roomId ?? "-"}\t${event.summary}`,
-          );
-        }
-        return;
-      }
-      if (subcommand === "export") {
-        await ensureAuditExportAllowed(store, parsed.filters);
-        const { AuditExportService } = await import("../audit/audit-export-service.js");
-        const exported = await new AuditExportService({ store, identity }).export({
-          filters: parsed.filters,
-          format: parsed.options.format,
-        });
-        if (parsed.options.output) {
-          const { promises: fs } = await import("node:fs");
-          const path = await import("node:path");
-          await fs.mkdir(path.dirname(parsed.options.output), { recursive: true });
-          await fs.writeFile(parsed.options.output, exported.output, "utf8");
-          const signatureStatus = exported.bundle?.signature ? "signed" : "unsigned";
-          console.log(`${exported.count}\t${parsed.options.format}\t${signatureStatus}\t${parsed.options.output}`);
-        } else {
-          process.stdout.write(exported.output);
-        }
-        return;
-      }
-      if (subcommand === "verify") {
-        const filePath = rest[1];
-        if (!filePath) {
-          console.error("Usage: agent audit verify <bundle-path>");
-          process.exitCode = 1;
-          return;
-        }
-        const { AuditExportService } = await import("../audit/audit-export-service.js");
-        const bundle = JSON.parse(await readUtf8(filePath)) as AuditExportBundle;
-        const status = await new AuditExportService({ store, identity }).verifyBundle(bundle);
-        console.log(`${status}\t${bundle.exportId ?? "-"}\tcount=${bundle.eventCount ?? "-"}\tsha256=${bundle.eventsSha256 ?? "-"}`);
-        if (status !== "valid") {
-          process.exitCode = 2;
-        }
-        return;
-      }
-      console.error(`Unknown audit command: ${subcommand}`);
-      process.exitCode = 1;
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    } finally {
-      store.close();
-    }
-    return;
-  }
-
-  if (command === "web") {
-    const options = parseWebArgs(rest);
-    const { startLocalRoomWebServer } = await import("../web/local-room-web-server.js");
-    try {
-      const server = await startLocalRoomWebServer(process.cwd(), options);
-      console.log(`Room Web UI: ${server.url}`);
-      process.on("SIGINT", () => {
-        server.close();
-        process.exit(0);
-      });
-      process.on("SIGTERM", () => {
-        server.close();
-        process.exit(0);
-      });
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "phase1") {
-    const subcommand = rest[0] ?? "verify";
-    if (subcommand !== "verify" && subcommand !== "check") {
-      console.error("Usage: agent phase1 verify [--json]");
-      process.exitCode = 1;
-      return;
-    }
-    try {
-      const result = await verifyPhaseOneReadiness(process.cwd());
-      if (rest.slice(1).includes("--json")) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        printPhaseOneReadiness(result);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "phase3") {
-    await handlePhaseThreeCommand(rest, process.cwd());
-    return;
-  }
-
-  if (command === "phase4") {
-    await handlePhaseFourCommand(rest, process.cwd());
-    return;
-  }
-
-  if (command === "phase5") {
-    await handlePhaseFiveCommand(rest, process.cwd());
-    return;
-  }
-
-  if (command === "phase2") {
-    const subcommand = rest[0] ?? "verify";
-    if (subcommand === "checklist" || subcommand === "manual-checklist") {
-      printPhaseTwoManualChecklist();
-      return;
-    }
-    if (subcommand === "closeout-guide" || subcommand === "guide") {
-      console.log(renderPhaseTwoCloseoutGuide());
-      return;
-    }
-    if (subcommand === "operator-runbook" || subcommand === "runbook") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const summary = await buildPhaseTwoGateSummary(workspace);
-        const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
-        console.log(renderPhaseTwoOperatorRunbook(summary, launch));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "closeout-wizard" || subcommand === "evidence-wizard") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        await runPhaseTwoCloseoutWizard(workspace, parsePhaseTwoCloseoutWizardArgs(cleanArgs));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "next" || subcommand === "next-action") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const next = await buildPhaseTwoNextAction(workspace);
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(next, null, 2));
-        } else {
-          console.log(renderPhaseTwoNextAction(next));
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "review" || subcommand === "review-board") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const board = await buildPhaseTwoReviewBoard(workspace);
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(board, null, 2));
-        } else {
-          console.log(renderPhaseTwoReviewBoard(board));
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "final-gate" || subcommand === "c3-gate") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
-          console.log(renderPhaseTwoFinalGatePlan(workspace));
-          return;
-        }
-        const result = await runPhaseTwoFinalGate(workspace);
-        console.log(renderPhaseTwoFinalGateResult(result));
-        if (result.status !== "pass") {
-          process.exitCode = 1;
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "evidence-template" || subcommand === "evidence") {
-      printPhaseTwoEvidenceTemplate();
-      return;
-    }
-    if (subcommand === "evidence-record" || subcommand === "record-evidence") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const parsed = parsePhaseTwoEvidenceRecordArgs(cleanArgs);
-        const result = await recordPhaseTwoEvidence(workspace, {
-          section: parsed.section,
-          filePath: parsed.filePath,
-          date: parsed.date,
-          fields: parsed.fields,
-        });
-        console.log(renderPhaseTwoEvidenceRecord(result));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "evidence-show" || subcommand === "show-evidence" || subcommand === "evidence-review") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const parsed = parsePhaseTwoEvidenceShowArgs(cleanArgs);
-        const review = await buildPhaseTwoEvidenceReview(workspace, parsed);
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(review, null, 2));
-        } else {
-          console.log(renderPhaseTwoEvidenceReview(review));
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "closure-task" || subcommand === "check-closure-task") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const parsed = parsePhaseTwoClosureTaskArgs(cleanArgs);
-        const result = await checkPhaseTwoClosureTask(workspace, parsed);
-        console.log(renderPhaseTwoClosureTask(result));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "gate" || subcommand === "summary") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const summary = await buildPhaseTwoGateSummary(workspace);
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(summary, null, 2));
-        } else {
-          console.log(renderPhaseTwoGateSummary(summary));
-        }
-        if (summary.status !== "ready_for_completion") {
-          process.exitCode = 1;
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "evidence-check" || subcommand === "check-evidence") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const evidence = await buildPhaseTwoEvidenceCheck(workspace, {
-          filePath: parsePhaseTwoEvidenceFileOption(cleanArgs),
-          strict: cleanArgs.includes("--strict"),
-        });
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(evidence, null, 2));
-        } else {
-          console.log(renderPhaseTwoEvidenceCheck(evidence));
-        }
-        if (evidence.status !== "paste_safe_pending_manual_review") {
-          process.exitCode = 1;
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "launch-terminal" || subcommand === "terminal") {
-      const args = rest.slice(1);
-      const workspace = await resolveInitialWorkspace(process.cwd(), args);
-      const cleanArgs = stripWorkspaceOption(args);
-      const launch = buildPhaseTwoExternalTerminalLaunch(workspace);
-      if (cleanArgs.includes("--print") || cleanArgs.includes("--dry-run")) {
-        console.log(renderPhaseTwoExternalTerminalLaunch(launch, false));
-        return;
-      }
-      try {
-        const result = await launchPhaseTwoExternalTerminal(launch);
-        console.log(renderPhaseTwoExternalTerminalLaunch(launch, true, result));
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        console.error("Use `soloclaw phase2 launch-terminal --print` to copy the command manually.");
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "readiness" || subcommand === "real-provider-readiness") {
-      try {
-        const args = rest.slice(1);
-        const workspace = await resolveInitialWorkspace(process.cwd(), args);
-        const cleanArgs = stripWorkspaceOption(args);
-        const readiness = await buildPhaseTwoRealProviderReadiness(workspace);
-        if (cleanArgs.includes("--json")) {
-          console.log(JSON.stringify(readiness, null, 2));
-        } else {
-          console.log(renderPhaseTwoRealProviderReadiness(readiness));
-        }
-      } catch (error) {
-        console.error(error instanceof Error ? error.message : String(error));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (subcommand === "status") {
-      const status = buildPhaseTwoClosureStatus();
-      if (rest.slice(1).includes("--json")) {
-        console.log(JSON.stringify(status, null, 2));
-      } else {
-        console.log(renderPhaseTwoClosureStatus(status));
-      }
-      return;
-    }
-    if (subcommand !== "verify" && subcommand !== "smoke") {
-      console.error(
-          "Usage: soloclaw phase2 verify [--workspace path] [--json] [--cleanup]\n" +
-          "       soloclaw phase2 status [--json]\n" +
-          "       soloclaw phase2 gate [--workspace path] [--json]\n" +
-          "       soloclaw phase2 next [--workspace path] [--json]\n" +
-          "       soloclaw phase2 review [--workspace path] [--json]\n" +
-          "       soloclaw phase2 final-gate [--workspace path] [--print]\n" +
-          "       soloclaw phase2 readiness [--workspace path] [--json]\n" +
-          "       soloclaw phase2 launch-terminal [--workspace path] [--print]\n" +
-          "       soloclaw phase2 checklist\n" +
-          "       soloclaw phase2 closeout-guide\n" +
-          "       soloclaw phase2 operator-runbook [--workspace path]\n" +
-          "       soloclaw phase2 closeout-wizard --section C1|C2|C3 [--workspace path]\n" +
-          "       soloclaw phase2 evidence-template\n" +
-          "       soloclaw phase2 evidence-show --section C1|C2|C3 [--workspace path] [--json]\n" +
-          "       soloclaw phase2 evidence-record --section C1|C2|C3 [--result text] [--terminal text] [--provider text] [--model text]\n" +
-          "       soloclaw phase2 closure-task --section C1|C2|C3 --confirm-reviewed\n" +
-          "       soloclaw phase2 evidence-check [--workspace path] [--file path] [--strict] [--json]\n" +
-          "       soloclaw phase3 long-task-gate [--workspace path] [--json]\n" +
-          "       soloclaw phase3 long-task-real-provider [--workspace path] [--json]\n" +
-          "       soloclaw smoke --rich-tui-real-provider\n" +
-          "       agent phase2 checklist",
-      );
-      process.exitCode = 1;
-      return;
-    }
-    try {
-      const args = rest.slice(1);
-      const workspace = await resolveInitialWorkspace(process.cwd(), args);
-      const cleanArgs = stripWorkspaceOption(args);
-      const result = await verifyPhaseTwoEngineeringSmoke(workspace, {
-        cleanup: cleanArgs.includes("--cleanup"),
-      });
-      if (cleanArgs.includes("--json")) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        printPhaseTwoEngineeringSmoke(result);
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exitCode = 1;
-    }
-    return;
-  }
-
-  if (command === "hygiene") {
-    const subcommand = rest[0] ?? "check";
-    if (subcommand !== "check") {
-      console.error(`Unknown hygiene command: ${subcommand}`);
-      process.exitCode = 1;
-      return;
-    }
-    const json = rest.includes("--json");
-    const findings = await scanExecutionHygiene(process.cwd());
-    if (json) {
-      console.log(JSON.stringify({ findings, count: findings.length }, null, 2));
-    } else if (findings.length === 0) {
-      console.log("Workspace hygiene check passed.");
-    } else {
-      for (const finding of findings) {
-        console.log(`${finding.severity}\t${finding.rule}\t${finding.path}\t${finding.message}`);
-      }
-    }
-    process.exitCode = findings.some((finding) => finding.severity === "error") ? 1 : 0;
     return;
   }
 
   const targetModeCommand = isTargetModeCommand(command) ? parseTargetMode(command) : undefined;
   if (command !== "run" && command !== "ask" && !targetModeCommand) {
-    console.error(`Unknown command: ${command}`);
-    printHelp();
+    const message = `Unknown command: ${command}`;
+    if (rest.includes("--json")) {
+      console.log(JSON.stringify({
+        ok: false,
+        error: {
+          code: "unknown_command",
+          command,
+          message,
+        },
+      }, null, 2));
+    } else {
+      console.error(message);
+      printHelp();
+    }
     process.exitCode = 1;
     return;
   }
@@ -5428,6 +1702,11 @@ function parseRunArgs(args: string[]) {
       index += 1;
       continue;
     }
+    if (arg === "--agent-profile" && next) {
+      options.agentProfile = parseAgentWorkProfile(next);
+      index += 1;
+      continue;
+    }
     if (arg === "--workspace-runtime" && next) {
       options.workspaceRuntime = parseWorkspaceRuntimeMode(next);
       index += 1;
@@ -5660,6 +1939,11 @@ function parseResumeArgs(args: string[]): { options: RunPlatformOptions; cli: Ru
     }
     if (arg === "--model-circuit-open-ms" && next) {
       options.modelCircuitOpenMs = parseNonNegativeInteger(next, "--model-circuit-open-ms");
+      index += 1;
+      continue;
+    }
+    if (arg === "--agent-profile" && next) {
+      options.agentProfile = parseAgentWorkProfile(next);
       index += 1;
       continue;
     }
@@ -27006,15 +23290,21 @@ type TuiModelSetupResult = {
   profile: GlobalModelProfileView;
 };
 
+type TuiModelSetupMenuEntry = GlobalModelProfileView & {
+  menuId: string;
+};
+
 async function promptTuiModelSetupMenu(
   rl: TuiQuestionReader,
   workspace: string,
   profileStore: GlobalModelProfileStore,
 ): Promise<TuiModelSetupResult> {
   const profiles = await profileStore.list();
-  const orderedProfiles = MODEL_SETUP_PROVIDER_ORDER
+  const baseProfiles = MODEL_SETUP_PROVIDER_ORDER
     .map((name) => profiles.find((profile) => profile.id === name))
-    .filter((profile): profile is GlobalModelProfileView => Boolean(profile));
+    .filter((profile): profile is GlobalModelProfileView => Boolean(profile))
+    .map(tuiModelSetupMenuEntry);
+  const orderedProfiles = appendOpenAIResponsesTuiMenuEntry(baseProfiles);
   stdout.write("Model setup\n");
   const providerIndex = await promptTuiChoiceIndex(rl, "Provider", orderedProfiles.map(modelProviderMenuLine), 0);
   const current = orderedProfiles[providerIndex];
@@ -27043,6 +23333,26 @@ async function promptTuiModelSetupMenu(
 
 function modelProviderMenuLine(profile: GlobalModelProfileView): string {
   return `${profile.displayName ?? profile.name} (${profile.defaultBaseUrl ?? "no base URL"})`;
+}
+
+function tuiModelSetupMenuEntry(profile: GlobalModelProfileView): TuiModelSetupMenuEntry {
+  return { ...profile, menuId: profile.id };
+}
+
+function appendOpenAIResponsesTuiMenuEntry(profiles: TuiModelSetupMenuEntry[]): TuiModelSetupMenuEntry[] {
+  const openAIProfile = profiles.find((profile) => profile.name === "openai");
+  if (!openAIProfile) {
+    return profiles;
+  }
+  return [
+    ...profiles,
+    {
+      ...openAIProfile,
+      menuId: "openai_responses",
+      displayName: "OpenAI Responses API",
+      protocol: "openai_responses",
+    },
+  ];
 }
 
 async function promptTuiModelBaseUrl(rl: TuiQuestionReader, profile: GlobalModelProfileView): Promise<string> {
@@ -27097,7 +23407,7 @@ async function promptTuiModelApiKeyConfig(
 }
 
 function requiresCustomBaseUrl(profile: GlobalModelProfileView): boolean {
-  return profile.provider === "openai_compatible" || profile.provider === "anthropic_compatible";
+  return profile.protocol === "openai_responses" || profile.provider === "openai_compatible" || profile.provider === "anthropic_compatible";
 }
 
 async function promptRequiredTuiLine(rl: TuiQuestionReader, question: string, emptyMessage: string): Promise<string> {
@@ -27372,29 +23682,6 @@ type ModelUsageCliOptions = {
   outputCostPerMillionTokens?: number;
 };
 
-type McpCliOptions = {
-  json?: boolean;
-  name?: string;
-  transport?: "stdio" | "http";
-  command?: string;
-  args?: string[];
-  url?: string;
-  inputJson?: string;
-  inputFile?: string;
-  timeoutMs?: number;
-  secretEnvMap?: Record<string, string>;
-  envVarNames?: string[];
-  capabilities?: string[];
-  enabled?: boolean;
-  requireApproval?: boolean;
-  risk?: TaskRisk;
-  allowedProjects?: string[];
-  allowedRooms?: string[];
-  scopeProjectId?: string;
-  scopeRoomId?: string;
-  executionMode?: ExecutionMode;
-};
-
 function parseModelProfileArgs(args: string[]): { options: ModelProfileCliOptions; positionals: string[] } {
   const options: ModelProfileCliOptions = {};
   const positionals: string[] = [];
@@ -27531,135 +23818,6 @@ function parseModelUsageArgs(args: string[]): { options: ModelUsageCliOptions; f
   return { options, filters };
 }
 
-function parseMcpArgs(args: string[]): { options: McpCliOptions; positionals: string[] } {
-  const options: McpCliOptions = {};
-  const positionals: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
-    if (arg === "--json") {
-      options.json = true;
-      continue;
-    }
-    if (arg === "--name" && next) {
-      options.name = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--transport" && next) {
-      if (next !== "stdio" && next !== "http") {
-        throw new Error("--transport must be stdio or http.");
-      }
-      options.transport = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--command" && next) {
-      options.command = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--arg" && next) {
-      options.args = [...(options.args ?? []), next];
-      index += 1;
-      continue;
-    }
-    if (arg === "--url" && next) {
-      options.url = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--input-json" && next) {
-      options.inputJson = next;
-      index += 1;
-      continue;
-    }
-    if ((arg === "--input-file" || arg === "--file") && next) {
-      options.inputFile = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--timeout-ms" && next) {
-      options.timeoutMs = parsePositiveInteger(next, "--timeout-ms");
-      index += 1;
-      continue;
-    }
-    if (arg === "--secret-env" && next) {
-      const [envName, secretId] = next.split("=", 2);
-      if (!envName || !secretId) {
-        throw new Error("--secret-env must be NAME=secret-ref.");
-      }
-      options.secretEnvMap = { ...(options.secretEnvMap ?? {}), [envName]: secretId };
-      index += 1;
-      continue;
-    }
-    if ((arg === "--env-var" || arg === "--env") && next) {
-      options.envVarNames = [...(options.envVarNames ?? []), next];
-      index += 1;
-      continue;
-    }
-    if ((arg === "--cap" || arg === "--capability") && next) {
-      options.capabilities = [...(options.capabilities ?? []), next];
-      index += 1;
-      continue;
-    }
-    if (arg === "--risk" && next) {
-      options.risk = parseTaskRisk(next);
-      index += 1;
-      continue;
-    }
-    if (arg === "--execution-mode" && next) {
-      options.executionMode = parseExecutionMode(next);
-      index += 1;
-      continue;
-    }
-    if (arg === "--no-approval") {
-      options.requireApproval = false;
-      continue;
-    }
-    if (arg === "--require-approval") {
-      options.requireApproval = true;
-      continue;
-    }
-    if (arg === "--disabled") {
-      options.enabled = false;
-      continue;
-    }
-    if (arg === "--enabled") {
-      options.enabled = true;
-      continue;
-    }
-    if (arg === "--project" && next) {
-      options.allowedProjects = [...(options.allowedProjects ?? []), next];
-      options.scopeProjectId = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--room" && next) {
-      options.allowedRooms = [...(options.allowedRooms ?? []), next];
-      options.scopeRoomId = next;
-      index += 1;
-      continue;
-    }
-    positionals.push(arg);
-  }
-  return { options, positionals };
-}
-
-function parseTaskRisk(value: string): TaskRisk {
-  if (value === "low" || value === "medium" || value === "high" || value === "critical") {
-    return value;
-  }
-  throw new Error(`Invalid risk: ${value}. Expected low, medium, high, or critical.`);
-}
-
-function parseExecutionMode(value: string): ExecutionMode {
-  if (value === "strict" || value === "balanced" || value === "trusted" || value === "full_access") {
-    return value;
-  }
-  throw new Error(`Invalid execution mode: ${value}. Expected strict, balanced, trusted, or full_access.`);
-}
-
 function formatModelUsageEntry(entry: ModelUsageSummaryEntry): string {
   return `${entry.provider}\t${entry.model}\t${formatModelUsageStats(entry)}`;
 }
@@ -27679,120 +23837,6 @@ function formatModelUsageStats(entry: Omit<ModelUsageSummaryEntry, "provider" | 
     parts.push(`estimatedCost=${entry.estimatedCost.toFixed(6)}`);
   }
   return parts.join("\t");
-}
-
-function formatMcpServer(server: McpServerRegistration): string {
-  const endpoint = server.transport === "stdio" ? `command=${server.command ?? "-"}` : `url=${server.url ?? "-"}`;
-  return [
-    server.id,
-    server.transport,
-    server.policy.enabled ? "enabled" : "disabled",
-    `risk=${server.policy.risk}`,
-    `approval=${server.policy.requireApproval ? "required" : "not_required"}`,
-    `caps=${server.capabilities.join(",") || "-"}`,
-    `env=${server.envVarNames.join(",") || "-"}`,
-    endpoint,
-    server.name,
-  ].join("\t");
-}
-
-function formatMcpConnectionPlan(plan: McpConnectionPlan): string {
-  const endpoint = plan.connection.transport === "stdio" ? `command=${plan.connection.command ?? "-"}` : `url=${plan.connection.url ?? "-"}`;
-  return [
-    plan.server.id,
-    plan.status,
-    `reason=${plan.reason}`,
-    `risk=${plan.server.policy.risk}`,
-    `approval=${plan.server.policy.requireApproval ? "required" : "not_required"}`,
-    `caps=${plan.server.capabilities.join(",") || "-"}`,
-    `env=${plan.connection.envVarNames.join(",") || "-"}`,
-    `project=${plan.scope.projectId ?? "-"}`,
-    `room=${plan.scope.roomId ?? "-"}`,
-    endpoint,
-  ].join("\t");
-}
-
-function createMcpExecutionService(registry: LocalMcpRegistry, platform: Awaited<ReturnType<typeof createLocalPlatform>>): McpExecutionService {
-  return new McpExecutionService(
-    registry,
-    new LocalMcpRuntime({ redactor: platform.redactor }),
-    platform.policy,
-    platform.store,
-    platform.secretBroker,
-  );
-}
-
-function createMcpHealthService(registry: LocalMcpRegistry, platform: Awaited<ReturnType<typeof createLocalPlatform>>): McpHealthService {
-  return new McpHealthService(
-    registry,
-    new LocalMcpRuntime({ redactor: platform.redactor }),
-    platform.policy,
-    platform.store,
-    platform.secretBroker,
-  );
-}
-
-function formatMcpExecutionResult(result: McpExecutionResult): string {
-  const lines = [
-    `server=${result.plan.server.id}\toperation=${result.operation}\ttransport=${result.plan.server.transport}`,
-  ];
-  if (result.capabilities) {
-    lines.push(`tools=${result.capabilities.tools.map((tool) => tool.name).join(",") || "-"}`);
-    lines.push(`resources=${result.capabilities.resources.map((resource) => resource.uri).join(",") || "-"}`);
-  }
-  if (result.tool) {
-    lines.push(`tool_ok=${result.tool.ok}\toutput_length=${result.tool.output?.length ?? 0}`);
-    if (result.tool.error) {
-      lines.push(`tool_error=${result.tool.error.code}:${result.tool.error.message}`);
-    }
-    if (result.tool.output) {
-      lines.push(result.tool.output);
-    }
-  }
-  if (result.resource) {
-    lines.push(`resource=${result.resource.uri}\tmime=${result.resource.mimeType ?? "-"}\ttext_length=${result.resource.text?.length ?? 0}\tblob=${result.resource.blob ? "yes" : "no"}`);
-    if (result.resource.text) {
-      lines.push(result.resource.text);
-    }
-  }
-  return lines.join("\n");
-}
-
-function formatMcpHealthResult(result: McpHealthCheckResult): string {
-  return [
-    result.serverId,
-    result.status,
-    `transport=${result.transport ?? "-"}`,
-    `tools=${result.capabilities?.tools ?? "-"}`,
-    `resources=${result.capabilities?.resources ?? "-"}`,
-    `reason=${result.reason ?? result.plan?.reason ?? "-"}`,
-  ].join("\t");
-}
-
-async function readJsonObjectInput(inputJson?: string, inputFile?: string): Promise<Record<string, unknown>> {
-  const raw = inputFile ? await readUtf8(inputFile) : inputJson ?? "{}";
-  const parsed = JSON.parse(raw) as unknown;
-  if (!isRecord(parsed)) {
-    throw new Error("MCP tool input must be a JSON object.");
-  }
-  return parsed;
-}
-
-function safeMcpAuditMetadata(server: McpServerRegistration): Record<string, unknown> {
-  return {
-    id: server.id,
-    name: server.name,
-    transport: server.transport,
-    hasCommand: Boolean(server.command),
-    hasUrl: Boolean(server.url),
-    envVarNames: server.envVarNames,
-    capabilities: server.capabilities,
-    policy: server.policy,
-  };
-}
-
-function isMcpApprovalAction(action: PolicyAction): boolean {
-  return action === "mcp.connect" || action === "mcp.tool.call" || action === "mcp.resource.read";
 }
 
 function parseModelProviderName(value: string): ModelProviderName {
@@ -27940,6 +23984,17 @@ Everyday commands:
   soloclaw config path|show [--json]            Locate or inspect editable JSON config
   soloclaw inspect [--json]                     Show the project context the agent sees
   soloclaw run|plan|build|goal "task"           Use advanced local task modes
+  agent run --agent-profile build|plan|explore|debug|review|docs|evidence|release "task"
+                                                 Select a local work profile for tool visibility
+  agent commands list|show|run                  Use local .agent/commands templates
+  agent workbench verify <session-id> [--json]  Check completion evidence for a session
+  agent memory extract <session-id> [--json]    Extract reviewable memory candidates from summaries
+  agent memory candidates [--status pending] [--json]
+                                                 Review pending persistent memory candidates
+  agent memory snapshot export|import|status --file path [--json]
+                                                 Sync curated .agent/MEMORY.md snapshots
+  agent memory eval --case-file path.json [--json]
+                                                 Run memory recall and permission-leak gates
   soloclaw phase4 verify [--json]               Verify multi-platform local-agent readiness
   soloclaw phase5 verify [--json]               Verify local remote-room agent exchange
   soloclaw phase5 matrix-template [--target id] Print cross-machine room smoke commands
@@ -27977,6 +24032,8 @@ Model setup examples:
   soloclaw setup --workspace ../project --mock
   soloclaw setup --mock
   soloclaw setup --local --model qwen-local
+  protocol choices: --protocol openai_chat|openai_responses|anthropic_messages|mock
+  soloclaw model setup openai --protocol openai_responses --base-url https://api.openai.com/v1 --model gpt-4.1 --api-key-env OPENAI_API_KEY
   soloclaw setup --provider custom --base-url http://localhost:11434/v1 --model qwen-local --api-key-env LOCAL_LLM_API_KEY
 
 Config:
@@ -27991,60 +24048,6 @@ More:
   soloclaw help --all                           Show the full compatibility command reference
   agent help --all                              Same full reference through the compatibility alias
 `);
-}
-
-function printRoomConvenienceHelp() {
-  console.log(`Soloclaw room shortcuts
-
-Invite a remote agent:
-  soloclaw room invite-agent <room-id> --control-url url --control-token token [--alias alias] [--display-name name] [--json]
-
-Pull a registered remote agent into a room:
-  soloclaw room pull-agent <room-id> <agent-id> [--alias alias] [--role executor] [--local-agent] [--json]
-
-Accept a room invitation from the remote machine:
-  agent remote invitations --control-url url --control-token token [--json]
-  agent remote accept-room --control-url url --control-token token --room room-id [--run] [--status-file path] [--json]
-
-Join and optionally run from a remote machine:
-  soloclaw room join --invite-bundle room-invite.json [--run] [--status-file .agent/tmp/remote-room-status.json] [--stop-file .agent/tmp/remote-room.stop] [--reply-template text] [--json]
-
-Inspect the metadata-only remote runner service plan:
-  soloclaw room service --control-url url --room room-id [--status-file .agent/tmp/remote-room-status.json] [--stop-file .agent/tmp/remote-room.stop] [--json]
-
-Lower-level equivalents:
-  agent remote register --control-url url --control-token token [--display-name name] [--json]
-  agent rooms pull-agent <room-id> <agent-id> [--alias alias] [--role role] [--json]
-  agent rooms invite-bundle <room-id> --control-url url --control-token token [--json]
-  agent remote join-bundle --invite-bundle room-invite.json [--run] [--status-file path] [--stop-file path] [--json]
-  agent remote service --control-url url --room room-id [--status-file path] [--stop-file path] [--json]
-`);
-}
-
-function normalizeRoomConvenienceCommand(command: string, rest: string[]): { command: string; rest: string[] } {
-  if (command !== "room") {
-    return { command, rest };
-  }
-  const [subcommand, ...args] = rest;
-  if (subcommand === "invite-agent" || subcommand === "invite-bundle") {
-    return { command: "rooms", rest: ["invite-bundle", ...args] };
-  }
-  if (subcommand === "pull-agent") {
-    return { command: "rooms", rest: ["pull-agent", ...args] };
-  }
-  if (subcommand === "join" || subcommand === "join-bundle") {
-    return { command: "remote", rest: ["join-bundle", ...args] };
-  }
-  if (subcommand === "run") {
-    return { command: "remote", rest: ["run", ...args] };
-  }
-  if (subcommand === "service" || subcommand === "daemon") {
-    return { command: "remote", rest: ["service", ...args] };
-  }
-  if (subcommand === "remote-say") {
-    return { command: "remote", rest: ["say", ...args] };
-  }
-  return { command: "rooms", rest };
 }
 
 function printFullHelp() {
@@ -28086,7 +24089,7 @@ Usage:
   soloclaw agent logs [--workspace path] [--json] [--limit n]
   soloclaw models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   soloclaw run [same options as agent run] "your task"
-  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--workspace-runtime typescript|rust|auto] [--agent-runner path] [--target-mode plan|build|goal] [--spec spec-id] [--provider mock|openai|anthropic|gemini|kimi|grok|minimax|deepseek|glm|qwen|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--context-window-tokens n] [--context-compaction-threshold-percent 1-100] [--context-compaction-buffer-tokens n] [--context-output-reserve-tokens n] [--context-compaction-keep-tokens n] [--context-compaction-summary-mode heuristic|model|auto] [--no-context-compaction] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
+  agent run [--workspace path] [--json] [--session-result] [--verify-session] [--require-model-ready] [--require-change] [--require-patch] [--require-recovery] [--require-timeout] [--require-diff-stat] [--require-review-profile] [--require-model-call] [--require-no-pending-approvals] [--require-execution-profile local-safe|local-workspace-write|local-network|local-full-access] [--require-approval-action action] [--allow-no-command] [--workspace-runtime typescript|rust|auto] [--agent-runner path] [--target-mode plan|build|goal] [--agent-profile build|plan|explore|debug|review|docs|evidence|release] [--spec spec-id] [--provider mock|openai|anthropic|gemini|kimi|grok|minimax|deepseek|glm|qwen|mimo|openai_compatible|anthropic_compatible] [--model model] [--base-url url] [--api-key-env env] [--api-key-secret secret-id] [--fallback-provider provider] [--model-retries n] [--model-retry-base-ms n] [--model-retry-max-ms n] [--model-call-budget n] [--model-failure-budget n] [--model-circuit-break-after n] [--model-circuit-open-ms n] [--context-window-tokens n] [--context-compaction-threshold-percent 1-100] [--context-compaction-buffer-tokens n] [--context-output-reserve-tokens n] [--context-compaction-keep-tokens n] [--context-compaction-summary-mode heuristic|model|auto] [--no-context-compaction] [--execution-mode trusted|balanced|strict|full_access] [--org org-id] [--project project-id] [--room room-id] [--skill name] [--no-workspace-snapshot] [--include-key-files] [--max-key-files n] [--max-preview-lines n] [--max-preview-chars n] [--knowledge-scope project] [--knowledge-id local] [--knowledge-enforce-acl] [--knowledge-safety off|annotate|exclude] "your task"
   agent plan "your task"
   agent build "your task"
   agent goal [--spec spec-id] "your objective"
@@ -28201,7 +24204,7 @@ Usage:
   agent config show [--json]
   agent models setup --provider provider [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   agent models profiles list [--json]
-  agent models profiles set <provider> [--protocol openai_chat|anthropic_messages] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
+  agent models profiles set <provider> [--protocol openai_chat|openai_responses|anthropic_messages|mock] [--base-url url] [--model model] [--api-key-env ENV|--api-key-secret secret-id] [--default]
   agent models profiles remove <provider>
   agent mcp list [--json]
   agent mcp register <server-id> --transport stdio|http [--name name] [--command cmd|--url url] [--arg value] [--env-var NAME] [--cap tools|resources|prompts|sampling] [--risk low|medium|high|critical] [--no-approval] [--disabled] [--project id] [--room id]
@@ -28236,6 +24239,8 @@ Usage:
   agent delegate [--parent-session session-id] [--room room-id] [--assigned-agent agent-id] "subtask objective"
   agent subtasks [parent-session-id]
   agent skills load|list|show
+  agent commands list|show <name>|run <name> [arguments...]
+  agent workbench verify <session-id> [--json]
   agent plugins list
   agent plugins show <plugin-name|plugin.tool.name>
   agent plugins run <plugin.tool.name> [--execution-mode strict|balanced|trusted|full_access] [--room room-id] [--input-file file] [json-input]
@@ -28243,6 +24248,14 @@ Usage:
   agent memory list [scope-type] [scope-id]
   agent memory delete <memory-id>
   agent memory summary <session-id> <summary>
+  agent memory extract <session-id> [--scope-type project] [--scope-id local] [--json]
+  agent memory candidates [--status pending|approved|rejected|superseded] [--scope-type project] [--scope-id local] [--json]
+  agent memory approve <candidate-id> [--summary text] [--content text] [--json]
+  agent memory reject <candidate-id> --reason text [--json]
+  agent memory search <query> [--scope-type project] [--scope-id local] [--limit n] [--json]
+  agent memory usage <memory-id> [--json]
+  agent memory snapshot export|import|status --scope-type project --scope-id local --file .agent/MEMORY.md [--json]
+  agent memory eval --case-file path.json [--limit n] [--json]
   agent spec create [--title title] [--org org-id] [--project project-id] [--room room-id] <objective>
   agent spec list [--org org-id] [--project project-id] [--room room-id] [--status draft|planned|ready|in_progress|completed|blocked|archived]
   agent spec show <spec-id>
@@ -30653,271 +26666,8 @@ function parseSpecArgs(args: string[]): { options: SpecCliOptions; positionals: 
   return { options, positionals };
 }
 
-type KnowledgeCliOptions = {
-  scopeType?: MemoryScope;
-  scopeId?: string;
-  sourceId?: string;
-  kind?: KnowledgeSourceKind;
-  name?: string;
-  uri?: string;
-  description?: string;
-  trustLevel?: KnowledgeTrustLevel;
-  inputFile?: string;
-  limit?: number;
-  evalSetId?: string;
-  regressionTolerance?: number;
-  minRecallAtK?: number;
-  minMrr?: number;
-  maxEmptyResultRate?: number;
-  minCitationPrecision?: number;
-  maxPermissionLeakRate?: number;
-  saveArtifact?: boolean;
-  saveRun?: boolean;
-  artifactName?: string;
-  enforceAccess?: boolean;
-  safetyMode?: KnowledgeSafetyMode;
-  json?: boolean;
-};
-
-function parseKnowledgeArgs(args: string[]): { options: KnowledgeCliOptions; positionals: string[] } {
-  const options: KnowledgeCliOptions = {};
-  const positionals: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
-    if ((arg === "--scope-type" || arg === "--knowledge-scope") && next) {
-      options.scopeType = next as MemoryScope;
-      index += 1;
-      continue;
-    }
-    if ((arg === "--scope-id" || arg === "--knowledge-id") && next) {
-      options.scopeId = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--source" && next) {
-      options.sourceId = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--kind" && next) {
-      options.kind = next as KnowledgeSourceKind;
-      index += 1;
-      continue;
-    }
-    if (arg === "--name" && next) {
-      options.name = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--uri" && next) {
-      options.uri = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--description" && next) {
-      options.description = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--trust" && next) {
-      options.trustLevel = next as KnowledgeTrustLevel;
-      index += 1;
-      continue;
-    }
-    if ((arg === "--file" || arg === "--input-file") && next) {
-      options.inputFile = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--limit" && next) {
-      options.limit = Number(next);
-      index += 1;
-      continue;
-    }
-    if (arg === "--eval-set" && next) {
-      options.evalSetId = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--regression-tolerance" && next) {
-      options.regressionTolerance = parseRatio(next, "--regression-tolerance");
-      index += 1;
-      continue;
-    }
-    if (arg === "--min-recall" && next) {
-      options.minRecallAtK = parseRatio(next, "--min-recall");
-      index += 1;
-      continue;
-    }
-    if (arg === "--min-mrr" && next) {
-      options.minMrr = parseRatio(next, "--min-mrr");
-      index += 1;
-      continue;
-    }
-    if (arg === "--max-empty-rate" && next) {
-      options.maxEmptyResultRate = parseRatio(next, "--max-empty-rate");
-      index += 1;
-      continue;
-    }
-    if (arg === "--min-citation-precision" && next) {
-      options.minCitationPrecision = parseRatio(next, "--min-citation-precision");
-      index += 1;
-      continue;
-    }
-    if (arg === "--max-permission-leak-rate" && next) {
-      options.maxPermissionLeakRate = parseRatio(next, "--max-permission-leak-rate");
-      index += 1;
-      continue;
-    }
-    if (arg === "--save-artifact") {
-      options.saveArtifact = true;
-      continue;
-    }
-    if (arg === "--save-run") {
-      options.saveRun = true;
-      continue;
-    }
-    if (arg === "--artifact-name" && next) {
-      options.artifactName = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--enforce-acl" || arg === "--enforce-access") {
-      options.enforceAccess = true;
-      continue;
-    }
-    if (arg === "--safety" && next) {
-      options.safetyMode = parseKnowledgeSafetyMode(next);
-      index += 1;
-      continue;
-    }
-    if (arg === "--json") {
-      options.json = true;
-      continue;
-    }
-    positionals.push(arg);
-  }
-  return { options, positionals };
-}
-
-type KnowledgeEvalFile = {
-  cases: KnowledgeEvalCase[];
-  scopeType?: MemoryScope;
-  scopeId?: string;
-  sourceId?: string;
-  limit?: number;
-  thresholds?: KnowledgeEvalThresholds;
-  enforceAccess?: boolean;
-  safetyMode?: KnowledgeSafetyMode;
-};
-
-function parseKnowledgeEvalFile(value: string): KnowledgeEvalFile {
-  if (!value.trim()) {
-    return { cases: [] };
-  }
-  const parsed = JSON.parse(value) as unknown;
-  const root = Array.isArray(parsed) ? { cases: parsed } : parsed;
-  if (!isRecord(root)) {
-    throw new Error("Knowledge eval file must be a JSON object or array.");
-  }
-  const rawCases = root.cases;
-  if (!Array.isArray(rawCases)) {
-    throw new Error("Knowledge eval file must include a cases array.");
-  }
-  const cases = rawCases.map((item, index) => {
-    if (!isRecord(item)) {
-      throw new Error(`Knowledge eval case ${index + 1} must be an object.`);
-    }
-    const query = stringField(item, "query");
-    if (!query) {
-      throw new Error(`Knowledge eval case ${index + 1} must include query.`);
-    }
-    const expectedSourceIds = stringArrayField(item, "expectedSourceIds");
-    const expectedChunkIds = stringArrayField(item, "expectedChunkIds");
-    const forbiddenSourceIds = stringArrayField(item, "forbiddenSourceIds");
-    const forbiddenChunkIds = stringArrayField(item, "forbiddenChunkIds");
-    if (expectedSourceIds.length === 0 && expectedChunkIds.length === 0 && forbiddenSourceIds.length === 0 && forbiddenChunkIds.length === 0) {
-      throw new Error(`Knowledge eval case ${index + 1} must include expectedSourceIds, expectedChunkIds, forbiddenSourceIds, or forbiddenChunkIds.`);
-    }
-    return {
-      id: stringField(item, "id"),
-      query,
-      scopeType: stringField(item, "scopeType") as MemoryScope | undefined,
-      scopeId: stringField(item, "scopeId"),
-      sourceId: stringField(item, "sourceId"),
-      expectedSourceIds,
-      expectedChunkIds,
-      forbiddenSourceIds,
-      forbiddenChunkIds,
-    };
-  });
-  return {
-    cases,
-    scopeType: stringField(root, "scopeType") as MemoryScope | undefined,
-    scopeId: stringField(root, "scopeId"),
-    sourceId: stringField(root, "sourceId"),
-    limit: typeof root.limit === "number" ? root.limit : undefined,
-    thresholds: isRecord(root.thresholds) ? knowledgeThresholdOptions({
-      minRecallAtK: numberField(root.thresholds, "minRecallAtK"),
-      minMrr: numberField(root.thresholds, "minMrr"),
-      maxEmptyResultRate: numberField(root.thresholds, "maxEmptyResultRate"),
-      minCitationPrecision: numberField(root.thresholds, "minCitationPrecision"),
-      maxPermissionLeakRate: numberField(root.thresholds, "maxPermissionLeakRate"),
-    }) : undefined,
-    enforceAccess: booleanField(root, "enforceAccess"),
-    safetyMode: stringField(root, "safetyMode") ? parseKnowledgeSafetyMode(stringField(root, "safetyMode") ?? "") : undefined,
-  };
-}
-
-function knowledgeThresholdOptions(options: Pick<KnowledgeCliOptions, "minRecallAtK" | "minMrr" | "maxEmptyResultRate" | "minCitationPrecision" | "maxPermissionLeakRate">): KnowledgeEvalThresholds {
-  const thresholds: KnowledgeEvalThresholds = {};
-  if (options.minRecallAtK !== undefined) {
-    thresholds.minRecallAtK = options.minRecallAtK;
-  }
-  if (options.minMrr !== undefined) {
-    thresholds.minMrr = options.minMrr;
-  }
-  if (options.maxEmptyResultRate !== undefined) {
-    thresholds.maxEmptyResultRate = options.maxEmptyResultRate;
-  }
-  if (options.minCitationPrecision !== undefined) {
-    thresholds.minCitationPrecision = options.minCitationPrecision;
-  }
-  if (options.maxPermissionLeakRate !== undefined) {
-    thresholds.maxPermissionLeakRate = options.maxPermissionLeakRate;
-  }
-  return thresholds;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function stringField(value: Record<string, unknown>, key: string): string | undefined {
-  const field = value[key];
-  return typeof field === "string" && field.trim() ? field.trim() : undefined;
-}
-
-function numberField(value: Record<string, unknown>, key: string): number | undefined {
-  const field = value[key];
-  return typeof field === "number" ? field : undefined;
-}
-
-function booleanField(value: Record<string, unknown>, key: string): boolean | undefined {
-  const field = value[key];
-  return typeof field === "boolean" ? field : undefined;
-}
-
-function stringArrayField(value: Record<string, unknown>, key: string): string[] {
-  const field = value[key];
-  if (field === undefined) {
-    return [];
-  }
-  if (!Array.isArray(field) || !field.every((item) => typeof item === "string")) {
-    throw new Error(`${key} must be an array of strings.`);
-  }
-  return field.map((item) => item.trim()).filter(Boolean);
 }
 
 function parseArtifactArgs(args: string[]): { options: ArtifactCliOptions; positionals: string[] } {
@@ -31439,11 +27189,6 @@ type SecretCliOptions = {
   reveal?: boolean;
 };
 
-type AuditCliOptions = {
-  format: "jsonl" | "json" | "bundle";
-  output?: string;
-};
-
 type PrCliOptions = {
   input: {
     title: string;
@@ -31600,92 +27345,6 @@ async function ensureGitPolicyAllowed(input: {
   throw new Error(`${decision.reason} Approval request: ${approvalId}.`);
 }
 
-function parseAuditArgs(args: string[]): { filters: ListAuditEventsInput; options: AuditCliOptions } {
-  const filters: ListAuditEventsInput = { limit: 100 };
-  const options: AuditCliOptions = { format: "jsonl" };
-
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
-    if (arg === "--limit" && next) {
-      filters.limit = Number(next);
-      index += 1;
-      continue;
-    }
-    if (arg === "--type" && next) {
-      filters.type = next as ListAuditEventsInput["type"];
-      index += 1;
-      continue;
-    }
-    if (arg === "--actor" && next) {
-      filters.actorId = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--session" && next) {
-      filters.sessionId = next as ListAuditEventsInput["sessionId"];
-      index += 1;
-      continue;
-    }
-    if (arg === "--room" && next) {
-      filters.roomId = next as ListAuditEventsInput["roomId"];
-      index += 1;
-      continue;
-    }
-    if (arg === "--project" && next) {
-      filters.projectId = next as ListAuditEventsInput["projectId"];
-      index += 1;
-      continue;
-    }
-    if (arg === "--from" && next) {
-      filters.from = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--to" && next) {
-      filters.to = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--format" && next) {
-      if (next !== "jsonl" && next !== "json" && next !== "bundle") {
-        throw new Error(`Unsupported audit export format: ${next}`);
-      }
-      options.format = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--output" && next) {
-      options.output = next;
-      index += 1;
-      continue;
-    }
-  }
-
-  if (filters.limit !== undefined && (!Number.isInteger(filters.limit) || filters.limit < 1 || filters.limit > 10000)) {
-    throw new Error("--limit must be an integer between 1 and 10000.");
-  }
-
-  return { filters, options };
-}
-
-async function ensureAuditExportAllowed(
-  store: Awaited<ReturnType<typeof createLocalPlatform>>["store"],
-  filters: ListAuditEventsInput,
-): Promise<void> {
-  if (!filters.projectId) {
-    return;
-  }
-  const project = await store.getProject(filters.projectId);
-  if (!project?.retentionPolicyId) {
-    return;
-  }
-  const policy = await store.getRetentionPolicy(project.retentionPolicyId);
-  if (policy && !policy.allowAuditExport) {
-    throw new Error(`Retention policy ${policy.name} does not allow audit export for project ${filters.projectId}.`);
-  }
-}
-
 function parseSecretArgs(args: string[]): { options: SecretCliOptions; positionals: string[] } {
   const options: SecretCliOptions = {};
   const positionals: string[] = [];
@@ -31788,33 +27447,6 @@ function parseApprovalArgs(args: string[]): { options: ApprovalCliOptions; posit
   }
 
   return { options, positionals };
-}
-
-function parseWebArgs(args: string[]): { host?: string; port?: number; token?: string } {
-  const options: { host?: string; port?: number; token?: string } = {};
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    const next = args[index + 1];
-    if (arg === "--host" && next) {
-      options.host = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--port" && next) {
-      const port = Number(next);
-      if (!Number.isInteger(port) || port < 0 || port > 65535) {
-        throw new Error(`Invalid port: ${next}`);
-      }
-      options.port = port;
-      index += 1;
-      continue;
-    }
-    if (arg === "--token" && next) {
-      options.token = next;
-      index += 1;
-    }
-  }
-  return options;
 }
 
 function localUserActor() {
@@ -32252,21 +27884,6 @@ async function parseToolInput(toolName: string, text: string, inputFile?: string
     default:
       return {};
   }
-}
-
-async function parsePluginInput(text: string, inputFile?: string) {
-  if (inputFile) {
-    const { promises: fs } = await import("node:fs");
-    return JSON.parse(await fs.readFile(inputFile, "utf8")) as Record<string, unknown>;
-  }
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return {};
-  }
-  if (trimmed.startsWith("{")) {
-    return JSON.parse(trimmed) as Record<string, unknown>;
-  }
-  return { text };
 }
 
 await main();

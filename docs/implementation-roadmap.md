@@ -17,6 +17,16 @@ The project has moved past the original skeleton and is now a broad local TypeSc
 
 Current local closeout boundary as of 2026-06-25: Phase 1 local readiness is covered by `agent phase1 verify --json`, while live-provider smoke remains a release-before-shipping manual check with a real configured provider. Phase 4 has a local Windows gate through `soloclaw phase4 verify --workspace E:\code\agent --json`, but fresh macOS and Android Termux matrix captures remain required. Phase 5 has a local room smoke through `soloclaw phase5 verify --workspace E:\code\agent --json`; real multi-machine `phase5 evidence-status` remains incomplete until control-host and per-target fragments are collected from actual machines, and generated template fragments do not count as completed evidence.
 
+Supplemental closure plan: `docs/superpowers/plans/2026-06-25-soloclaw-real-environment-evidence-closure.md` is the active plan for turning the Phase 1-5 local gates into release-grade evidence. It adds a Phase 4.5/5.5 evidence lane for live-provider smoke, macOS shell, Android Termux, and real multi-machine room collection before Phase 6 is allowed to move beyond local policy simulation.
+
+Local agent workbench hardening: `docs/superpowers/plans/2026-06-25-soloclaw-local-agent-workbench-hardening.md` is the Phase 5.6 closeout plan for strengthening local agent working ability before broader Phase 6 work. The local implementation adds trusted instruction discovery, preset skills, lazy skill loading, work profiles, command templates, and completion gates while preserving the Phase 4.5/5.5 real-environment evidence boundary.
+
+Persistent memory hardening: `docs/superpowers/plans/2026-06-25-soloclaw-persistent-memory-hardening.md` is the Phase 5.7 closeout plan for turning manual memory into a reviewed, safety-scanned, ACL-aware, retrieval-tested memory lifecycle. The local implementation keeps memories lower priority than rules/skills/policy and adds candidate extraction, approval/rejection, usage audit, room/agent ACL-aware retrieval, compaction hooks, curated memory snapshots, memory CLI, and memory eval gates.
+
+Product maturation overlay: `docs/superpowers/plans/2026-06-25-soloclaw-ai-coding-product-maturation.md` is the cross-phase plan for turning the local and room-agent MVP into a mature AI coding product. It does not replace the Phase 1-6 evidence model; instead it maps product workstreams onto the phase roadmap: CLI modularization, unified product configuration, provider/model catalog, TUI workbench, tool registry, session UX, permission rules, cross-platform agent interop, subagent task tooling, local API/SDK/event streams, packaging, and product onboarding. Its cross-agent invariants are mandatory for follow-up plans: rooms stay hub-and-control-plane first, routed inbox messages are the execution trigger, remote work preserves signed ack/heartbeat/revocation/stale recovery, and mixed-agent product claims require token-safe Phase 5.5 evidence.
+
+Product maturation execution status as of 2026-06-26: Workstream 1 is active and the top-level CLI command boundary is now routed through focused command modules. CLI modularization slices 1-29 added the shared router, moved help and quickstart command registration, moved `doctor`/`check`, `status`, `platform doctor|check`, `inspect`, remaining onboarding/workbench commands, local-agent views, smoke paths, and `workbench verify` into the workbench command module, moved model/config/session/tool/memory/web/workspace/admin/worker/spec/agent/subagent command groups into focused modules, moved room convenience plus `rooms` and `remote` into room/remote modules, and routed Phase 1-5 gates plus `hygiene` through focused modules while preserving existing evidence handlers. The current Workstream 1 command modules now cover `providers` / `model`, legacy `models`, `config path|show`, `secrets`, `sessions` / `show-session`, `session`, `pause` / `cancel`, `changes`, `resume`, `artifacts`, read-only `approvals`, `approve` / `deny`, `replay`, `audit`, `memory`, `web`, `workspace`, `commands`, `skills`, `tool`, `knowledge`, `plugins`, `mcp`, onboarding/workbench, local-agent, smoke, admin, worker, scheduler, assignment, operator, spec, identity, agent health, delegate, subtask listing, room, remote, phase gate, and hygiene command flow with focused tests. `src/cli/index.ts` remains the process startup, pre-router shortcut, router registration, unknown-command formatting, and natural-language run/ask entrypoint while legacy builders/renderers are injected into modules until later cleanup slices.
+
 ## Soloclaw Product Mainline
 
 The product mainline is:
@@ -73,6 +83,23 @@ Product phases:
 5. **Room collaboration network**: multiple devices and agents can join the same room, identify themselves, exchange protocol messages, receive routed task assignments, synchronize files/results, handle conflicts, and wake or hand off work across devices.
 6. **Advanced autonomous operation and safety governance**: stronger local/phone operations and native app surfaces are introduced only behind explicit safety boundaries, including capability tiers, approvals, audit logs, sensitive-action interception, model-output constraints, and protected secret handling. Android may plan Accessibility, Intent, notification, clipboard, and browser integrations, but payment, ordering, messaging, deletion, authorization, CAPTCHA, and security-prompt flows require human confirmation.
 
+Supplemental evidence lane:
+
+- **4.5 Real platform evidence closure**: collect fresh macOS shell and Android Termux source-run evidence with `soloclaw phase4 verify --json`, record paste-safe summaries in `docs/platform-support.md`, and keep native installers/service managers as later productization work.
+- **5.5 Real room evidence closure**: collect the full control-host plus Windows PowerShell/CMD, Linux, macOS, and Android Termux Phase 5 matrix through the existing evidence fragments, merge them, and require `soloclaw phase5 evidence-check --file phase5-evidence.merged.json --json` to pass before calling the room collaboration alpha closed.
+- **5.6 Local agent workbench hardening**: improve the single-machine agent's engineering reliability with trusted `AGENTS.md`-style rules, preset skills, lazy `load_skill`, work profiles, command templates, and completion gates. This is a local capability lane and does not close Phase 4.5/5.5 evidence.
+- **5.7 Persistent memory hardening**: improve long-running local and room-agent recall with reviewed memory candidates, safety/privacy filtering, ACL-aware retrieval, memory usage audit, compaction/session-end extraction hooks, curated `.agent/MEMORY.md` / `.agent/USER.md` snapshots, and memory eval gates. This is a local/room capability lane and does not close Phase 4.5/5.5 evidence.
+- **Release live-provider gate**: every release candidate must run one configured live-provider readiness check and one real-provider smoke without committing provider credentials, prompts, raw responses, or secret-shaped output.
+- **Phase 6 admission gate**: before Phase 4.5 and Phase 5.5 are closed, Phase 6 work may only be labelled `local policy simulation`, `design`, or `prototype`; it must not be described as production native app support, production mobile automation, production sandbox replacement, or production distributed autonomy.
+
+Phase 6 is split into evidence-gated subphases:
+
+- **6A Safety policy hardening**: capability tiers, approval replay, redaction, audit export, denial tests, and incident drills. This can proceed as local simulation after Phase 1-5 local gates pass.
+- **6B Sandboxed runner hardening**: Rust/container/VM runner policy, resource limits, teardown, network policy, and artifact boundaries. This can prototype locally, but cannot replace local runtime defaults until Phase 4.5 is closed.
+- **6C Native desktop contract**: Windows and macOS app shells wrap the existing control-plane APIs without privileged backdoors. This requires Phase 4.5 real OS evidence.
+- **6D Android companion and mobile-action policy**: companion monitoring, notifications, approvals, and policy simulation for Intent/clipboard/browser flows. This requires Android Termux evidence and must deny autonomous payment, checkout, CAPTCHA, account, deletion, authorization, and security-prompt flows by default.
+- **6E Distributed autonomy soak**: multi-agent recovery, incident response, broker-backed queues, and long-running room operations. This requires Phase 5.5 real multi-machine evidence.
+
 ## Runtime Boundary By Phase
 
 The TS/Rust plan is product-aggregated but runtime-decoupled. `soloclaw` remains one product surface and this repository remains one coordinated workspace, but Rust must enter through stable process/runtime contracts instead of creating a second agent stack.
@@ -115,6 +142,10 @@ Phase acceptance checklist:
 ## Phase Closure Gates
 
 These are the release gates for declaring a phase deliverable. A phase is closed only when its user promise, demo path, automated checks, safety boundary, and explicit non-goals are all documented and verified.
+
+## Release Gate Overlay
+
+Phase 1 and Phase 2 local completion do not require committing live-provider credentials, but every release candidate must run one live-provider readiness check and one real-provider smoke with the configured release provider. The release record stores provider name, model id, command exit status, and secret-scan result only; it must not store API keys, key prefixes, bearer tokens, vault passphrases, raw prompts, or raw model responses.
 
 | Phase | Closed when | Required evidence |
 | --- | --- | --- |
@@ -841,6 +872,8 @@ Status: in progress.
    - Current: agent-loop model requests run opencode-style automatic preflight compaction for known built-in model profiles by inferring the active model context window; `SOLOCLAW_CONTEXT_WINDOW_TOKENS`, `--context-window-tokens`, or explicit runtime options still override/customize that window for unknown providers. The path uses token estimation, a reserved output/buffer window, optional `SOLOCLAW_CONTEXT_COMPACTION_THRESHOLD_PERCENT` / `--context-compaction-threshold-percent`, optional `SOLOCLAW_CONTEXT_COMPACTION_SUMMARY_MODE=model|auto|heuristic`, a bounded recent-context tail, repeated rolling-summary updates over prior checkpoints, and a `<conversation-checkpoint>` summary before calling the model.
    - Current: resumed sessions read the latest stored compaction checkpoint as the previous anchored summary seed, so model-generated summaries can roll forward across CLI resumes without treating ordinary final-answer summaries as checkpoint state.
    - Current: provider context-overflow errors before a completed assistant response trigger one forced compaction and a single rebuilt model request; a second overflow falls through as the ordinary model failure instead of looping.
+   - Current: Phase 5.6 local agent workbench hardening adds trusted instruction discovery, builtin preset skills, lazy skill body loading through policy, local work profiles, command templates, and completion gates.
+   - Current: Phase 5.7 persistent memory hardening adds reviewed candidates, safety filtering, ACL-aware retrieval, usage audit, compaction extraction hooks, curated memory snapshots, memory CLI, and memory eval gates.
    - Next: add summary quality checks and editable per-profile context/output metadata for custom providers whose model limits cannot be inferred safely.
 
 10. Local secret hardening.
@@ -1043,6 +1076,7 @@ Soloclaw terminal/TUN usability
   -> security/adversarial test expansion
   -> production boundary abstractions
   -> MCP stdio/HTTP execution MVP
+  -> reviewed persistent memory lifecycle
   -> RAG accuracy upgrade
   -> daemon-ready worker/scheduler/remote room runner
   -> parallel Web UI + TUI/CLI execution inspection

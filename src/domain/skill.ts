@@ -8,6 +8,7 @@ export type SkillManifest = {
   description: string;
   permissions: string[];
   tools: string[];
+  metadata?: Record<string, string>;
 };
 
 export type Skill = {

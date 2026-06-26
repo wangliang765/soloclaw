@@ -5,11 +5,13 @@ import type { AgentMessage, ModelResponse, RegisteredTool, ToolCall, ToolDefinit
 import type { ActorRef, ExecutionTargetMode, GoalRun, Session } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import { GoalService } from "../goals/goal-service.js";
+import { MemoryExtractionService } from "../memory/memory-extraction-service.js";
 import { ModelBudgetExceededError } from "../model/guarded-model-client.js";
 import type { AgentStore } from "../store/agent-store.js";
 import { TaskOperationsService } from "../tasks/task-operations-service.js";
 import { redactAgentEventText, summarizeToolInput } from "./agent-event-redaction.js";
 import type { AgentRunEvent, AgentRunEventSink } from "./agent-events.js";
+import type { AgentWorkProfile } from "./agent-work-profile.js";
 import { withEventDefaults } from "./agent-events.js";
 import { agentModePolicy } from "./agent-mode-policy.js";
 import { formatRuntimeStopAnswer, modelBudgetRuntimeStop } from "./agent-runtime-stop.js";
@@ -21,6 +23,7 @@ import {
 } from "./context-compactor.js";
 import type { ModelRequestCompactionOptions } from "./context-compactor.js";
 import { ContextManager } from "./context-manager.js";
+import { evaluateCompletionGate } from "./completion-gate.js";
 import { DoomLoopDetector } from "./doom-loop-detector.js";
 import { createRunBudget, RunBudgetController } from "./run-budget.js";
 import type { AgentRunBudget } from "./run-budget.js";
@@ -50,6 +53,8 @@ export type AgentLoopOptions = {
   contextAttachments?: AgentContextAttachment[];
   contextCompaction?: Omit<ModelRequestCompactionOptions, "messages" | "tools">;
   selectedSkillIds?: string[];
+  workProfile?: Pick<AgentWorkProfile, "name" | "description" | "commandPolicyHint" | "visibleTools">;
+  completionGate?: "off" | "warn";
   targetMode?: ExecutionTargetMode;
   planDirectory?: string;
   sessionScope?: Pick<Session, "orgId" | "projectId" | "roomId">;
@@ -68,6 +73,8 @@ export class AgentLoop {
   private readonly contextAttachments: AgentContextAttachment[];
   private readonly contextCompaction?: Omit<ModelRequestCompactionOptions, "messages" | "tools">;
   private readonly selectedSkillIds: string[];
+  private readonly workProfile?: Pick<AgentWorkProfile, "name" | "description" | "commandPolicyHint" | "visibleTools">;
+  private readonly completionGate: "off" | "warn";
   private readonly targetMode: ExecutionTargetMode;
   private readonly planDirectory?: string;
   private readonly sessionScope: Pick<Session, "orgId" | "projectId" | "roomId">;
@@ -92,6 +99,8 @@ export class AgentLoop {
     this.contextAttachments = options.contextAttachments ?? [];
     this.contextCompaction = options.contextCompaction;
     this.selectedSkillIds = options.selectedSkillIds ?? [];
+    this.workProfile = options.workProfile;
+    this.completionGate = options.completionGate ?? "off";
     this.sessionScope = options.sessionScope ?? {};
     this.planDirectory = options.planDirectory;
     this.onSessionActivated = options.onSessionActivated;
@@ -342,6 +351,7 @@ export class AgentLoop {
             summary: response.content.length > 1000 ? `${response.content.slice(0, 1000)}\n[truncated]` : response.content,
             createdAt: new Date().toISOString(),
           });
+          await this.recordCompletionGateAudit(session);
           if (goalService && goal) {
             goal = await goalService.updateUsage(goal.id, {
               modelCalls: budget.usage.modelCalls,
@@ -558,8 +568,63 @@ export class AgentLoop {
       createdBy: this.actor,
     });
     this.onSessionActivated?.(session);
+    if (this.workProfile) {
+      await this.store.recordAuditEvent({
+        id: makeId<"ArtifactId">("audit"),
+        type: "agent.profile_selected",
+        actor: this.actor,
+        orgId: this.sessionScope.orgId,
+        projectId: this.sessionScope.projectId,
+        roomId: this.sessionScope.roomId,
+        sessionId: session.id,
+        summary: `Selected agent work profile: ${this.workProfile.name}`,
+        metadata: {
+          profile: this.workProfile.name,
+          description: this.workProfile.description,
+          commandPolicyHint: this.workProfile.commandPolicyHint,
+          visibleTools: this.workProfile.visibleTools,
+        },
+        artifactRefs: [],
+        createdAt: new Date().toISOString(),
+      });
+    }
     await this.emitProgress({ type: "session_started", sessionId: session.id, objective: userTask, targetMode: this.targetMode });
     return session;
+  }
+
+  private async recordCompletionGateAudit(session: Session): Promise<void> {
+    if (!this.store || this.completionGate !== "warn") {
+      return;
+    }
+    const toolResults = await this.store.getToolResults(session.id);
+    const fileChanges = await this.store.listFileChanges(session.id);
+    const approvals = (await this.store.listApprovalRequests()).filter((approval) => approval.sessionId === session.id);
+    const auditEvents = await this.store.listAuditEvents({ sessionId: session.id, limit: 100 });
+    const result = evaluateCompletionGate({
+      targetMode: this.targetMode,
+      changedFiles: [...new Set(fileChanges.map((change) => change.path))].sort(),
+      commandEvents: auditEvents
+        .filter((event) => event.type === "command.finished")
+        .map((event) => ({
+          command: typeof event.metadata?.command === "string" ? event.metadata.command : undefined,
+          exitCode: typeof event.metadata?.exitCode === "number" ? event.metadata.exitCode : undefined,
+        })),
+      pendingApprovalCount: approvals.filter((approval) => approval.status === "pending").length,
+      failedToolCount: toolResults.filter((result) => !result.ok).length,
+    });
+    await this.store.recordAuditEvent({
+      id: makeId<"ArtifactId">("audit"),
+      type: "completion.gate",
+      actor: this.actor ?? session.createdBy,
+      orgId: session.orgId ?? this.sessionScope.orgId,
+      projectId: session.projectId ?? this.sessionScope.projectId,
+      roomId: session.roomId ?? this.sessionScope.roomId,
+      sessionId: session.id,
+      summary: result.summary,
+      metadata: result,
+      artifactRefs: [],
+      createdAt: new Date().toISOString(),
+    });
   }
 
   private async emitProgress(event: AgentRunEventInput): Promise<void> {
@@ -671,17 +736,54 @@ export class AgentLoop {
     }
     context.replace(compaction.messages);
     if (session && compaction.summary) {
+      const summaryId = makeId<"SessionSummaryId">("sum");
+      const summaryText = formatStoredModelRequestCompactionSummary({
+        summary: compaction.summary,
+        recent: compaction.recent,
+      });
       await this.store?.addSessionSummary({
-        id: makeId<"SessionSummaryId">("sum"),
+        id: summaryId,
         sessionId: session.id,
-        summary: formatStoredModelRequestCompactionSummary({
-          summary: compaction.summary,
-          recent: compaction.recent,
-        }),
+        summary: summaryText,
         createdAt: new Date().toISOString(),
       });
+      await this.recordProviderTurnMemoryExtraction(session, summaryId, summaryText);
     }
     return true;
+  }
+
+  private async recordProviderTurnMemoryExtraction(session: Session, summaryId: string, summary: string): Promise<void> {
+    if (!this.store) {
+      return;
+    }
+    const actor = this.actor ?? session.createdBy;
+    const extraction = await new MemoryExtractionService(this.store).extractFromSessionSummary({
+      text: summary,
+      scopeType: "project",
+      scopeId: session.projectId ?? "local",
+      sourceSessionId: session.id,
+      sourceSummaryId: summaryId,
+      actor,
+    });
+    await this.store.recordAuditEvent({
+      id: makeId<"ArtifactId">("audit"),
+      type: "memory.provider_turn_extract",
+      actor,
+      orgId: session.orgId ?? this.sessionScope.orgId,
+      projectId: session.projectId ?? this.sessionScope.projectId,
+      roomId: session.roomId ?? this.sessionScope.roomId,
+      sessionId: session.id,
+      summary: "Provider-turn memory extraction completed",
+      metadata: {
+        sessionId: session.id,
+        summaryId,
+        candidateCount: extraction.createdCandidates.length,
+        deniedCount: extraction.deniedCandidates.length,
+        trigger: "context_compaction",
+      },
+      artifactRefs: [],
+      createdAt: new Date().toISOString(),
+    });
   }
 
   private async latestStoredModelRequestCompactionCheckpoint(
