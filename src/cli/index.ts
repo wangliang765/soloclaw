@@ -22093,28 +22093,49 @@ async function readWorkspaceHistory(historyRoot: string): Promise<WorkspaceHisto
   const filePath = workspaceHistoryPath(historyRoot);
   try {
     const parsed = JSON.parse(await fs.readFile(filePath, "utf8")) as Partial<WorkspaceHistoryFile>;
-    const entries = Array.isArray(parsed.entries)
-      ? parsed.entries
-          .filter((entry): entry is WorkspaceHistoryEntry => typeof entry?.path === "string" && typeof entry?.lastUsedAt === "string")
-          .map((entry) => ({ path: path.resolve(entry.path), lastUsedAt: entry.lastUsedAt }))
-      : [];
-    return { version: 1, activeWorkspace: typeof parsed.activeWorkspace === "string" ? path.resolve(parsed.activeWorkspace) : undefined, entries };
+    return parseWorkspaceHistory(parsed);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       const legacyPath = legacyWorkspaceHistoryPath(historyRoot);
       if (legacyPath !== filePath && await pathExists(legacyPath)) {
         const parsed = JSON.parse(await fs.readFile(legacyPath, "utf8")) as Partial<WorkspaceHistoryFile>;
-        const entries = Array.isArray(parsed.entries)
-          ? parsed.entries
-              .filter((entry): entry is WorkspaceHistoryEntry => typeof entry?.path === "string" && typeof entry?.lastUsedAt === "string")
-              .map((entry) => ({ path: path.resolve(entry.path), lastUsedAt: entry.lastUsedAt }))
-          : [];
-        return { version: 1, activeWorkspace: typeof parsed.activeWorkspace === "string" ? path.resolve(parsed.activeWorkspace) : undefined, entries };
+        return parseWorkspaceHistory(parsed);
       }
       return { version: 1, entries: [] };
     }
     throw error;
   }
+}
+
+function parseWorkspaceHistory(parsed: Partial<WorkspaceHistoryFile>): WorkspaceHistoryFile {
+  const activeWorkspace = typeof parsed.activeWorkspace === "string" ? path.resolve(parsed.activeWorkspace) : undefined;
+  const entries = Array.isArray(parsed.entries)
+    ? parsed.entries
+        .filter((entry): entry is WorkspaceHistoryEntry => typeof entry?.path === "string" && typeof entry?.lastUsedAt === "string")
+        .map((entry) => ({ path: path.resolve(entry.path), lastUsedAt: entry.lastUsedAt }))
+        .filter((entry) => isImplicitWorkspaceSelectable(entry.path))
+    : [];
+  return {
+    version: 1,
+    activeWorkspace: activeWorkspace && isImplicitWorkspaceSelectable(activeWorkspace) ? activeWorkspace : undefined,
+    entries,
+  };
+}
+
+function isImplicitWorkspaceSelectable(workspace: string): boolean {
+  return !isWindowsSystemWorkspace(workspace);
+}
+
+function isWindowsSystemWorkspace(workspace: string): boolean {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const normalized = path.resolve(workspace).toLowerCase();
+  const roots = [process.env.SystemRoot, process.env.windir, "C:\\Windows"].filter((root): root is string => Boolean(root));
+  return roots.some((root) => {
+    const resolvedRoot = path.resolve(root);
+    return normalized === path.join(resolvedRoot, "System32").toLowerCase() || normalized === path.join(resolvedRoot, "SysWOW64").toLowerCase();
+  });
 }
 
 async function saveWorkspaceHistory(historyRoot: string, history: WorkspaceHistoryFile): Promise<void> {
