@@ -10,12 +10,19 @@ import type {
   AuditEvent,
   CapabilityGrant,
   FileChange,
+  GoalCheckpoint,
+  GoalRun,
   KnowledgeChunk,
   KnowledgeEvalRun,
   KnowledgeEvalSet,
   KnowledgeSource,
+  MemoryCandidate,
   MemoryRecord,
+  MemoryReviewStatus,
+  MemorySnapshotRecord,
   MemoryScope,
+  MemorySource,
+  MemoryUsageEvent,
   Organization,
   PendingToolCall,
   PendingToolCallStatus,
@@ -27,8 +34,10 @@ import type {
   RoomInvite,
   RoomMember,
   RoomMessage,
+  RoomMessageIntentNonce,
   Session,
   SessionLink,
+  SessionTodo,
   SessionSummary,
   Skill,
   SkillUsageEvent,
@@ -50,9 +59,11 @@ import type {
   AgentStore,
   AppendMessageInput,
   CreateSessionInput,
+  ListGoalRunsInput,
   ListAuditEventsInput,
   ListKnowledgeEvalRunsInput,
   ListKnowledgeEvalSetsInput,
+  ListMemoryCandidatesInput,
   ListSpecificationsInput,
   ListSpecificationClarificationsInput,
   ListSpecificationPlansInput,
@@ -63,6 +74,7 @@ import type {
   RecordAgentHeartbeatNonceInput,
   RecordTaskLeaseNonceInput,
   RecordRoomDeliveryAckNonceInput,
+  RecordRoomMessageIntentNonceInput,
   RecordWorkerHeartbeatNonceInput,
   RecordToolCallInput,
   WorkerHeartbeatInput,
@@ -174,6 +186,100 @@ export class SqliteAgentStore implements AgentStore {
       ? (this.db.prepare("SELECT * FROM file_changes WHERE session_id = ? ORDER BY created_at DESC").all(sessionId) as FileChangeRow[])
       : (this.db.prepare("SELECT * FROM file_changes ORDER BY created_at DESC").all() as FileChangeRow[]);
     return rows.map(fileChangeFromRow);
+  }
+
+  async createGoalRun(goal: GoalRun): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO goals (
+          id, session_id, objective, status, token_budget, token_used, model_calls,
+          repeated_blocker_key, repeated_blockers, created_by_json, created_at, updated_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        goal.id,
+        goal.sessionId,
+        goal.objective,
+        goal.status,
+        goal.tokenBudget ?? null,
+        goal.tokenUsed,
+        goal.modelCalls,
+        goal.repeatedBlockerKey ?? null,
+        goal.repeatedBlockers,
+        JSON.stringify(goal.createdBy),
+        goal.createdAt,
+        goal.updatedAt,
+        goal.completedAt ?? null,
+      );
+  }
+
+  async updateGoalRun(goal: GoalRun): Promise<void> {
+    this.db
+      .prepare(
+        `UPDATE goals SET
+          objective = ?, status = ?, token_budget = ?, token_used = ?, model_calls = ?,
+          repeated_blocker_key = ?, repeated_blockers = ?, updated_at = ?, completed_at = ?
+        WHERE id = ?`,
+      )
+      .run(
+        goal.objective,
+        goal.status,
+        goal.tokenBudget ?? null,
+        goal.tokenUsed,
+        goal.modelCalls,
+        goal.repeatedBlockerKey ?? null,
+        goal.repeatedBlockers,
+        goal.updatedAt,
+        goal.completedAt ?? null,
+        goal.id,
+      );
+  }
+
+  async getGoalRun(goalId: string): Promise<GoalRun | undefined> {
+    const row = this.db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as GoalRunRow | undefined;
+    return row ? goalRunFromRow(row) : undefined;
+  }
+
+  async getGoalRunBySession(sessionId: string): Promise<GoalRun | undefined> {
+    const row = this.db.prepare("SELECT * FROM goals WHERE session_id = ?").get(sessionId) as GoalRunRow | undefined;
+    return row ? goalRunFromRow(row) : undefined;
+  }
+
+  async listGoalRuns(input: ListGoalRunsInput = {}): Promise<GoalRun[]> {
+    const values: SQLInputValue[] = [];
+    const where = input.status ? "WHERE status = ?" : "";
+    if (input.status) {
+      values.push(input.status);
+    }
+    values.push(input.limit ?? 50);
+    const rows = this.db.prepare(`SELECT * FROM goals ${where} ORDER BY updated_at DESC LIMIT ?`).all(...values) as GoalRunRow[];
+    return rows.map(goalRunFromRow);
+  }
+
+  async addGoalCheckpoint(checkpoint: GoalCheckpoint): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO goal_checkpoints (
+          id, goal_id, session_id, kind, summary, blocker_key, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        checkpoint.id,
+        checkpoint.goalId,
+        checkpoint.sessionId,
+        checkpoint.kind,
+        checkpoint.summary,
+        checkpoint.blockerKey ?? null,
+        JSON.stringify(checkpoint.metadata ?? {}),
+        checkpoint.createdAt,
+      );
+  }
+
+  async listGoalCheckpoints(goalId: string, limit = 50): Promise<GoalCheckpoint[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM goal_checkpoints WHERE goal_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(goalId, limit) as GoalCheckpointRow[];
+    return rows.map(goalCheckpointFromRow);
   }
 
   async createKnowledgeSource(source: KnowledgeSource): Promise<void> {
@@ -1000,6 +1106,48 @@ export class SqliteAgentStore implements AgentStore {
     return Number(result.changes ?? 0);
   }
 
+  async recordRoomMessageIntentNonce(input: RecordRoomMessageIntentNonceInput): Promise<boolean> {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO room_message_intent_nonces (
+            agent_id, nonce, room_id, envelope_hash, first_seen_at, expires_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.agentId, input.nonce, input.roomId, input.envelopeHash, input.firstSeenAt, input.expiresAt ?? null);
+      return true;
+    } catch (error) {
+      if (error instanceof Error && /UNIQUE|constraint/i.test(error.message)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  async getRoomMessageIntentNonce(agentId: string, nonce: string): Promise<RoomMessageIntentNonce | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM room_message_intent_nonces WHERE agent_id = ? AND nonce = ?")
+      .get(agentId, nonce) as RoomMessageIntentNonceRow | undefined;
+    return row ? roomMessageIntentNonceFromRow(row) : undefined;
+  }
+
+  async deleteRoomMessageIntentNoncesBefore(input: { before: string; limit?: number }): Promise<number> {
+    const limit = input.limit ?? 1000;
+    const result = this.db
+      .prepare(
+        `DELETE FROM room_message_intent_nonces
+         WHERE rowid IN (
+           SELECT rowid
+           FROM room_message_intent_nonces
+           WHERE expires_at IS NOT NULL AND expires_at <= ?
+           ORDER BY first_seen_at ASC
+           LIMIT ?
+         )`,
+      )
+      .run(input.before, limit);
+    return Number(result.changes ?? 0);
+  }
+
   async createRoom(room: Room): Promise<void> {
     this.db
       .prepare(
@@ -1712,8 +1860,8 @@ export class SqliteAgentStore implements AgentStore {
       .prepare(
         `INSERT OR REPLACE INTO skills (
           id, scope, source_path, name, version, description, permissions_json, tools_json,
-          summary, body, checksum, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          metadata_json, summary, body, checksum, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         skill.id,
@@ -1724,6 +1872,7 @@ export class SqliteAgentStore implements AgentStore {
         skill.manifest.description,
         JSON.stringify(skill.manifest.permissions),
         JSON.stringify(skill.manifest.tools),
+        JSON.stringify(skill.manifest.metadata ?? {}),
         skill.summary,
         skill.body,
         skill.checksum ?? null,
@@ -1787,6 +1936,147 @@ export class SqliteAgentStore implements AgentStore {
     return result.changes > 0;
   }
 
+  async createMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    await this.updateMemoryCandidate(candidate);
+  }
+
+  async updateMemoryCandidate(candidate: MemoryCandidate): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_candidates (
+          id, scope_type, scope_id, kind, proposed_content, proposed_summary,
+          source_session_id, source_summary_id, confidence, status, safety_findings_json,
+          approved_memory_id, review_reason, created_by_json, reviewed_by_json,
+          created_at, updated_at, reviewed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        candidate.id,
+        candidate.scopeType,
+        candidate.scopeId,
+        candidate.kind,
+        candidate.proposedContent,
+        candidate.proposedSummary,
+        candidate.sourceSessionId ?? null,
+        candidate.sourceSummaryId ?? null,
+        candidate.confidence,
+        candidate.status,
+        JSON.stringify(candidate.safetyFindings),
+        candidate.approvedMemoryId ?? null,
+        candidate.reviewReason ?? null,
+        JSON.stringify(candidate.createdBy),
+        candidate.reviewedBy ? JSON.stringify(candidate.reviewedBy) : null,
+        candidate.createdAt,
+        candidate.updatedAt,
+        candidate.reviewedAt ?? null,
+      );
+  }
+
+  async getMemoryCandidate(candidateId: string): Promise<MemoryCandidate | undefined> {
+    const row = this.db.prepare("SELECT * FROM memory_candidates WHERE id = ?").get(candidateId) as MemoryCandidateRow | undefined;
+    return row ? memoryCandidateFromRow(row) : undefined;
+  }
+
+  async listMemoryCandidates(input: ListMemoryCandidatesInput = {}): Promise<MemoryCandidate[]> {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (input.scopeType) {
+      clauses.push("scope_type = ?");
+      params.push(input.scopeType);
+    }
+    if (input.scopeId) {
+      clauses.push("scope_id = ?");
+      params.push(input.scopeId);
+    }
+    if (input.status) {
+      clauses.push("status = ?");
+      params.push(input.status);
+    }
+    if (input.sourceSessionId) {
+      clauses.push("source_session_id = ?");
+      params.push(input.sourceSessionId);
+    }
+    if (input.sourceSummaryId) {
+      clauses.push("source_summary_id = ?");
+      params.push(input.sourceSummaryId);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`SELECT * FROM memory_candidates ${where} ORDER BY updated_at DESC, id ASC LIMIT ?`)
+      .all(...params, input.limit ?? 100) as MemoryCandidateRow[];
+    return rows.map(memoryCandidateFromRow);
+  }
+
+  async createMemorySource(source: MemorySource): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO memory_sources (
+          id, memory_id, source_type, source_id, citation, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(source.id, source.memoryId, source.sourceType, source.sourceId ?? null, source.citation ?? null, source.createdAt);
+  }
+
+  async listMemorySources(memoryId: string): Promise<MemorySource[]> {
+    const rows = this.db.prepare("SELECT * FROM memory_sources WHERE memory_id = ? ORDER BY created_at DESC").all(memoryId) as MemorySourceRow[];
+    return rows.map(memorySourceFromRow);
+  }
+
+  async recordMemoryUsage(event: MemoryUsageEvent): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO memory_usage_events (
+          id, memory_id, actor_json, session_id, reason, query, score, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        event.memoryId,
+        JSON.stringify(event.actor),
+        event.sessionId ?? null,
+        event.reason,
+        event.query ?? null,
+        event.score ?? null,
+        event.createdAt,
+      );
+  }
+
+  async listMemoryUsageEvents(memoryId: string): Promise<MemoryUsageEvent[]> {
+    const rows = this.db.prepare("SELECT * FROM memory_usage_events WHERE memory_id = ? ORDER BY created_at DESC").all(memoryId) as MemoryUsageEventRow[];
+    return rows.map(memoryUsageEventFromRow);
+  }
+
+  async touchMemory(memoryId: string, lastUsedAt: string): Promise<boolean> {
+    const result = this.db.prepare("UPDATE memories SET last_used_at = ? WHERE id = ?").run(lastUsedAt, memoryId);
+    return result.changes > 0;
+  }
+
+  async upsertMemorySnapshot(snapshot: MemorySnapshotRecord): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_snapshots (
+          id, scope_type, scope_id, file_path, content_hash, imported_at, exported_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        snapshot.id,
+        snapshot.scopeType,
+        snapshot.scopeId,
+        snapshot.filePath,
+        snapshot.contentHash,
+        snapshot.importedAt ?? null,
+        snapshot.exportedAt ?? null,
+        snapshot.updatedAt,
+      );
+  }
+
+  async getMemorySnapshot(scopeType: MemoryScope, scopeId: string, filePath: string): Promise<MemorySnapshotRecord | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM memory_snapshots WHERE scope_type = ? AND scope_id = ? AND file_path = ?")
+      .get(scopeType, scopeId, filePath) as MemorySnapshotRow | undefined;
+    return row ? memorySnapshotFromRow(row) : undefined;
+  }
+
   async addSessionSummary(summary: SessionSummary): Promise<void> {
     this.db
       .prepare("INSERT INTO session_summaries (id, session_id, summary, created_at) VALUES (?, ?, ?, ?)")
@@ -1839,6 +2129,32 @@ export class SqliteAgentStore implements AgentStore {
   async getToolResults(sessionId: string): Promise<ToolResult[]> {
     const rows = this.db.prepare("SELECT result_json FROM tool_calls WHERE session_id = ? ORDER BY created_at ASC").all(sessionId) as Array<{ result_json: string }>;
     return rows.map((row) => JSON.parse(row.result_json) as ToolResult);
+  }
+
+  async replaceSessionTodos(sessionId: string, todos: SessionTodo[]): Promise<void> {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM session_todos WHERE session_id = ?").run(sessionId);
+      const insert = this.db.prepare(
+        `INSERT INTO session_todos (
+          session_id, position, content, status, priority
+        ) VALUES (?, ?, ?, ?, ?)`,
+      );
+      todos.forEach((todo, position) => {
+        insert.run(sessionId, position, todo.content, todo.status, todo.priority);
+      });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  async listSessionTodos(sessionId: string): Promise<SessionTodo[]> {
+    const rows = this.db
+      .prepare("SELECT content, status, priority FROM session_todos WHERE session_id = ? ORDER BY position ASC")
+      .all(sessionId) as SessionTodoRow[];
+    return rows.map(sessionTodoFromRow);
   }
 
   close(): void {
@@ -2055,6 +2371,16 @@ export class SqliteAgentStore implements AgentStore {
         nonce TEXT NOT NULL,
         room_id TEXT NOT NULL,
         message_id TEXT NOT NULL,
+        envelope_hash TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        expires_at TEXT,
+        PRIMARY KEY (agent_id, nonce)
+      );
+
+      CREATE TABLE IF NOT EXISTS room_message_intent_nonces (
+        agent_id TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        room_id TEXT NOT NULL,
         envelope_hash TEXT NOT NULL,
         first_seen_at TEXT NOT NULL,
         expires_at TEXT,
@@ -2300,6 +2626,7 @@ export class SqliteAgentStore implements AgentStore {
         description TEXT NOT NULL,
         permissions_json TEXT NOT NULL,
         tools_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
         summary TEXT NOT NULL,
         body TEXT NOT NULL,
         checksum TEXT,
@@ -2395,11 +2722,102 @@ export class SqliteAgentStore implements AgentStore {
         last_used_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS memory_candidates (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        proposed_content TEXT NOT NULL,
+        proposed_summary TEXT NOT NULL,
+        source_session_id TEXT,
+        source_summary_id TEXT,
+        confidence REAL NOT NULL,
+        status TEXT NOT NULL,
+        safety_findings_json TEXT NOT NULL,
+        approved_memory_id TEXT,
+        review_reason TEXT,
+        created_by_json TEXT NOT NULL,
+        reviewed_by_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        reviewed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_sources (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT,
+        citation TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_usage_events (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT NOT NULL,
+        actor_json TEXT NOT NULL,
+        session_id TEXT,
+        reason TEXT NOT NULL,
+        query TEXT,
+        score REAL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_snapshots (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        imported_at TEXT,
+        exported_at TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(scope_type, scope_id, file_path)
+      );
+
+      CREATE TABLE IF NOT EXISTS session_todos (
+        session_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        status TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        PRIMARY KEY (session_id, position),
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS session_summaries (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         summary TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS goals (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL UNIQUE,
+        objective TEXT NOT NULL,
+        status TEXT NOT NULL,
+        token_budget INTEGER,
+        token_used INTEGER NOT NULL,
+        model_calls INTEGER NOT NULL,
+        repeated_blocker_key TEXT,
+        repeated_blockers INTEGER NOT NULL,
+        created_by_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS goal_checkpoints (
+        id TEXT PRIMARY KEY,
+        goal_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        blocker_key TEXT,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
@@ -2421,6 +2839,7 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_task_lease_nonces_assignment ON task_lease_nonces(assignment_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_task_lease_nonces_worker ON task_lease_nonces(worker_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_room_delivery_ack_nonces_room ON room_delivery_ack_nonces(room_id, first_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_room_message_intent_nonces_room ON room_message_intent_nonces(room_id, first_seen_at);
       CREATE INDEX IF NOT EXISTS idx_room_invites_room ON room_invites(room_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_room_invites_token_hash ON room_invites(token_hash);
       CREATE INDEX IF NOT EXISTS idx_room_messages_room ON room_messages(room_id, created_at);
@@ -2452,7 +2871,14 @@ export class SqliteAgentStore implements AgentStore {
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_eval_set ON knowledge_eval_runs(eval_set_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_scope ON knowledge_eval_runs(scope_type, scope_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_candidates_scope_status ON memory_candidates(scope_type, scope_id, status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_memory_candidates_source_summary ON memory_candidates(source_summary_id, status);
+      CREATE INDEX IF NOT EXISTS idx_memory_sources_memory_id ON memory_sources(memory_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_usage_memory_id ON memory_usage_events(memory_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_session_todos_session ON session_todos(session_id, position);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_session ON session_summaries(session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_goals_status_updated ON goals(status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_goal_checkpoints_goal_created ON goal_checkpoints(goal_id, created_at);
     `);
     this.addColumnIfMissing("sessions", "target_mode", "TEXT NOT NULL DEFAULT 'build'");
     this.addColumnIfMissing("pending_tool_calls", "tool_call_id", "TEXT");
@@ -2469,6 +2895,7 @@ export class SqliteAgentStore implements AgentStore {
     this.addColumnIfMissing("agents", "last_room_id", "TEXT");
     this.addColumnIfMissing("agents", "last_error", "TEXT");
     this.addColumnIfMissing("agents", "heartbeat_metadata_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.addColumnIfMissing("skills", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_agents_heartbeat ON agents(heartbeat_status, last_heartbeat_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_subtasks_spec_task ON subtasks(spec_task_id, created_at)");
   }
@@ -2719,6 +3146,15 @@ type RoomDeliveryAckNonceRow = {
   expires_at: string | null;
 };
 
+type RoomMessageIntentNonceRow = {
+  agent_id: string;
+  nonce: string;
+  room_id: string;
+  envelope_hash: string;
+  first_seen_at: string;
+  expires_at: string | null;
+};
+
 function agentFromRow(row: AgentRow): AgentIdentity {
   return {
     id: row.id as AgentIdentity["id"],
@@ -2800,6 +3236,17 @@ function roomDeliveryAckNonceFromRow(row: RoomDeliveryAckNonceRow): RoomDelivery
     nonce: row.nonce,
     roomId: row.room_id as RoomDeliveryAckNonce["roomId"],
     messageId: row.message_id,
+    envelopeHash: row.envelope_hash,
+    firstSeenAt: row.first_seen_at,
+    expiresAt: row.expires_at ?? undefined,
+  };
+}
+
+function roomMessageIntentNonceFromRow(row: RoomMessageIntentNonceRow): RoomMessageIntentNonce {
+  return {
+    agentId: row.agent_id as RoomMessageIntentNonce["agentId"],
+    nonce: row.nonce,
+    roomId: row.room_id as RoomMessageIntentNonce["roomId"],
     envelopeHash: row.envelope_hash,
     firstSeenAt: row.first_seen_at,
     expiresAt: row.expires_at ?? undefined,
@@ -3464,6 +3911,7 @@ type SkillRow = {
   description: string;
   permissions_json: string;
   tools_json: string;
+  metadata_json: string;
   summary: string;
   body: string;
   checksum: string | null;
@@ -3486,10 +3934,95 @@ type MemoryRow = {
   last_used_at: string | null;
 };
 
+type MemoryCandidateRow = {
+  id: string;
+  scope_type: MemoryCandidate["scopeType"];
+  scope_id: string;
+  kind: MemoryCandidate["kind"];
+  proposed_content: string;
+  proposed_summary: string;
+  source_session_id: string | null;
+  source_summary_id: string | null;
+  confidence: number;
+  status: MemoryReviewStatus;
+  safety_findings_json: string;
+  approved_memory_id: string | null;
+  review_reason: string | null;
+  created_by_json: string;
+  reviewed_by_json: string | null;
+  created_at: string;
+  updated_at: string;
+  reviewed_at: string | null;
+};
+
+type MemorySourceRow = {
+  id: string;
+  memory_id: string;
+  source_type: MemorySource["sourceType"];
+  source_id: string | null;
+  citation: string | null;
+  created_at: string;
+};
+
+type MemoryUsageEventRow = {
+  id: string;
+  memory_id: string;
+  actor_json: string;
+  session_id: string | null;
+  reason: MemoryUsageEvent["reason"];
+  query: string | null;
+  score: number | null;
+  created_at: string;
+};
+
+type MemorySnapshotRow = {
+  id: string;
+  scope_type: MemorySnapshotRecord["scopeType"];
+  scope_id: string;
+  file_path: string;
+  content_hash: string;
+  imported_at: string | null;
+  exported_at: string | null;
+  updated_at: string;
+};
+
 type SessionSummaryRow = {
   id: string;
   session_id: string;
   summary: string;
+  created_at: string;
+};
+
+type SessionTodoRow = {
+  content: string;
+  status: SessionTodo["status"];
+  priority: SessionTodo["priority"];
+};
+
+type GoalRunRow = {
+  id: string;
+  session_id: string;
+  objective: string;
+  status: GoalRun["status"];
+  token_budget: number | null;
+  token_used: number;
+  model_calls: number;
+  repeated_blocker_key: string | null;
+  repeated_blockers: number;
+  created_by_json: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+};
+
+type GoalCheckpointRow = {
+  id: string;
+  goal_id: string;
+  session_id: string;
+  kind: GoalCheckpoint["kind"];
+  summary: string;
+  blocker_key: string | null;
+  metadata_json: string;
   created_at: string;
 };
 
@@ -3504,6 +4037,7 @@ function skillFromRow(row: SkillRow): Skill {
       description: row.description,
       permissions: JSON.parse(row.permissions_json) as string[],
       tools: JSON.parse(row.tools_json) as string[],
+      metadata: JSON.parse(row.metadata_json) as Record<string, string>,
     },
     summary: row.summary,
     body: row.body,
@@ -3530,11 +4064,110 @@ function memoryFromRow(row: MemoryRow): MemoryRecord {
   };
 }
 
+function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
+  return {
+    id: row.id,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    kind: row.kind,
+    proposedContent: row.proposed_content,
+    proposedSummary: row.proposed_summary,
+    sourceSessionId: row.source_session_id ?? undefined,
+    sourceSummaryId: row.source_summary_id ?? undefined,
+    confidence: row.confidence,
+    status: row.status,
+    safetyFindings: JSON.parse(row.safety_findings_json) as MemoryCandidate["safetyFindings"],
+    approvedMemoryId: row.approved_memory_id ?? undefined,
+    reviewReason: row.review_reason ?? undefined,
+    createdBy: JSON.parse(row.created_by_json) as MemoryCandidate["createdBy"],
+    reviewedBy: row.reviewed_by_json ? JSON.parse(row.reviewed_by_json) as MemoryCandidate["reviewedBy"] : undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    reviewedAt: row.reviewed_at ?? undefined,
+  };
+}
+
+function memorySourceFromRow(row: MemorySourceRow): MemorySource {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    sourceType: row.source_type,
+    sourceId: row.source_id ?? undefined,
+    citation: row.citation ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
+function memoryUsageEventFromRow(row: MemoryUsageEventRow): MemoryUsageEvent {
+  return {
+    id: row.id,
+    memoryId: row.memory_id,
+    actor: JSON.parse(row.actor_json) as MemoryUsageEvent["actor"],
+    sessionId: row.session_id ?? undefined,
+    reason: row.reason,
+    query: row.query ?? undefined,
+    score: row.score ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
+function memorySnapshotFromRow(row: MemorySnapshotRow): MemorySnapshotRecord {
+  return {
+    id: row.id,
+    scopeType: row.scope_type,
+    scopeId: row.scope_id,
+    filePath: row.file_path,
+    contentHash: row.content_hash,
+    importedAt: row.imported_at ?? undefined,
+    exportedAt: row.exported_at ?? undefined,
+    updatedAt: row.updated_at,
+  };
+}
+
 function sessionSummaryFromRow(row: SessionSummaryRow): SessionSummary {
   return {
     id: row.id,
     sessionId: row.session_id,
     summary: row.summary,
+    createdAt: row.created_at,
+  };
+}
+
+function sessionTodoFromRow(row: SessionTodoRow): SessionTodo {
+  return {
+    content: row.content,
+    status: row.status,
+    priority: row.priority,
+  };
+}
+
+function goalRunFromRow(row: GoalRunRow): GoalRun {
+  return {
+    id: row.id,
+    sessionId: row.session_id as GoalRun["sessionId"],
+    objective: row.objective,
+    status: row.status,
+    tokenBudget: row.token_budget ?? undefined,
+    tokenUsed: row.token_used,
+    modelCalls: row.model_calls,
+    repeatedBlockerKey: row.repeated_blocker_key ?? undefined,
+    repeatedBlockers: row.repeated_blockers,
+    createdBy: JSON.parse(row.created_by_json) as GoalRun["createdBy"],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at ?? undefined,
+  };
+}
+
+function goalCheckpointFromRow(row: GoalCheckpointRow): GoalCheckpoint {
+  return {
+    id: row.id,
+    goalId: row.goal_id,
+    sessionId: row.session_id as GoalCheckpoint["sessionId"],
+    kind: row.kind,
+    summary: row.summary,
+    blockerKey: row.blocker_key ?? undefined,
+    metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
     createdAt: row.created_at,
   };
 }

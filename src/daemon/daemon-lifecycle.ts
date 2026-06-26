@@ -1,4 +1,4 @@
-export type DaemonServiceKind = "worker" | "scheduler";
+export type DaemonServiceKind = "worker" | "scheduler" | "remote-room-runner";
 
 export type DaemonLifecyclePhase =
   | "created"
@@ -18,7 +18,9 @@ export type DaemonStopReason =
   | "shutdown_requested"
   | "worker_not_runnable"
   | "paused_assignment"
-  | "drain_completed";
+  | "drain_completed"
+  | "max_cycles"
+  | "max_errors";
 
 export type DaemonLoopMetrics = {
   tickCount: number;
@@ -31,6 +33,7 @@ export type DaemonLoopMetrics = {
   failures?: number;
   heartbeatAgeMs?: number;
   loopLatencyMs?: number;
+  messagesProcessed?: number;
   drainBlocked?: number;
   assignmentsCompleted?: number;
 };
@@ -110,6 +113,7 @@ export class DaemonLifecycleController {
       retriesScheduled: addMetric(this.metrics.retriesScheduled, tickMetrics.retriesScheduled),
       delayedRetries: addMetric(this.metrics.delayedRetries, tickMetrics.delayedRetries),
       failures: addMetric(this.metrics.failures, tickMetrics.failures),
+      messagesProcessed: addMetric(this.metrics.messagesProcessed, tickMetrics.messagesProcessed),
       drainBlocked: addMetric(this.metrics.drainBlocked, tickMetrics.drainBlocked),
       assignmentsCompleted: addMetric(this.metrics.assignmentsCompleted, tickMetrics.assignmentsCompleted),
       tickCount: this.metrics.tickCount + 1,

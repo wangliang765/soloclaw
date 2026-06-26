@@ -19,12 +19,20 @@ export class ContextManager {
     this.messages.push({ role: "assistant", content, toolCalls });
   }
 
+  addUser(content: string) {
+    this.messages.push({ role: "user", content });
+  }
+
   addToolResult(result: ToolResult) {
     this.messages.push({
       role: "tool",
       content: JSON.stringify(result),
       toolResult: result,
     });
+  }
+
+  replace(messages: AgentMessage[]) {
+    this.messages.splice(0, this.messages.length, ...messages);
   }
 
   snapshot(): AgentMessage[] {

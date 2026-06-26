@@ -4380,11 +4380,10 @@ async function git(root: string, args: string[]): Promise<{ exitCode: number | n
 }
 
 function parsePorcelainPath(line: string): string | undefined {
-  const trimmed = line.trim();
-  if (!trimmed) {
+  if (!line.trim()) {
     return undefined;
   }
-  const pathPart = trimmed.slice(3);
+  const pathPart = line.length > 3 ? line.slice(3).trimEnd() : "";
   const renameIndex = pathPart.indexOf(" -> ");
   return renameIndex === -1 ? pathPart : pathPart.slice(renameIndex + 4);
 }

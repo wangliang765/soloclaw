@@ -11,11 +11,23 @@ export type ToolResult = {
   ok: boolean;
   output?: string;
   data?: unknown;
+  display?: ToolDisplay;
   error?: {
     code: string;
     message: string;
   };
   truncated?: boolean;
+};
+
+export type ToolDisplay = {
+  title: string;
+  detailsHidden?: boolean;
+  paths?: string[];
+  exitCode?: number | null;
+  timedOut?: boolean;
+  durationMs?: number;
+  stdoutBytes?: number;
+  stderrBytes?: number;
 };
 
 export type AgentMessage =

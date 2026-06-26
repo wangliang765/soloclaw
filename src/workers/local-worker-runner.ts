@@ -376,10 +376,22 @@ export class LocalWorkerRunner {
   private async targetStatus(assignment: TaskAssignment): Promise<"paused" | "failed" | "cancelled" | "completed"> {
     const sessionId = await this.resolveSessionId(assignment);
     const session = await this.input.store.getSession(sessionId);
+    if (session?.status === "failed" && session.targetMode === "goal" && await this.hasResumableRuntimeStop(sessionId)) {
+      return "paused";
+    }
     if (session?.status === "paused" || session?.status === "failed" || session?.status === "cancelled") {
       return session.status;
     }
     return "completed";
+  }
+
+  private async hasResumableRuntimeStop(sessionId: string): Promise<boolean> {
+    const events = await this.input.store.listAuditEvents({ sessionId, limit: 20 });
+    return events.some((event) =>
+      event.summary === "agent.event.runtime_stopped" &&
+      event.metadata?.eventType === "runtime_stopped" &&
+      typeof event.metadata.resumeCommand === "string"
+    );
   }
 }
 

@@ -119,6 +119,7 @@ function parseStoredProfiles(input: unknown): StoredModelProviderProfiles {
       defaultBaseUrl: typeof value.defaultBaseUrl === "string" ? value.defaultBaseUrl : undefined,
       defaultModel: parseNonEmptyString(value.defaultModel, `defaultModel for ${name}`),
       apiKeyEnvNames: parseEnvNames(value.apiKeyEnvNames, name),
+      apiKeySecretRef: parseOptionalSecretRef(value.apiKeySecretRef, name),
     };
     validateEditableProfile(profile);
     profiles[providerName] = profile;
@@ -131,6 +132,7 @@ function validateEditableProfile(profile: EditableModelProviderProfile): void {
   parseProtocol(profile.protocol);
   parseNonEmptyString(profile.defaultModel, `defaultModel for ${profile.name}`);
   parseEnvNames(profile.apiKeyEnvNames, profile.name);
+  parseOptionalSecretRef(profile.apiKeySecretRef, profile.name);
   if (profile.protocol !== "mock" && !profile.defaultBaseUrl) {
     throw new Error(`Model provider ${profile.name} requires defaultBaseUrl.`);
   }
@@ -155,7 +157,7 @@ function parseModelProviderName(value: string): ModelProviderName {
 }
 
 function parseProtocol(value: unknown): ModelProviderProfile["protocol"] {
-  if (value === "openai_chat" || value === "anthropic_messages" || value === "mock") {
+  if (value === "openai_chat" || value === "openai_responses" || value === "anthropic_messages" || value === "mock") {
     return value;
   }
   throw new Error(`Invalid model provider protocol: ${String(value)}.`);
@@ -173,6 +175,16 @@ function parseEnvNames(value: unknown, providerName: string): string[] {
     throw new Error(`Invalid apiKeyEnvNames for ${providerName}.`);
   }
   return value;
+}
+
+function parseOptionalSecretRef(value: unknown, providerName: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value === "string" && /^sec_[A-Za-z0-9_-]+$/.test(value)) {
+    return value;
+  }
+  throw new Error(`Invalid apiKeySecretRef for ${providerName}.`);
 }
 
 function isValidHttpUrl(value: string): boolean {

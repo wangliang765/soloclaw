@@ -8,6 +8,7 @@ import { commandExecutionProfile, type CreateFileInput, type PatchApplyResult, t
 
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT = 20_000;
+const SEARCH_IGNORED_DIRS = new Set(["node_modules", ".git", ".agent"]);
 
 export class LocalWorkspaceRuntime implements WorkspaceRuntime {
   constructor(private readonly root: string) {}
@@ -49,7 +50,8 @@ export class LocalWorkspaceRuntime implements WorkspaceRuntime {
       if (maybe.code === 1) {
         return "";
       }
-      return truncate(`${maybe.stdout ?? ""}${maybe.stderr ?? ""}`);
+      const fallback = await searchTextFallback(this.root, query, glob);
+      return fallback || truncate(`${maybe.stdout ?? ""}${maybe.stderr ?? ""}`);
     }
   }
 
@@ -65,20 +67,37 @@ export class LocalWorkspaceRuntime implements WorkspaceRuntime {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let exitCode: number | null = null;
+      let settled = false;
       const timeoutMs = input.timeoutMs ?? 30_000;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        child.kill();
-      }, timeoutMs);
+      let exitGraceTimer: ReturnType<typeof setTimeout> | undefined;
 
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdout = truncate(stdout + chunk.toString());
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderr = truncate(stderr + chunk.toString());
-      });
-      child.on("close", (exitCode) => {
+      const scheduleFinish = (delayMs: number) => {
+        if (exitGraceTimer) {
+          clearTimeout(exitGraceTimer);
+        }
+        exitGraceTimer = setTimeout(finish, delayMs);
+      };
+
+      const killProcessTree = () => {
+        if (process.platform === "win32" && child.pid) {
+          execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true }, () => undefined);
+          return;
+        }
+        child.kill();
+      };
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         clearTimeout(timer);
+        if (exitGraceTimer) {
+          clearTimeout(exitGraceTimer);
+        }
+        child.stdout.destroy();
+        child.stderr.destroy();
         resolve({
           stdout,
           stderr,
@@ -87,6 +106,36 @@ export class LocalWorkspaceRuntime implements WorkspaceRuntime {
           durationMs: Date.now() - startedAt,
           executionProfile,
         });
+      };
+
+      const finishAfterExit = (code: number | null) => {
+        exitCode = code;
+        if (!timedOut) {
+          clearTimeout(timer);
+        }
+        scheduleFinish(timedOut ? 2_000 : 100);
+      };
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killProcessTree();
+        scheduleFinish(2_000);
+      }, timeoutMs);
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout = truncate(stdout + chunk.toString());
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr = truncate(stderr + chunk.toString());
+      });
+      child.on("error", (error) => {
+        stderr = truncate(`${stderr}${error.message}`);
+        finish();
+      });
+      child.on("exit", finishAfterExit);
+      child.on("close", (code) => {
+        exitCode = exitCode ?? code;
+        finish();
       });
     });
   }
@@ -204,6 +253,79 @@ export class LocalWorkspaceRuntime implements WorkspaceRuntime {
     }
     return absolute;
   }
+}
+
+async function searchTextFallback(root: string, query: string, glob?: string): Promise<string> {
+  const matches: string[] = [];
+  const globMatcher = glob ? createGlobMatcher(glob) : undefined;
+  await walkSearch(root, "", query, globMatcher, matches);
+  return truncate(matches.join("\n"));
+}
+
+async function walkSearch(root: string, relativeDir: string, query: string, globMatcher: ((path: string) => boolean) | undefined, matches: string[]): Promise<void> {
+  if (matches.join("\n").length >= MAX_OUTPUT) {
+    return;
+  }
+  const absoluteDir = path.join(root, relativeDir);
+  let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+  try {
+    entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const relativePath = normalizeSearchPath(path.join(relativeDir, entry.name));
+    if (!relativePath) {
+      continue;
+    }
+    if (entry.isDirectory()) {
+      if (SEARCH_IGNORED_DIRS.has(entry.name)) {
+        continue;
+      }
+      await walkSearch(root, relativePath, query, globMatcher, matches);
+      continue;
+    }
+    if (!entry.isFile() || (globMatcher && !globMatcher(relativePath))) {
+      continue;
+    }
+    await searchFile(path.join(root, relativePath), relativePath, query, matches);
+  }
+}
+
+async function searchFile(absolutePath: string, relativePath: string, query: string, matches: string[]): Promise<void> {
+  let content: string;
+  try {
+    content = await fs.readFile(absolutePath, "utf8");
+  } catch {
+    return;
+  }
+  const lines = content.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.includes(query)) {
+      matches.push(`${relativePath}:${index + 1}:${line}`);
+      if (matches.join("\n").length >= MAX_OUTPUT) {
+        return;
+      }
+    }
+  }
+}
+
+function createGlobMatcher(glob: string): (inputPath: string) => boolean {
+  const normalized = normalizeSearchPath(glob);
+  const escaped = normalized
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "\0")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(/\0/g, ".*");
+  const regex = new RegExp(`^${escaped}$`);
+  return (inputPath) => regex.test(normalizeSearchPath(inputPath));
+}
+
+function normalizeSearchPath(inputPath: string): string {
+  return inputPath.replace(/\\/g, "/").replace(/^\.?\//, "");
 }
 
 async function readOptional(inputPath: string): Promise<string | undefined> {

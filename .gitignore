@@ -3,3 +3,13 @@ dist/
 .agent/
 .env
 *.log
+target/
+
+# Local Phase 5 evidence collection workspace outputs.
+phase5-collection-runbook.md
+phase5-collector-guides/
+phase5-evidence.json
+phase5-evidence.merged.json
+phase5-fragments/
+phase5-registered-pull-operator-next.json
+phase5-registered-pull-evidence-patch.json

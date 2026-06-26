@@ -1,6 +1,8 @@
-import type { MemoryKind, MemoryRecord, MemoryScope, SessionSummary } from "../domain/index.js";
+import type { MemoryCandidate, MemoryKind, MemoryRecord, MemoryScope, SessionSummary } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import type { AgentStore } from "../store/agent-store.js";
+import { MemoryExtractionService, type MemoryExtractionInput, type MemoryExtractionResult } from "./memory-extraction-service.js";
+import { MemoryReviewService, type ApproveMemoryCandidateInput, type ApproveMemoryCandidateResult, type RejectMemoryCandidateInput } from "./memory-review-service.js";
 
 export type AddMemoryInput = {
   scopeType: MemoryScope;
@@ -39,6 +41,22 @@ export class MemoryService {
 
   async delete(memoryId: string): Promise<boolean> {
     return this.store.deleteMemory(memoryId);
+  }
+
+  async extractCandidates(input: MemoryExtractionInput): Promise<MemoryExtractionResult> {
+    return new MemoryExtractionService(this.store).extractFromText(input);
+  }
+
+  async listCandidates(input?: Parameters<AgentStore["listMemoryCandidates"]>[0]): Promise<MemoryCandidate[]> {
+    return this.store.listMemoryCandidates(input);
+  }
+
+  async approveCandidate(input: ApproveMemoryCandidateInput): Promise<ApproveMemoryCandidateResult> {
+    return new MemoryReviewService(this.store).approve(input);
+  }
+
+  async rejectCandidate(input: RejectMemoryCandidateInput): Promise<MemoryCandidate> {
+    return new MemoryReviewService(this.store).reject(input);
   }
 
   async addSessionSummary(sessionId: string, summary: string): Promise<SessionSummary> {

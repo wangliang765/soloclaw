@@ -1,4 +1,4 @@
-import type { ModelClient, ModelRequest } from "./model-client.js";
+import type { ModelClient, ModelRequest, ModelStreamEvent } from "./model-client.js";
 import type { ModelResponse } from "../protocol/types.js";
 
 export type ModelReliabilityGuardOptions = {
@@ -41,6 +41,19 @@ export class GuardedModelClient implements ModelClient {
   ) {}
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    return this.runGuarded(() => this.inner.complete(request));
+  }
+
+  async *streamComplete(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const stream = await this.runGuarded(async () => this.inner.streamComplete?.(request));
+    if (stream) {
+      yield* stream;
+      return;
+    }
+    yield await this.inner.complete(request);
+  }
+
+  private async runGuarded<T>(action: () => Promise<T>): Promise<T> {
     const now = this.now();
     if (this.circuitOpenUntilMs > now) {
       throw new ModelCircuitOpenError("Model circuit is open after repeated failures.", new Date(this.circuitOpenUntilMs).toISOString());
@@ -54,7 +67,7 @@ export class GuardedModelClient implements ModelClient {
 
     this.totalCalls += 1;
     try {
-      const response = await this.inner.complete(request);
+      const response = await action();
       this.consecutiveFailures = 0;
       return response;
     } catch (error) {

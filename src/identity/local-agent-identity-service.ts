@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
-import type { AgentHeartbeatEnvelope, AgentIdentity, AuditExportBundle, MachineId, RoomDeliveryAckEnvelope, RoomInviteEnvelope, RoomMessage, TaskLeaseEnvelope, WorkerHeartbeatEnvelope } from "../domain/index.js";
-import { agentHeartbeatEnvelopeSigningPayload, auditExportBundleSigningPayload, roomDeliveryAckEnvelopeSigningPayload, roomInviteEnvelopeSigningPayload, taskLeaseEnvelopeSigningPayload, workerHeartbeatEnvelopeSigningPayload } from "../domain/index.js";
+import type { AgentHeartbeatEnvelope, AgentIdentity, AuditExportBundle, MachineId, RoomDeliveryAckEnvelope, RoomInviteEnvelope, RoomMessage, RoomMessageIntentEnvelope, TaskLeaseEnvelope, WorkerHeartbeatEnvelope } from "../domain/index.js";
+import { agentHeartbeatEnvelopeSigningPayload, auditExportBundleSigningPayload, roomDeliveryAckEnvelopeSigningPayload, roomInviteEnvelopeSigningPayload, roomMessageIntentEnvelopeSigningPayload, taskLeaseEnvelopeSigningPayload, workerHeartbeatEnvelopeSigningPayload } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import type { AgentStore } from "../store/agent-store.js";
 
@@ -231,6 +231,40 @@ export class LocalAgentIdentityService {
     const ok = verify(
       null,
       Buffer.from(roomDeliveryAckEnvelopeSigningPayload(envelope), "utf8"),
+      createPublicKey(agent.publicKeyPem),
+      Buffer.from(encoded, "base64"),
+    );
+    return ok ? "valid" : "invalid";
+  }
+
+  async signRoomMessageIntentEnvelope(envelope: Omit<RoomMessageIntentEnvelope, "signature">): Promise<string | undefined> {
+    const identity = await this.getOrCreate();
+    if (envelope.sentBy.type !== "agent" || envelope.sentBy.id !== identity.id || envelope.agentId !== identity.id) {
+      return undefined;
+    }
+    const privateKeyPem = readFileSync(this.privateKeyPath, "utf8");
+    const signature = sign(null, Buffer.from(roomMessageIntentEnvelopeSigningPayload(envelope), "utf8"), createPrivateKey(privateKeyPem));
+    return `ed25519:${signature.toString("base64")}`;
+  }
+
+  async verifyRoomMessageIntentEnvelope(envelope: RoomMessageIntentEnvelope): Promise<"valid" | "unsigned" | "unknown_agent" | "invalid"> {
+    if (!envelope.signature) {
+      return "unsigned";
+    }
+    if (envelope.sentBy.type !== "agent" || envelope.sentBy.id !== envelope.agentId) {
+      return "invalid";
+    }
+    const agent = await this.store.getAgent(envelope.agentId);
+    if (!agent) {
+      return "unknown_agent";
+    }
+    const [algorithm, encoded] = envelope.signature.split(":", 2);
+    if (algorithm !== "ed25519" || !encoded) {
+      return "invalid";
+    }
+    const ok = verify(
+      null,
+      Buffer.from(roomMessageIntentEnvelopeSigningPayload(envelope), "utf8"),
       createPublicKey(agent.publicKeyPem),
       Buffer.from(encoded, "base64"),
     );

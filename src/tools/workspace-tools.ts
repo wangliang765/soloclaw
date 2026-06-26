@@ -1,4 +1,4 @@
-import type { ActorRef } from "../domain/index.js";
+import type { ActorRef, SessionTodo, SessionTodoPriority, SessionTodoStatus } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
 import type { JsonObject, RegisteredTool, ToolResult } from "../protocol/types.js";
 import type { AgentStore } from "../store/agent-store.js";
@@ -25,7 +25,14 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["path"],
       },
-      handler: async (input) => wrap("list_files", async () => (await workspace.listFiles(stringInput(input, "path"))).join("\n")),
+      handler: async (input) => {
+        const filePath = stringInput(input, "path");
+        return wrap("list_files", async () => (await workspace.listFiles(filePath)).join("\n"), {
+          title: `List ${filePath}`,
+          paths: [filePath],
+          detailsHidden: true,
+        });
+      },
     },
     {
       name: "read_file",
@@ -39,14 +46,20 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["path"],
       },
-      handler: async (input) =>
-        wrap("read_file", async () =>
+      handler: async (input) => {
+        const filePath = stringInput(input, "path");
+        return wrap("read_file", async () =>
           workspace.readFile({
-            path: stringInput(input, "path"),
+            path: filePath,
             startLine: numberInput(input, "startLine"),
             endLine: numberInput(input, "endLine"),
           }),
-        ),
+        {
+          title: `Read ${filePath}`,
+          paths: [filePath],
+          detailsHidden: true,
+        });
+      },
     },
     {
       name: "search_text",
@@ -59,7 +72,51 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["query"],
       },
-      handler: async (input) => wrap("search_text", async () => workspace.searchText(stringInput(input, "query"), optionalString(input, "glob"))),
+      handler: async (input) => {
+        const query = stringInput(input, "query");
+        return wrap("search_text", async () => workspace.searchText(query, optionalString(input, "glob")), {
+          title: `Search ${query}`,
+          detailsHidden: true,
+        });
+      },
+    },
+    {
+      name: "todowrite",
+      description: "Create and maintain the structured task list for the current coding session. Use it during multi-step work and keep statuses current.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                content: { type: "string" },
+                status: { type: "string", enum: ["pending", "in_progress", "completed", "cancelled"] },
+                priority: { type: "string", enum: ["high", "medium", "low"] },
+              },
+              required: ["content", "status", "priority"],
+            },
+          },
+        },
+        required: ["todos"],
+      },
+      handler: async (input) =>
+        wrap("todowrite", async () => {
+          const sessionId = resolveSessionId(options);
+          if (!options.store || !sessionId) {
+            throw new Error("todowrite requires a session store and session id.");
+          }
+          const todos = todosInput(input);
+          await options.store.replaceSessionTodos(sessionId, todos);
+          return {
+            output: JSON.stringify(todos, null, 2),
+            display: {
+              title: "Update task list",
+              detailsHidden: true,
+            },
+          };
+        }),
     },
     {
       name: "run_command",
@@ -98,7 +155,8 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
             stdoutBytes: result.stdout.length,
             stderrBytes: result.stderr.length,
           });
-          return [
+          return {
+            output: [
             `exit=${result.exitCode}`,
             `timedOut=${result.timedOut}`,
             `durationMs=${result.durationMs}`,
@@ -110,7 +168,17 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
             result.stdout,
             "stderr:",
             result.stderr,
-          ].join("\n");
+            ].join("\n"),
+            display: {
+              title: "Run command",
+              detailsHidden: true,
+              exitCode: result.exitCode,
+              timedOut: result.timedOut,
+              durationMs: result.durationMs,
+              stdoutBytes: result.stdout.length,
+              stderrBytes: result.stderr.length,
+            },
+          };
         }),
     },
     {
@@ -123,9 +191,10 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["patch"],
       },
-      handler: async (input) =>
-        wrap("apply_patch", async () => {
-          const patch = stringInput(input, "patch");
+      handler: async (input) => {
+        const patch = stringInput(input, "patch");
+        const paths = extractPatchTargetPaths(patch);
+        return wrap("apply_patch", async () => {
           return withFileLocks(options, extractPatchTargetPaths(patch), async () => {
             const result = await workspace.applyPatch(patch);
             for (const file of result.files) {
@@ -133,7 +202,12 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
             }
             return JSON.stringify(result);
           });
-        }),
+        }, {
+          title: `Apply patch (${paths.length} file${paths.length === 1 ? "" : "s"})`,
+          paths,
+          detailsHidden: true,
+        });
+      },
     },
     {
       name: "create_file",
@@ -147,9 +221,9 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["path", "content"],
       },
-      handler: async (input) =>
-        wrap("create_file", async () => {
-          const filePath = stringInput(input, "path");
+      handler: async (input) => {
+        const filePath = stringInput(input, "path");
+        return wrap("create_file", async () => {
           return withFileLock(options, filePath, async () => {
             const result = await workspace.createFile({
               path: filePath,
@@ -159,7 +233,12 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
             await recordFileChange(options, "create", result.path, result.summary, result.beforeHash, result.afterHash);
             return JSON.stringify(result);
           });
-        }),
+        }, {
+          title: `Create ${filePath}`,
+          paths: [filePath],
+          detailsHidden: true,
+        });
+      },
     },
     {
       name: "replace_range",
@@ -174,9 +253,9 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
         },
         required: ["path", "startLine", "endLine", "content"],
       },
-      handler: async (input) =>
-        wrap("replace_range", async () => {
-          const filePath = stringInput(input, "path");
+      handler: async (input) => {
+        const filePath = stringInput(input, "path");
+        return wrap("replace_range", async () => {
           return withFileLock(options, filePath, async () => {
             const result = await workspace.replaceRange({
               path: filePath,
@@ -187,22 +266,32 @@ export function createWorkspaceTools(workspace: WorkspaceRuntime, options: Works
             await recordFileChange(options, "replace_range", result.path, result.summary, result.beforeHash, result.afterHash);
             return JSON.stringify(result);
           });
-        }),
+        }, {
+          title: `Edit ${filePath}`,
+          paths: [filePath],
+          detailsHidden: true,
+        });
+      },
     },
   ];
 }
 
-async function wrap(callId: string, action: () => Promise<string>): Promise<ToolResult> {
+async function wrap(callId: string, action: () => Promise<string | { output: string; display?: ToolResult["display"] }>, display?: ToolResult["display"]): Promise<ToolResult> {
   try {
+    const result = await action();
+    const output = typeof result === "string" ? result : result.output;
+    const resultDisplay = typeof result === "string" ? display : result.display ?? display;
     return {
       callId,
       ok: true,
-      output: await action(),
+      output,
+      display: resultDisplay,
     };
   } catch (error) {
     return {
       callId,
       ok: false,
+      display,
       error: {
         code: "tool_error",
         message: error instanceof Error ? error.message : String(error),
@@ -222,6 +311,44 @@ function stringInput(input: JsonObject, key: string): string {
 function optionalString(input: JsonObject, key: string): string | undefined {
   const value = input[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function todosInput(input: JsonObject): SessionTodo[] {
+  const value = input.todos;
+  if (!Array.isArray(value)) {
+    throw new Error("Expected array input: todos");
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`Expected todo object at index ${index}`);
+    }
+    const candidate = item as Record<string, unknown>;
+    const content = candidate.content;
+    const status = candidate.status;
+    const priority = candidate.priority;
+    if (typeof content !== "string" || content.trim().length === 0) {
+      throw new Error(`Expected non-empty todo content at index ${index}`);
+    }
+    if (!isSessionTodoStatus(status)) {
+      throw new Error(`Invalid todo status at index ${index}`);
+    }
+    if (!isSessionTodoPriority(priority)) {
+      throw new Error(`Invalid todo priority at index ${index}`);
+    }
+    return {
+      content,
+      status,
+      priority,
+    };
+  });
+}
+
+function isSessionTodoStatus(value: unknown): value is SessionTodoStatus {
+  return value === "pending" || value === "in_progress" || value === "completed" || value === "cancelled";
+}
+
+function isSessionTodoPriority(value: unknown): value is SessionTodoPriority {
+  return value === "high" || value === "medium" || value === "low";
 }
 
 function numberInput(input: JsonObject, key: string): number | undefined {

@@ -6,7 +6,7 @@ import type { LocalAgentIdentityService } from "../identity/local-agent-identity
 import type { AgentStore } from "../store/agent-store.js";
 import { assertRoomCapability, memberHasCapability, type RoomCapability } from "./room-capabilities.js";
 import { buildRoomMessageRouting, buildRoomRoutingDiagnostics, countRoutedAgentTargets, hasWideRoomRouting, normalizeMentionAlias } from "./message-routing.js";
-import type { CreateRoomInput, CreateRoomInviteInput, CreatedRoomInvite, RoomService } from "./room-service.js";
+import type { AcceptRoomAgentInvitationInput, CreateRoomInput, CreateRoomInviteInput, CreatedRoomInvite, InviteRoomAgentInput, RoomService } from "./room-service.js";
 
 export class MemoryRoomService implements RoomService {
   constructor(
@@ -112,6 +112,79 @@ export class MemoryRoomService implements RoomService {
       createdAt: new Date().toISOString(),
     });
     return revoked;
+  }
+
+  async inviteAgent(input: InviteRoomAgentInput): Promise<RoomMember> {
+    const room = await this.store.getRoom(input.roomId);
+    if (!room) {
+      throw new Error(`Room not found: ${input.roomId}`);
+    }
+    await this.assertCapability(input.roomId, input.invitedBy, "room.member.invite");
+    const agent = await this.store.getAgent(input.agentId);
+    if (!agent) {
+      throw new Error(`Agent not found: ${input.agentId}`);
+    }
+    if (agent.trustStatus === "revoked" || agent.trustStatus === "suspended" || agent.trustStatus === "expired") {
+      throw new Error(`Agent trust status ${agent.trustStatus} cannot be invited to a room.`);
+    }
+    const members = await this.store.listRoomMembers(input.roomId);
+    const existing = members.find((member) => member.actor.type === "agent" && member.actor.id === input.agentId);
+    const member: RoomMember = {
+      roomId: room.id,
+      actor: {
+        type: "agent",
+        id: agent.id,
+        displayName: agent.displayName,
+      },
+      aliases: this.normalizeMemberAliases(input.aliases ?? existing?.aliases ?? [], members, input.agentId),
+      role: input.role ?? existing?.role ?? "participant",
+      status: existing?.status === "active" ? "active" : "invited",
+      joinedAt: existing?.joinedAt,
+      expiresAt: existing?.expiresAt,
+    };
+    if (existing) {
+      await this.store.updateRoomMember(member);
+    } else {
+      await this.store.addRoomMember(member);
+    }
+    return member;
+  }
+
+  async acceptAgentInvitation(input: AcceptRoomAgentInvitationInput): Promise<RoomMember> {
+    const room = await this.store.getRoom(input.roomId);
+    if (!room) {
+      throw new Error(`Room not found: ${input.roomId}`);
+    }
+    if (input.actor.type !== "agent") {
+      throw new Error("Only an agent can accept a room agent invitation.");
+    }
+    const agent = await this.store.getAgent(input.actor.id);
+    if (!agent) {
+      throw new Error(`Agent not found: ${input.actor.id}`);
+    }
+    if (agent.trustStatus === "revoked" || agent.trustStatus === "suspended" || agent.trustStatus === "expired") {
+      throw new Error(`Agent trust status ${agent.trustStatus} cannot accept a room invitation.`);
+    }
+    const members = await this.store.listRoomMembers(input.roomId);
+    const member = members.find((candidate) => candidate.actor.type === "agent" && candidate.actor.id === input.actor.id);
+    if (!member) {
+      throw new Error(`Room agent invitation not found: ${input.actor.id}`);
+    }
+    if (member.status === "active") {
+      return member;
+    }
+    if (member.status !== "invited" && member.status !== "pending") {
+      throw new Error(`Room agent invitation is ${member.status}.`);
+    }
+    const accepted: RoomMember = {
+      ...member,
+      actor: await this.enrichActor(input.actor),
+      aliases: this.normalizeMemberAliases(input.aliases ?? member.aliases ?? [], members, input.actor.id),
+      status: "active",
+      joinedAt: new Date().toISOString(),
+    };
+    await this.store.updateRoomMember(accepted);
+    return accepted;
   }
 
   async requestJoin(roomId: string, actor: ActorRef, role: RoomMember["role"], aliases: string[] = []): Promise<RoomMember> {

@@ -157,14 +157,24 @@ raw messages
 
 Current local status:
 
-```text
-agent session compact <session-id>
-  -> writes session_summaries
-  -> removes hot messages and tool-call rows
-  -> records session.compacted audit event
+- manual memory add/list/delete remains available;
+- automatic extraction creates pending candidates from session summaries and compaction summaries;
+- candidate approval creates durable memories and source links;
+- retrieval is ACL-aware, safety-scanned, bounded, and records usage events plus `lastUsedAt`;
+- `.agent/MEMORY.md` and `.agent/USER.md` snapshots can be exported/imported through the review queue;
+- memory evals check recall, stale-memory behavior, prompt-injection denial, and permission leaks.
 
-retention apply <project-id>
-  -> compacts sessions according to the project retention policy
+Useful commands:
+
+```text
+agent memory extract <session-id> [--json]
+agent memory candidates [--status pending] [--json]
+agent memory approve <candidate-id> [--json]
+agent memory reject <candidate-id> --reason text [--json]
+agent memory search <query> [--json]
+agent memory usage <memory-id> [--json]
+agent memory snapshot export|import|status --file path [--json]
+agent memory eval --case-file path.json [--json]
 ```
 
 Production compaction should also trigger when a session approaches the model context window, when a long-running task reaches a checkpoint, or when retention policy moves hot transcript data into colder storage. Summaries should be incremental, versioned, auditable, and safe to inject back into resume context before recent uncompressed messages.
@@ -224,12 +234,15 @@ Memory:
 store session summaries
 allow manual memory add/list/delete
 retrieve project memories by keyword
+extract pending candidates from summaries
+approve or reject candidates
+export/import curated memory snapshots
+run memory retrieval eval gates
 ```
 
 Later:
 
 ```text
-automatic memory extraction
 semantic retrieval
 organization memory governance
 skill marketplace / plugin skills

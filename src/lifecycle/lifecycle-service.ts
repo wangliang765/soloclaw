@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ActorRef, ArtifactKind, ArtifactRecord, RetentionPolicy, Session, SessionSummary } from "../domain/index.js";
 import { makeId } from "../domain/common.js";
+import { MemoryExtractionService } from "../memory/memory-extraction-service.js";
 import type { AgentStore } from "../store/agent-store.js";
 
 export type RegisterArtifactInput = {
@@ -124,7 +125,7 @@ export class LifecycleService {
       sessionId: input.sessionId,
       projectId: session.projectId,
       forced: input.force ?? false,
-    }, session);
+    }, lifecycleSessionScope(session));
   }
 
   async compactSession(input: { sessionId: string; actor: ActorRef; force?: boolean; summary?: string }): Promise<import("../store/agent-store.js").CompactSessionResult> {
@@ -139,12 +140,26 @@ export class LifecycleService {
       createdAt: new Date().toISOString(),
     };
     const result = await this.store.compactSession(input.sessionId, summary);
+    const extraction = await new MemoryExtractionService(this.store).extractFromSessionSummary({
+      text: summary.summary,
+      scopeType: "project",
+      scopeId: session.projectId ?? "local",
+      sourceSessionId: session.id,
+      sourceSummaryId: summary.id,
+      actor: input.actor,
+    });
+    await this.audit("memory.pre_compaction_extract", input.actor, `Extracted memory candidates before compacting session ${input.sessionId}`, {
+      sessionId: input.sessionId,
+      summaryId: summary.id,
+      candidateCount: extraction.createdCandidates.length,
+      deniedCount: extraction.deniedCandidates.length,
+    }, lifecycleSessionScope(session));
     await this.audit("session.compacted", input.actor, `Compacted session ${input.sessionId}`, {
       sessionId: input.sessionId,
       messagesDeleted: result.messagesDeleted,
       toolCallsDeleted: result.toolCallsDeleted,
       summaryId: summary.id,
-    }, session);
+    }, lifecycleSessionScope(session));
     return result;
   }
 
@@ -306,6 +321,15 @@ function inferArtifactName(input: RegisterArtifactInput): string {
     return input.uri;
   }
   return `${input.kind} artifact`;
+}
+
+function lifecycleSessionScope(session: Session): Pick<ArtifactRecord, "orgId" | "projectId" | "sessionId" | "roomId"> {
+  return {
+    orgId: session.orgId,
+    projectId: session.projectId,
+    roomId: session.roomId,
+    sessionId: session.id,
+  };
 }
 
 function cutoffIso(days: number): string {

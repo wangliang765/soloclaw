@@ -39,7 +39,7 @@ Anthropic-compatible custom endpoint
 
 Agent logic must depend on `ModelClient`, not provider SDKs directly.
 
-Current local implementation uses typed provider profiles for OpenAI, Anthropic, Grok/xAI, MiniMax, DeepSeek, GLM, MiMo, OpenAI-compatible custom endpoints, and Anthropic-compatible custom endpoints. The non-Anthropic commercial providers currently run through the OpenAI-compatible chat adapter with provider-specific base URLs, default model names, and API key environment aliases. Local `.agent/model-providers.json` overrides allow operators to edit non-secret profile metadata through `agent models profiles`; production can replace individual profiles with provider-specific adapters or a tenant-scoped provider registry without changing the agent loop.
+Current local implementation uses typed provider profiles for OpenAI, Anthropic, Gemini, Kimi/Moonshot, Grok/xAI, MiniMax, DeepSeek, GLM/Z.AI, Qwen/DashScope, MiMo, OpenAI-compatible custom endpoints, and Anthropic-compatible custom endpoints. The non-Anthropic commercial providers currently run through the OpenAI-compatible chat adapter with provider-specific base URLs, default model names, API key environment aliases, docs/API key/pricing links, and menu model choices. Local `.agent/model-providers.json` overrides allow operators to edit non-secret profile metadata through TUI `/model setup` and `agent models profiles`; production can replace individual profiles with provider-specific adapters or a tenant-scoped provider registry without changing the agent loop.
 
 ## Control Plane
 

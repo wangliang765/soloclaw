@@ -1,4 +1,4 @@
-import type { ActorRef, ArtifactId, RoomId, Timestamp } from "./common.js";
+import type { ActorRef, AgentId, ArtifactId, RoomId, Timestamp } from "./common.js";
 
 export type RoomJoinPolicy = "manual" | "invite_token" | "fingerprint_allowlist" | "quorum" | "same_org";
 export type RoomMemberStatus = "invited" | "pending" | "active" | "suspended" | "left" | "removed" | "expired";
@@ -121,6 +121,30 @@ export type RoomDeliveryAckNonce = {
   expiresAt?: Timestamp;
 };
 
+export type RoomMessageIntentEnvelope = {
+  version: 1;
+  roomId: RoomId;
+  agentId: AgentId;
+  kind: RoomMessageKind;
+  body: string;
+  sentAt: Timestamp;
+  sentBy: ActorRef;
+  nonce: string;
+  parentMessageId?: string;
+  artifactRefs?: ArtifactId[];
+  routing?: RoomMessageRouting;
+  signature?: string;
+};
+
+export type RoomMessageIntentNonce = {
+  agentId: AgentId;
+  nonce: string;
+  roomId: RoomId;
+  envelopeHash: string;
+  firstSeenAt: Timestamp;
+  expiresAt?: Timestamp;
+};
+
 export type RoomInviteEnvelope = {
   version: 1;
   inviteId: string;
@@ -144,6 +168,23 @@ export function roomDeliveryAckEnvelopeSigningPayload(envelope: Omit<RoomDeliver
     acknowledgedByType: envelope.acknowledgedBy.type,
     acknowledgedById: envelope.acknowledgedBy.id,
     nonce: envelope.nonce,
+  });
+}
+
+export function roomMessageIntentEnvelopeSigningPayload(envelope: Omit<RoomMessageIntentEnvelope, "signature">): string {
+  return JSON.stringify({
+    version: envelope.version,
+    roomId: envelope.roomId,
+    agentId: envelope.agentId,
+    kind: envelope.kind,
+    body: envelope.body,
+    sentAt: envelope.sentAt,
+    sentByType: envelope.sentBy.type,
+    sentById: envelope.sentBy.id,
+    nonce: envelope.nonce,
+    parentMessageId: envelope.parentMessageId ?? null,
+    artifactRefs: envelope.artifactRefs ?? [],
+    routing: envelope.routing ?? null,
   });
 }
 

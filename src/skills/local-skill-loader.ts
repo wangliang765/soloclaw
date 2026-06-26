@@ -32,13 +32,15 @@ export class LocalSkillLoader {
   async loadSkill(skillPath: string, scope: SkillScope): Promise<Skill | undefined> {
     const manifestPath = path.join(skillPath, "manifest.json");
     const bodyPath = path.join(skillPath, "SKILL.md");
-    if (!(await pathExists(manifestPath)) || !(await pathExists(bodyPath))) {
+    if (!(await pathExists(bodyPath))) {
       return undefined;
     }
 
-    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as SkillManifest;
-    validateManifest(manifest);
     const body = await fs.readFile(bodyPath, "utf8");
+    const manifest = (await pathExists(manifestPath))
+      ? JSON.parse(await fs.readFile(manifestPath, "utf8")) as SkillManifest
+      : manifestFromSkillMarkdown(body);
+    validateManifest(manifest);
     const now = new Date().toISOString();
     return {
       id: makeId<"PluginId">("skill"),
@@ -52,6 +54,75 @@ export class LocalSkillLoader {
       updatedAt: now,
     };
   }
+}
+
+function manifestFromSkillMarkdown(body: string): SkillManifest {
+  const { data } = parseFrontmatter(body);
+  return {
+    name: requiredFrontmatter(data, "name"),
+    version: data.version ?? "0.1.0",
+    description: requiredFrontmatter(data, "description"),
+    permissions: parseStringList(data.permissions),
+    tools: parseStringList(data.tools),
+    metadata: parseMetadata(data.metadata),
+  };
+}
+
+function parseFrontmatter(body: string): { data: Record<string, string>; content: string } {
+  const normalized = body.replace(/\r\n/g, "\n");
+  if (!normalized.startsWith("---\n")) {
+    return { data: {}, content: body };
+  }
+  const end = normalized.indexOf("\n---", 4);
+  if (end === -1) {
+    return { data: {}, content: body };
+  }
+  const header = normalized.slice(4, end).trim();
+  const content = normalized.slice(end + 4).replace(/^\n/, "");
+  const data: Record<string, string> = {};
+  for (const line of header.split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator <= 0) {
+      continue;
+    }
+    data[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+  }
+  return { data, content };
+}
+
+function requiredFrontmatter(data: Record<string, string>, key: string): string {
+  const value = data[key];
+  if (!value) {
+    throw new Error(`Skill frontmatter requires ${key}.`);
+  }
+  return value;
+}
+
+function parseStringList(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parseMetadata(value: string | undefined): Record<string, string> | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const entries = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const separator = item.indexOf("=");
+      return separator >= 0
+        ? [item.slice(0, separator).trim(), item.slice(separator + 1).trim()]
+        : [item, "true"];
+    });
+  return Object.fromEntries(entries);
 }
 
 function validateManifest(manifest: SkillManifest) {

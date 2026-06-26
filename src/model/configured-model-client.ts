@@ -1,4 +1,4 @@
-import type { ModelClient, ModelProviderConfig, ModelRequest } from "./model-client.js";
+import type { ModelClient, ModelProviderConfig, ModelRequest, ModelStreamEvent } from "./model-client.js";
 import type { ModelResponse } from "../protocol/types.js";
 
 export class ConfiguredModelClient implements ModelClient {
@@ -12,5 +12,18 @@ export class ConfiguredModelClient implements ModelClient {
       ...request,
       provider: this.provider,
     });
+  }
+
+  async *streamComplete(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    const routedRequest = {
+      ...request,
+      provider: this.provider,
+    };
+    const stream = this.inner.streamComplete?.(routedRequest);
+    if (stream) {
+      yield* stream;
+      return;
+    }
+    yield await this.inner.complete(routedRequest);
   }
 }
